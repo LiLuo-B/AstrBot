@@ -35,10 +35,13 @@ data/webchat
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/dashboard.zip
+data/plugins.json
+data/skills.json
+data/mcp_server.json
 configs/config.yaml
 configs/session
 cmd_config.json
-
 # Plugins
 addons/plugins
 astrbot/builtin_stars/python_interpreter/workplace

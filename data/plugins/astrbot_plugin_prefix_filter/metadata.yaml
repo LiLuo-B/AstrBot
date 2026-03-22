@@ -1,0 +1,6 @@
+name: prefix_filter
+desc: 一个用于过滤特定前缀消息的插件
+help: prefix_list：显示当前忽略的前缀列表 prefix_add：添加需要忽略的前缀 prefix_remove：移除忽略的前缀
+version: v0.1.0
+author: padoru233
+repo: https://github.com/padoru233/astrbot_plugin_prefix_filter

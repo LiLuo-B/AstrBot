@@ -1,0 +1,9 @@
+{
+  "ignored_prefixes": {
+    "description": "需要忽略的消息前缀列表",
+    "type": "list",
+    "hint": "以这些前缀开头的消息将被忽略",
+    "obvious_hint": true,
+    "default": ["/", "!", "#", "."]
+  }
+}
