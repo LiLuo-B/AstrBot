@@ -16,12 +16,27 @@ logs/
 temp
 cookies.json
 
-# Data files
+# Data files (keep plugins, ignore other data)
 data_v2.db
 data_v3.db
-data
-configs/session
+data_v4.db
+data/attachments
+data/config
+data/dist
+data/knowledge_base
+data/logs
+data/plugin_data
+data/self_learning_data
+data/site-packages
+data/skills
+data/t2i_templates
+data/temp
+data/webchat
+data/*.db
+data/*.db-shm
+data/*.db-wal
 configs/config.yaml
+configs/session
 cmd_config.json
 
 # Plugins
