@@ -1,29 +1,23 @@
 """
-AstrBot 撤回取消回复插件 v2.0.1 (Recall Cancel)
+AstrBot Recall Cancel Plugin v2.1.0
 
-当用户撤回消息时，自动取消正在处理的 LLM 回复，防止 Bot 回复已撤回的消息。
+Cancels pending replies when the user recalls the original message.
 
-核心功能:
-- 撤回检测: 监听 QQ 群聊/私聊消息撤回事件
-- LLM 拦截: 在多个阶段检查撤回状态并阻止回复
-- 上下文清理: 同时清理 context_aware 插件中已记录的消息（如已安装）
+Highlights in v2.1.0:
+- Adapted to AstrBot 4.20.x plugin registry behavior.
+- Stops running Agent generation with agent_stop_requested plus stop_event().
+- Cleans pending state earlier and tightens UUID-like ID detection.
 
-v2.0.1 更新:
-- 修复消息ID匹配问题：正确从撤回事件中提取被撤回消息的原始ID
-- 修复撤回事件监听：使用正确的事件过滤器
-- 新增 context_aware 集成：撤回时同步清理 context_aware 中的消息记录
-- 提高事件处理优先级：确保在其他插件之前处理撤回
-- 增强日志：详细的调试信息
-
-Author: 木有知
-Version: 2.0.1
+Author: Muyouzhi
+Version: 2.1.0
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from astrbot import logger
@@ -216,82 +210,100 @@ class RecallStateManager:
 
 
 class ContextAwareIntegration:
-    """context_aware 插件集成 - 负责清理已撤回消息的上下文记录"""
+    """Integration layer for astrbot_plugin_context_aware."""
     
-    __slots__ = ("_context", "_plugin_instance", "_checked")
+    __slots__ = ("_context", "_plugin_instance", "_plugin_module_path")
     
     def __init__(self, context: star.Context) -> None:
         self._context = context
         self._plugin_instance: Any = None
-        self._checked = False
+        self._plugin_module_path: str | None = None
+    
+    @staticmethod
+    def _resolve_star_instance(star_entry: Any) -> Any:
+        star_instance = getattr(star_entry, "star_cls", None)
+        return star_instance if star_instance is not None else star_entry
+    
+    @staticmethod
+    def _is_context_aware_plugin(plugin: Any) -> bool:
+        if plugin is None:
+            return False
+        module_name = getattr(plugin.__class__, "__module__", "")
+        return (
+            "context_aware" in module_name
+            and hasattr(plugin, "remove_message")
+            and hasattr(plugin, "remove_last_bot_response")
+        )
     
     def _get_plugin(self) -> Any:
-        """获取 context_aware 插件实例"""
-        if self._checked:
-            return self._plugin_instance
+        """Get the current context_aware plugin instance if available."""
+        plugin = self._plugin_instance
+        if self._is_context_aware_plugin(plugin):
+            return plugin
         
-        self._checked = True
+        self._plugin_instance = None
+        self._plugin_module_path = None
         try:
-            # 尝试从已加载的插件中获取 context_aware
-            for star_instance in self._context.get_all_stars():
-                # 检查是否有 remove_message 方法（context_aware v2.5.1+ 提供的公开 API）
-                if hasattr(star_instance, 'remove_message') and hasattr(star_instance, 'remove_last_bot_response'):
-                    module_name = star_instance.__class__.__module__
-                    if 'context_aware' in module_name:
-                        self._plugin_instance = star_instance
-                        logger.info("[RecallCancel] 已检测到 context_aware 插件，将同步清理上下文")
-                        return self._plugin_instance
+            for star_entry in self._context.get_all_stars():
+                if getattr(star_entry, "activated", True) is False:
+                    continue
+                
+                star_instance = self._resolve_star_instance(star_entry)
+                if not self._is_context_aware_plugin(star_instance):
+                    continue
+                
+                module_name = getattr(star_instance.__class__, "__module__", "")
+                self._plugin_instance = star_instance
+                if self._plugin_module_path != module_name:
+                    logger.info("[RecallCancel] context_aware detected, sync cleanup enabled")
+                self._plugin_module_path = module_name
+                return self._plugin_instance
         except Exception as e:
-            logger.debug(f"[RecallCancel] 检查 context_aware 插件时出错: {e}")
+            logger.debug(f"[RecallCancel] Failed to inspect context_aware plugin: {e}")
         
         return None
     
-    def remove_message(self, unified_msg_origin: str, message_id: str) -> bool:
-        """从 context_aware 中删除指定消息
-        
-        Returns:
-            是否成功删除
-        """
+    async def _call_plugin_bool(self, method_name: str, *args: Any) -> bool:
         plugin = self._get_plugin()
         if plugin is None:
             return False
         
-        try:
-            # 使用 context_aware 的公开 API
-            result = plugin.remove_message(unified_msg_origin, message_id)
-            if result:
-                logger.debug(
-                    f"[RecallCancel] 已从 context_aware 删除消息 "
-                    f"(msg_id={message_id})"
-                )
-            return result
-        except Exception as e:
-            logger.warning(f"[RecallCancel] 清理 context_aware 失败: {e}")
+        method = getattr(plugin, method_name, None)
+        if method is None:
+            return False
         
-        return False
+        try:
+            result = method(*args)
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        except Exception as e:
+            logger.warning(f"[RecallCancel] context_aware.{method_name} failed: {e}")
+            return False
     
-    def remove_last_bot_response(self, unified_msg_origin: str) -> bool:
-        """删除 context_aware 中最后一条 Bot 响应
-        
-        用于撤回时同时删除 Bot 可能已记录的响应。
-        
-        Returns:
-            是否成功删除
-        """
-        plugin = self._get_plugin()
-        if plugin is None:
-            return False
-        
-        try:
-            # 使用 context_aware 的公开 API
-            result = plugin.remove_last_bot_response(unified_msg_origin)
-            if result:
-                logger.debug("[RecallCancel] 已从 context_aware 删除最后一条 Bot 响应")
-            return result
-        except Exception as e:
-            logger.warning(f"[RecallCancel] 清理 context_aware Bot 响应失败: {e}")
-        
-        return False
+    async def remove_message(self, unified_msg_origin: str, message_id: str) -> bool:
+        """Remove one user message from context_aware history."""
+        result = await self._call_plugin_bool(
+            "remove_message",
+            unified_msg_origin,
+            message_id,
+        )
+        if result:
+            logger.debug(
+                f"[RecallCancel] Removed recalled message from context_aware "
+                f"(msg_id={message_id})"
+            )
+        return result
+    
+    async def remove_last_bot_response(self, unified_msg_origin: str) -> bool:
+        """Remove the last recorded bot response from context_aware history."""
+        result = await self._call_plugin_bool(
+            "remove_last_bot_response",
+            unified_msg_origin,
+        )
+        if result:
+            logger.debug("[RecallCancel] Removed last bot response from context_aware")
+        return result
 
 
 # ============================================================================
@@ -321,158 +333,159 @@ class Main(star.Star):
     # 消息 ID 提取
     # -------------------------------------------------------------------------
     
-    def _get_message_id(self, event: AstrMessageEvent) -> str | None:
-        """从事件中提取原始消息 ID
+    @staticmethod
+    def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
+        if raw is None:
+            return default
+        if isinstance(raw, dict):
+            return raw.get(key, default)
         
-        对于普通消息：message_obj.message_id
-        对于撤回事件：raw_message 中的 message_id
-        """
+        value = getattr(raw, key, default)
+        if value is not default:
+            return value
+        
+        getter = getattr(raw, "get", None)
+        if callable(getter):
+            try:
+                return getter(key, default)
+            except TypeError:
+                try:
+                    return getter(key)
+                except Exception:
+                    return default
+            except Exception:
+                return default
+        return default
+    
+    @staticmethod
+    def _normalize_message_id(value: Any) -> str | None:
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+    
+    @staticmethod
+    def _is_uuid_like(value: str) -> bool:
+        compact = value.replace("-", "")
+        return len(compact) == 32 and all(
+            ch in "0123456789abcdefABCDEF" for ch in compact
+        )
+    
+    def _get_message_id(self, event: AstrMessageEvent) -> str | None:
+        """Extract the original message ID from a regular or recall event."""
         try:
-            # 优先从 raw_message 获取（撤回事件的情况）
-            raw = getattr(event.message_obj, 'raw_message', None)
-            if raw:
-                if isinstance(raw, dict):
-                    msg_id = raw.get('message_id')
-                    if msg_id:
-                        return str(msg_id)
-                elif hasattr(raw, 'message_id'):
-                    msg_id = getattr(raw, 'message_id', None)
-                    if msg_id:
-                        return str(msg_id)
+            raw = getattr(event.message_obj, "raw_message", None)
+            raw_msg_id = self._normalize_message_id(self._raw_get(raw, "message_id"))
+            if raw_msg_id:
+                return raw_msg_id
             
-            # 回退到 message_obj.message_id
-            msg_id = getattr(event.message_obj, 'message_id', None)
-            if msg_id:
-                # 检查是否为 UUID（撤回事件会生成新 UUID，需要排除）
-                msg_id_str = str(msg_id)
-                # UUID 格式检测（32位十六进制，允许带短横线）
-                compact = msg_id_str.replace("-", "")
-                if len(compact) == 32 and compact.isalnum():
-                    # 可能是 UUID，尝试从 raw_message 获取真实 ID
-                    return None
-                return msg_id_str
-                
+            msg_id = self._normalize_message_id(
+                getattr(event.message_obj, "message_id", None)
+            )
+            if msg_id and not self._is_uuid_like(msg_id):
+                return msg_id
         except Exception as e:
-            logger.debug(f"[RecallCancel] 提取消息ID失败: {e}")
+            logger.debug(f"[RecallCancel] Failed to extract message_id: {e}")
         
         return None
     
     def _is_recall_event(self, event: AstrMessageEvent) -> tuple[bool, str | None, str | None]:
-        """检查是否为撤回事件
-        
-        Returns:
-            (is_recall, recalled_message_id, operator_id)
-        """
+        """Return whether the event is a recall notice and its target message ID."""
         try:
-            raw = getattr(event.message_obj, 'raw_message', None)
+            raw = getattr(event.message_obj, "raw_message", None)
             if not raw:
                 return False, None, None
             
-            # 获取 notice_type
-            notice_type = None
-            if isinstance(raw, dict):
-                notice_type = raw.get('notice_type')
-                post_type = raw.get('post_type')
-            elif hasattr(raw, 'notice_type'):
-                notice_type = getattr(raw, 'notice_type', None)
-                post_type = getattr(raw, 'post_type', None)
-            else:
+            post_type = self._raw_get(raw, "post_type")
+            if post_type not in (None, "notice"):
                 return False, None, None
             
-            # 检查是否为撤回事件
+            notice_type = self._raw_get(raw, "notice_type")
             if notice_type not in (NOTICE_GROUP_RECALL, NOTICE_FRIEND_RECALL):
                 return False, None, None
             
-            # 提取被撤回消息的 ID
-            if isinstance(raw, dict):
-                recalled_msg_id = raw.get('message_id')
-                operator_id = raw.get('operator_id') or raw.get('user_id')
-            else:
-                recalled_msg_id = getattr(raw, 'message_id', None)
-                operator_id = getattr(raw, 'operator_id', None) or getattr(raw, 'user_id', None)
-            
+            recalled_msg_id = self._normalize_message_id(
+                self._raw_get(raw, "message_id")
+            )
+            operator_id = self._normalize_message_id(
+                self._raw_get(raw, "operator_id") or self._raw_get(raw, "user_id")
+            )
             if recalled_msg_id:
-                return True, str(recalled_msg_id), str(operator_id) if operator_id else None
-            
+                return True, recalled_msg_id, operator_id
         except Exception as e:
-            logger.debug(f"[RecallCancel] 检查撤回事件失败: {e}")
+            logger.debug(f"[RecallCancel] Failed to inspect recall event: {e}")
         
         return False, None, None
     
-    # -------------------------------------------------------------------------
-    # Event Handlers - 撤回事件监听
-    # -------------------------------------------------------------------------
+    @staticmethod
+    def _request_stop_event(event: AstrMessageEvent | None) -> None:
+        if event is None:
+            return
+        try:
+            event.set_extra("agent_stop_requested", True)
+        except Exception:
+            pass
+        event.stop_event()
+    
+    async def _stop_pending_request(self, pending: PendingRequest | None) -> bool:
+        if pending is None:
+            return False
+        
+        self._request_stop_event(pending.event)
+        await self._state.remove_pending_request(
+            pending.message_id,
+            pending.unified_msg_origin,
+        )
+        return True
     
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_all_message(self, event: AstrMessageEvent) -> None:
-        """监听所有消息，检测撤回事件
-        
-        撤回事件在 aiocqhttp 中以 notice 类型传入，
-        会被转换为 OTHER_MESSAGE 类型的 AstrMessageEvent。
-        """
-        # 检查是否为撤回事件
+        """Listen to all aiocqhttp events and intercept recall notices."""
         is_recall, recalled_msg_id, operator_id = self._is_recall_event(event)
-        
         if not is_recall or not recalled_msg_id:
             return
         
         self._stats.recalls_detected += 1
         umo = event.unified_msg_origin
-        
         logger.info(
-            f"[RecallCancel] 检测到撤回事件 | "
-            f"消息ID: {recalled_msg_id} | "
-            f"操作者: {operator_id} | "
-            f"会话: {umo}"
+            f"[RecallCancel] Recall detected | msg_id={recalled_msg_id} | "
+            f"operator={operator_id} | umo={umo}"
         )
         
-        # 记录撤回状态
         await self._state.add_recalled_message(
             message_id=recalled_msg_id,
             unified_msg_origin=umo,
             operator_id=operator_id or "",
         )
         
-        # 检查是否有正在处理的 LLM 请求
         pending = await self._state.get_pending_request(recalled_msg_id, umo)
-        if pending and pending.event:
+        if pending:
             logger.info(
-                f"[RecallCancel] 找到待处理的 LLM 请求，正在取消 | "
-                f"消息ID: {recalled_msg_id}"
+                f"[RecallCancel] Pending LLM request found, stopping it | "
+                f"msg_id={recalled_msg_id}"
             )
-            # 立即停止事件
-            pending.event.stop_event()
+            await self._stop_pending_request(pending)
             self._stats.llm_requests_blocked += 1
         
-        # 清理 context_aware 中的消息
-        if self._context_aware.remove_message(umo, recalled_msg_id):
+        if await self._context_aware.remove_message(umo, recalled_msg_id):
             self._stats.context_aware_cleaned += 1
             await self._state.mark_context_aware_cleaned(recalled_msg_id, umo)
         
-        # 同时删除可能已记录的 Bot 响应
-        self._context_aware.remove_last_bot_response(umo)
-        
-        # 阻止事件继续传播（撤回事件不需要其他处理）
+        await self._context_aware.remove_last_bot_response(umo)
         event.stop_event()
     
-    # -------------------------------------------------------------------------
-    # Event Handlers - LLM 请求/响应拦截
-    # -------------------------------------------------------------------------
-    
-    @filter.on_llm_request(priority=100)  # 高优先级，确保最先执行
+    @filter.on_llm_request(priority=100)  # run early
     async def on_llm_request(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """在 LLM 请求前检查消息是否已被撤回"""
+        """Block the LLM request if the source message was already recalled."""
         msg_id = self._get_message_id(event)
         if not msg_id:
             return
         
         umo = event.unified_msg_origin
         sender_id = event.get_sender_id()
-        
-        # 记录待处理请求
         await self._state.add_pending_request(
             message_id=msg_id,
             unified_msg_origin=umo,
@@ -480,62 +493,56 @@ class Main(star.Star):
             event=event,
         )
         
-        # 检查是否已被撤回
         if await self._state.is_recalled(msg_id, umo):
             logger.info(
-                f"[RecallCancel] LLM 请求阶段拦截 | "
-                f"消息已被撤回，阻止请求 | 消息ID: {msg_id}"
+                f"[RecallCancel] Blocked LLM request for recalled message | "
+                f"msg_id={msg_id}"
             )
-            event.stop_event()
+            self._request_stop_event(event)
+            await self._state.remove_pending_request(msg_id, umo)
             self._stats.llm_requests_blocked += 1
             return
         
-        logger.debug(f"[RecallCancel] 记录 LLM 请求 | 消息ID: {msg_id}")
+        logger.debug(f"[RecallCancel] Tracked LLM request | msg_id={msg_id}")
     
-    @filter.on_llm_response(priority=100)  # 高优先级
+    @filter.on_llm_response(priority=100)  # run early
     async def on_llm_response(
         self, event: AstrMessageEvent, resp: LLMResponse
     ) -> None:
-        """在 LLM 响应后检查消息是否已被撤回"""
+        """Block the final LLM response if the message was recalled."""
         msg_id = self._get_message_id(event)
         if not msg_id:
             return
         umo = event.unified_msg_origin
         
-        # 检查是否已被撤回
         if await self._state.is_recalled(msg_id, umo):
             logger.info(
-                f"[RecallCancel] LLM 响应阶段拦截 | "
-                f"消息已被撤回，阻止响应 | 消息ID: {msg_id}"
+                f"[RecallCancel] Blocked LLM response for recalled message | "
+                f"msg_id={msg_id}"
             )
-            event.stop_event()
+            self._request_stop_event(event)
+            await self._state.remove_pending_request(msg_id, umo)
             self._stats.llm_responses_blocked += 1
-            
-            # 清理 context_aware 中可能已记录的 Bot 响应
-            self._context_aware.remove_last_bot_response(umo)
+            await self._context_aware.remove_last_bot_response(umo)
     
-    @filter.on_decorating_result(priority=100)  # 高优先级
+    @filter.on_decorating_result(priority=100)  # run early
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
-        """在发送消息前最后检查一次"""
+        """Do one last check right before the message is sent."""
         msg_id = self._get_message_id(event)
         if not msg_id:
             return
         umo = event.unified_msg_origin
         
-        # 短暂延迟，给撤回事件更多时间传入
         await asyncio.sleep(0.1)
-        
-        # 检查是否已被撤回
         if await self._state.is_recalled(msg_id, umo):
             logger.info(
-                f"[RecallCancel] 发送阶段拦截 | "
-                f"消息已被撤回，阻止发送 | 消息ID: {msg_id}"
+                f"[RecallCancel] Blocked send stage for recalled message | "
+                f"msg_id={msg_id}"
             )
-            event.stop_event()
+            self._request_stop_event(event)
+            await self._state.remove_pending_request(msg_id, umo)
             self._stats.send_blocked += 1
-            
-            # 清理 context_aware
-            self._context_aware.remove_last_bot_response(umo)
+            await self._context_aware.remove_last_bot_response(umo)
     
     @filter.after_message_sent(priority=100)
     async def after_message_sent(self, event: AstrMessageEvent) -> None:

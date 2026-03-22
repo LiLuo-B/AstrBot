@@ -16,32 +16,14 @@ logs/
 temp
 cookies.json
 
-# Data files (keep plugins, ignore other data)
+# Data files
 data_v2.db
 data_v3.db
-data_v4.db
-data/attachments
-data/config
-data/dist
-data/knowledge_base
-data/logs
-data/plugin_data
-data/self_learning_data
-data/site-packages
-data/skills
-data/t2i_templates
-data/temp
-data/webchat
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/dashboard.zip
-data/plugins.json
-data/skills.json
-data/mcp_server.json
-configs/config.yaml
+data
 configs/session
+configs/config.yaml
 cmd_config.json
+
 # Plugins
 addons/plugins
 astrbot/builtin_stars/python_interpreter/workplace
@@ -81,4 +63,3 @@ GenieData/
 .kilocode/
 .worktrees/
 
-dashboard/bun.lock

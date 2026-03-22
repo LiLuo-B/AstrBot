@@ -1,7 +1,0 @@
-{
-    "name": "pc_control",
-    "author": "Your Name",
-    "version": "1.0.0",
-    "description": "Control PC power via LAN (Wake-on-LAN / SSH shutdown)",
-    "repo": ""
-}
