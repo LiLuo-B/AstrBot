@@ -9,8 +9,7 @@
     "handlersOperation": "管理行为"
   },
   "titles": {
-    "installedAstrBotPlugins": "已安装的 AstrBot 插件",
-    "pinnedPlugins": "置顶插件"
+    "installedAstrBotPlugins": "已安装的 AstrBot 插件"
   },
   "failedPlugins": {
     "title": "加载失败插件（{count}）",
@@ -44,18 +43,22 @@
     "viewInfo": "行为",
     "viewDocs": "文档",
     "viewRepo": "仓库",
+    "openPages": "Pages",
+    "openPage": "打开",
+    "openWebui": "打开插件UI界面",
     "close": "关闭",
     "save": "保存",
     "saveAndClose": "保存并关闭",
     "cancel": "取消",
+    "next": "下一步",
     "actions": "操作",
     "back": "返回",
     "selectFile": "选择文件",
     "refresh": "刷新",
     "updateAll": "更新全部插件",
-    "deleteSource": "删除源",
     "pin": "置顶",
     "unpin": "取消置顶",
+    "deleteSource": "删除源",
     "reshuffle": "随机一发"
   },
   "status": {
@@ -64,7 +67,8 @@
     "system": "系统",
     "loading": "加载中...",
     "installed": "已安装",
-    "unknown": "未知"
+    "unknown": "未知",
+    "unsupported": "不支持"
   },
   "tooltips": {
     "enable": "点击启用",
@@ -94,7 +98,41 @@
   },
   "empty": {
     "noPlugins": "暂无插件",
-    "noPluginsDesc": "尝试安装插件或者显示系统插件"
+    "noPluginsDesc": "尝试安装插件或调整搜索条件"
+  },
+  "detail": {
+    "contents": "插件行为",
+    "noContents": "暂无行为",
+    "notFound": "未找到该插件",
+    "docsTitle": "文档",
+    "docsEmpty": "暂无文档",
+    "changelogTitle": "更新日志",
+    "changelogEmpty": "暂无更新日志",
+    "subCommandsCount": "{count} 个子指令",
+    "handlerGroups": {
+      "page": "页面",
+      "skill": "技能",
+      "command": "指令/指令组",
+      "llm_tool": "LLM 工具",
+      "listener": "事件监听器",
+      "hook": "钩子",
+      "commands": "指令/指令组",
+      "hooks": "钩子",
+      "functionTools": "函数工具",
+      "eventListeners": "事件监听器"
+    },
+    "info": {
+      "title": "信息",
+      "version": "版本",
+      "author": "作者",
+      "category": "类别",
+      "stars": "Star数",
+      "tags": "标签",
+      "astrbotVersion": "AstrBot 版本要求",
+      "supportPlatforms": "支持平台",
+      "authorWebsite": "作者网站",
+      "repository": "仓库"
+    }
   },
   "market": {
     "recommended": "🥳 推荐",
@@ -131,10 +169,9 @@
     "sourceUpdated": "插件源更新成功",
     "defaultOfficialSource": "默认官方源",
     "sourceExists": "该插件源已存在",
+    "sourceResolved": "插件源可用",
     "installPlugin": "安装插件",
     "randomPlugins": "🎲 随机插件",
-    "showRandomPlugins": "显示随机插件",
-    "hideRandomPlugins": "隐藏随机插件",
     "sourceSafetyWarning": "即使是默认插件源，我们也不能完全保证插件的稳定性和安全性，使用前请谨慎核查。"
   },
   "sort": {
@@ -159,7 +196,12 @@
     },
     "config": {
       "title": "插件配置",
-      "noConfig": "这个插件没有配置"
+      "noConfig": "这个插件没有其他配置项",
+      "coreSettings": {
+        "logLevel": "日志级别",
+        "logLevelHint": "仅影响该插件的日志输出，立即生效，无需重启",
+        "followGlobal": "跟随全局"
+      }
     },
     "loading": {
       "title": "加载中...",
@@ -171,13 +213,22 @@
       "deleteConfig": "同时删除插件配置文件",
       "deleteData": "同时删除插件持久化数据",
       "configHint": "配置文件位于 data/config 目录",
-      "dataHint": "删除 data/plugin_data 和 data/plugins_data 目录下的数据"
+      "dataHint": "删除 data/plugin_data、plugins_data 目录下的数据，以及数据库中插件的 KV 数据"
     },
     "install": {
       "title": "安装插件",
       "fromFile": "从文件安装",
       "fromUrl": "从链接安装",
-      "supportPlatformsCount": "支持 {count} 个平台"
+      "supportPlatformsCount": "支持 {count} 个平台",
+      "sectionTitle": "安装",
+      "downloadSource": "将从以下位置安装插件包体：",
+      "githubSecurityWarning": "AstrBot 不能保证从 GitHub 上下载的插件的安全性。请确认你信任该插件来源后再安装。"
+    },
+    "update": {
+      "title": "更新插件",
+      "sectionTitle": "更新",
+      "downloadSource": "将从以下位置安装更新包体：",
+      "confirm": "确认更新"
     },
     "danger_warning": {
       "title": "警告",
@@ -185,7 +236,7 @@
       "confirm": "继续",
       "cancel": "取消"
     },
-    "versionCompatibility": {
+    "versionSupport": {
       "title": "版本兼容性警告",
       "message": "该插件声明的 AstrBot 版本范围与当前版本不匹配。你可以无视警告继续安装，但可能无法正常运行。",
       "confirm": "无视警告，继续安装",
@@ -200,6 +251,16 @@
       "title": "确认更新全部插件",
       "message": "确定要更新全部 {count} 个插件吗？此操作可能需要一些时间。",
       "confirm": "确认更新"
+    },
+    "sourceBinding": {
+      "title": "更换插件源",
+      "selectTitle": "选择插件安装源",
+      "noCandidates": "未在已配置的插件源中找到匹配记录，且当前插件缺少可用仓库地址。",
+      "repoOption": "直接使用仓库地址",
+      "repoOptionId": "通过 repo 重新安装",
+      "installDestination": "安装目的地",
+      "confirm": "使用该插件源",
+      "confirmAndContinue": "使用并继续"
     }
   },
   "messages": {
@@ -208,6 +269,7 @@
     "refreshSuccess": "插件列表已刷新！",
     "refreshFailed": "刷新插件列表时发生错误",
     "operationFailed": "操作失败",
+    "logLevelUpdated": "日志级别已更新并实时生效",
     "reloadSuccess": "重载成功",
     "reloadFailed": "重载失败",
     "updateSuccess": "更新成功!",
@@ -225,9 +287,25 @@
     "supportedFormats": "支持 .zip 格式的插件文件",
     "updateAllSuccess": "所有可更新的插件都已更新！",
     "updateAllFailed": "有 {failed}/{total} 个插件更新失败:",
-    "fillSourceNameAndUrl": "请填写完整的插件源名称和地址",
+    "noUpdatesAvailable": "当前没有可更新的插件",
+    "updateDisabled": "该插件缺少可用的安装源或仓库地址，无法更新或重新安装",
+    "changeSourceDisabled": "当前插件缺少可用仓库地址，无法更换插件源",
+    "fillSourceUrl": "请填写插件源地址",
+    "fillSourceName": "请填写插件源名称",
+    "resolveSourceFirst": "请先解析并校验插件源地址",
+    "sourceResolveFailed": "插件源解析失败",
     "invalidUrl": "请输入有效的URL地址",
-    "enterJsonUrl": "请输入返回插件列表JSON数据的URL地址"
+    "invalidGithubRepo": "请输入有效的 GitHub 仓库链接",
+    "enterJsonUrl": "请输入返回插件列表JSON数据的URL地址",
+    "pluginNotFound": "未找到该插件",
+    "pluginDisabled": "该插件当前已禁用，请先启用后再访问页面",
+    "pluginPageNotFound": "未找到该插件页面",
+    "pluginPageLoadFailed": "加载插件页面失败",
+    "missingMarketPluginId": "缺少合法的插件标识，无法从该插件市场源安装",
+    "sourceBindSuccess": "插件源已更新",
+    "validatingPlugin": "正在校验插件...",
+    "pluginValidateSuccess": "插件校验通过",
+    "pluginValidateFailed": "插件校验失败"
   },
   "upload": {
     "fromFile": "从文件安装",
@@ -245,7 +323,7 @@
     "emptyHint": "请上传 Skills 压缩包",
     "uploadDialogTitle": "上传 Skills",
     "uploadHint": "支持批量上传 zip 技能包，也支持拖拽批量上传 zip 技能包。系统会自动校验目录结构，并给出逐个文件的结果。",
-    "structureRequirement": "常见失败原因是压缩包结构不正确。每个 zip 必须只包含一个顶层目录，例如 `skillname/`，且该目录下必须存在 `SKILL.md`。",
+    "structureRequirement": "支持压缩包内含多个 skills 文件夹。",
     "abilityMultiple": "支持一次上传多个zip文件",
     "abilityValidate": "自动校验 `SKILL.md`",
     "abilitySkip": "自动跳过重复文件",
@@ -324,13 +402,25 @@
     "neoPayloadTitle": "Neo Payload 详情",
     "neoPayloadFailed": "读取 Payload 失败",
     "runtimeNoneWarning": "Computer Use 运行环境为无，Skills 可能无法正确被 Agent 运行，因为没有启用运行环境。",
-    "runtimeHint": "需要在配置的 “使用电脑能力” 中将运行环境设置为 “local” 或 “sandbox” 才能让 AstrBot 正常使用你提供的 Skills。",
+    "runtimeHint": "需要在配置的 “使用电脑能力” 中将运行环境设置为 “local” 或 “sandbox” 才能让 AstrBot 正常使用你提供的 Skills。工作区的 Skills 暂不在此页面显示。",
     "neoRuntimeRequired": "Neo Skills 仅在运行环境为 sandbox 且沙箱驱动为 shipyard_neo 时可用。",
     "sourceLocalOnly": "本地 Skill",
     "sourceSandboxOnly": "Sandbox 预置 Skill",
     "sourceBoth": "本地 + Sandbox",
+    "sourcePlugin": "插件：{plugin}",
     "sandboxDiscoveryPending": "尚未发现 Sandbox 预置 Skill。请至少启动一次 Sandbox 会话后再查看。",
-    "sandboxPresetReadonly": "Sandbox 预置 Skill 在此处为只读，无法在本地 Skills 页面删除或启用/禁用。"
+    "sandboxPresetReadonly": "Sandbox 预置 Skill 在此处为只读，无法在本地 Skills 页面删除或启用/禁用。",
+    "pluginReadonly": "插件提供的 Skill 由插件管理，无法在本地 Skills 页面删除或下载。",
+    "openEditor": "查看/编辑",
+    "editorTitle": "编辑 Skill",
+    "editorLoadFailed": "读取 Skill 文件失败",
+    "editorSaveFailed": "保存 Skill 文件失败",
+    "editorSaveSuccess": "保存成功",
+    "saveFile": "保存文件",
+    "readonly": "只读",
+    "unsaved": "未保存",
+    "noFileSelected": "未选择文件",
+    "discardChanges": "当前文件有未保存修改，确定要丢弃吗？"
   },
   "card": {
     "actions": {
@@ -340,7 +430,8 @@
       "togglePlugin": "插件",
       "viewHandlers": "查看行为",
       "updateTo": "更新到",
-      "reinstall": "重新安装"
+      "reinstall": "重新安装",
+      "changeSource": "更换插件源"
     },
     "status": {
       "hasUpdate": "有新版本可用",

@@ -17,7 +17,7 @@ from astrbot.core.agent.runners.deerflow.deerflow_agent_runner import (
 )
 from astrbot.core.agent.runners.dify.dify_agent_runner import DifyAgentRunner
 from astrbot.core.astr_agent_hooks import MAIN_AGENT_HOOKS
-from astrbot.core.message.components import Image
+from astrbot.core.message.components import Image, Record
 from astrbot.core.message.message_event_result import (
     MessageChain,
     MessageEventResult,
@@ -301,11 +301,15 @@ class ThirdPartyAgentSubStage(Stage):
             {},
         )
         if not self.prov_id:
-            logger.error("没有填写 Agent Runner 提供商 ID，请前往配置页面配置。")
+            logger.error(
+                "No Agent Runner provider ID is configured. Configure one on the "
+                "settings page."
+            )
             return
         if not self.prov_cfg:
             logger.error(
-                f"Agent Runner 提供商 {self.prov_id} 配置不存在，请前往配置页面修改配置。"
+                f"Configuration for Agent Runner provider {self.prov_id} does not "
+                "exist. Update it on the settings page."
             )
             return
 
@@ -317,8 +321,11 @@ class ThirdPartyAgentSubStage(Stage):
             if isinstance(comp, Image):
                 image_path = await comp.convert_to_base64()
                 req.image_urls.append(image_path)
+            elif isinstance(comp, Record):
+                audio_path = await comp.convert_to_file_path()
+                req.audio_urls.append(audio_path)
 
-        if not req.prompt and not req.image_urls:
+        if not req.prompt and not req.image_urls and not req.audio_urls:
             return
 
         custom_error_message = await self._resolve_persona_custom_error_message(event)

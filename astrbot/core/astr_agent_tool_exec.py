@@ -19,13 +19,6 @@ from astrbot.core.agent.tool_executor import BaseFunctionToolExecutor
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.astr_main_agent_resources import (
     BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT,
-    EXECUTE_SHELL_TOOL,
-    FILE_DOWNLOAD_TOOL,
-    FILE_UPLOAD_TOOL,
-    LOCAL_EXECUTE_SHELL_TOOL,
-    LOCAL_PYTHON_TOOL,
-    PYTHON_TOOL,
-    SEND_MESSAGE_TO_USER_TOOL,
 )
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.message.components import Image
@@ -37,6 +30,23 @@ from astrbot.core.message.message_event_result import (
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.provider.entites import ProviderRequest
 from astrbot.core.provider.register import llm_tools
+from astrbot.core.tools.computer_tools import (
+    CuaKeyboardTypeTool,
+    CuaMouseClickTool,
+    CuaScreenshotTool,
+    ExecuteShellTool,
+    FileDownloadTool,
+    FileEditTool,
+    FileReadTool,
+    FileUploadTool,
+    FileWriteTool,
+    GrepTool,
+    LocalExecuteShellTool,
+    LocalPythonTool,
+    PythonTool,
+    ShellSessionTool,
+)
+from astrbot.core.tools.message_tools import SendMessageToUserTool
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.history_saver import persist_agent_history
 from astrbot.core.utils.image_ref_utils import is_supported_image_ref
@@ -177,18 +187,60 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
             return
 
     @classmethod
-    def _get_runtime_computer_tools(cls, runtime: str) -> dict[str, FunctionTool]:
+    def _get_runtime_computer_tools(
+        cls,
+        runtime: str,
+        tool_mgr,
+        booter: str | None = None,
+    ) -> dict[str, FunctionTool]:
+        booter = "" if booter is None else str(booter).lower()
         if runtime == "sandbox":
-            return {
-                EXECUTE_SHELL_TOOL.name: EXECUTE_SHELL_TOOL,
-                PYTHON_TOOL.name: PYTHON_TOOL,
-                FILE_UPLOAD_TOOL.name: FILE_UPLOAD_TOOL,
-                FILE_DOWNLOAD_TOOL.name: FILE_DOWNLOAD_TOOL,
+            shell_tool = tool_mgr.get_builtin_tool(ExecuteShellTool)
+            python_tool = tool_mgr.get_builtin_tool(PythonTool)
+            upload_tool = tool_mgr.get_builtin_tool(FileUploadTool)
+            download_tool = tool_mgr.get_builtin_tool(FileDownloadTool)
+            read_tool = tool_mgr.get_builtin_tool(FileReadTool)
+            write_tool = tool_mgr.get_builtin_tool(FileWriteTool)
+            edit_tool = tool_mgr.get_builtin_tool(FileEditTool)
+            grep_tool = tool_mgr.get_builtin_tool(GrepTool)
+            tools = {
+                shell_tool.name: shell_tool,
+                python_tool.name: python_tool,
+                upload_tool.name: upload_tool,
+                download_tool.name: download_tool,
+                read_tool.name: read_tool,
+                write_tool.name: write_tool,
+                edit_tool.name: edit_tool,
+                grep_tool.name: grep_tool,
             }
+            if booter == "cua":
+                screenshot_tool = tool_mgr.get_builtin_tool(CuaScreenshotTool)
+                mouse_click_tool = tool_mgr.get_builtin_tool(CuaMouseClickTool)
+                keyboard_type_tool = tool_mgr.get_builtin_tool(CuaKeyboardTypeTool)
+                tools.update(
+                    {
+                        screenshot_tool.name: screenshot_tool,
+                        mouse_click_tool.name: mouse_click_tool,
+                        keyboard_type_tool.name: keyboard_type_tool,
+                    }
+                )
+            return tools
         if runtime == "local":
+            shell_tool = LocalExecuteShellTool()
+            shell_session_tool = tool_mgr.get_builtin_tool(ShellSessionTool)
+            python_tool = tool_mgr.get_builtin_tool(LocalPythonTool)
+            read_tool = tool_mgr.get_builtin_tool(FileReadTool)
+            write_tool = tool_mgr.get_builtin_tool(FileWriteTool)
+            edit_tool = tool_mgr.get_builtin_tool(FileEditTool)
+            grep_tool = tool_mgr.get_builtin_tool(GrepTool)
             return {
-                LOCAL_EXECUTE_SHELL_TOOL.name: LOCAL_EXECUTE_SHELL_TOOL,
-                LOCAL_PYTHON_TOOL.name: LOCAL_PYTHON_TOOL,
+                shell_tool.name: shell_tool,
+                shell_session_tool.name: shell_session_tool,
+                python_tool.name: python_tool,
+                read_tool.name: read_tool,
+                write_tool.name: write_tool,
+                edit_tool.name: edit_tool,
+                grep_tool.name: grep_tool,
             }
         return {}
 
@@ -203,14 +255,28 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
         cfg = ctx.get_config(umo=event.unified_msg_origin)
         provider_settings = cfg.get("provider_settings", {})
         runtime = str(provider_settings.get("computer_use_runtime", "local"))
-        runtime_computer_tools = cls._get_runtime_computer_tools(runtime)
+        tool_mgr = (
+            ctx.get_llm_tool_manager()
+            if hasattr(ctx, "get_llm_tool_manager")
+            else llm_tools
+        )
+        runtime_computer_tools = cls._get_runtime_computer_tools(
+            runtime,
+            tool_mgr,
+            provider_settings.get("sandbox", {}).get("booter"),
+        )
 
         # Keep persona semantics aligned with the main agent: tools=None means
         # "all tools", including runtime computer-use tools.
         if tools is None:
             toolset = ToolSet()
-            for registered_tool in llm_tools.func_list:
-                if isinstance(registered_tool, HandoffTool):
+            handoff_names = {
+                tool.name
+                for tool in tool_mgr.func_list
+                if isinstance(tool, HandoffTool)
+            }
+            for registered_tool in tool_mgr.get_full_tool_set():
+                if registered_tool.name in handoff_names:
                     continue
                 if registered_tool.active:
                     toolset.add_tool(registered_tool)
@@ -481,11 +547,12 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
             message_type=session.message_type,
         )
         cron_event.role = event.role
+        cfg = ctx.get_config(umo=event.unified_msg_origin) or {}
+        provider_settings = cfg.get("provider_settings") or {}
         config = MainAgentBuildConfig(
             tool_call_timeout=run_context.tool_call_timeout,
-            streaming_response=ctx.get_config()
-            .get("provider_settings", {})
-            .get("stream", False),
+            streaming_response=provider_settings.get("stream", False),
+            provider_settings=provider_settings,
         )
 
         req = ProviderRequest()
@@ -515,7 +582,9 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
         )
         if not req.func_tool:
             req.func_tool = ToolSet()
-        req.func_tool.add_tool(SEND_MESSAGE_TO_USER_TOOL)
+        req.func_tool.add_tool(
+            ctx.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
+        )
 
         result = await build_main_agent(
             event=cron_event, plugin_context=ctx, config=config, req=req

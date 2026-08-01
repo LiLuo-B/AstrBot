@@ -1,8 +1,9 @@
 import asyncio
 import base64
+import copy
+import logging
 import os
 import random
-import uuid
 from typing import cast
 
 import aiofiles
@@ -15,14 +16,23 @@ from botpy import Client
 from botpy.http import Route
 from botpy.types import message
 from botpy.types.message import MarkdownPayload, Media
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import File, Image, Plain, Record, Video
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
-from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
-from astrbot.core.utils.io import download_image_by_url, file_to_base64
-from astrbot.core.utils.tencent_record_helper import wav_to_tencent_silk
+from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path, is_file_uri
+
+
+class APIReturnNoneError(Exception):
+    pass
 
 
 def _patch_qq_botpy_formdata() -> None:
@@ -43,6 +53,34 @@ def _patch_qq_botpy_formdata() -> None:
 
 
 _patch_qq_botpy_formdata()
+
+
+def _qqofficial_retry(max_attempts: int = 5):
+    """Retry decorator for QQ Official API transient errors (HTTP 500/504)"""
+    return retry(
+        retry=retry_if_exception_type(
+            (
+                botpy.errors.ServerError,
+                botpy.errors.SequenceNumberError,
+                OSError,
+                asyncio.TimeoutError,
+                APIReturnNoneError,
+            )
+        ),
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+
+
+_QQOFFICIAL_SEND_API_ERRORS = (
+    botpy.errors.ForbiddenError,
+    botpy.errors.MethodNotAllowedError,
+    botpy.errors.NotFoundError,
+    botpy.errors.SequenceNumberError,
+    botpy.errors.ServerError,
+)
 
 
 class QQOfficialMessageEvent(AstrMessageEvent):
@@ -86,11 +124,8 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                 source = self.message_obj.raw_message
 
                 if not isinstance(source, botpy.message.C2CMessage):
-                    # 非 C2C 场景：直接累积，最后统一发
-                    if not self.send_buffer:
-                        self.send_buffer = chain
-                    else:
-                        self.send_buffer.chain.extend(chain.chain)
+                    # 非 C2C 场景：直接累积，最后统一发（拷贝 delta，避免引用丢首字）
+                    self._append_stream_delta(chain)
                     continue
 
                 # ---- C2C 流式场景 ----
@@ -113,11 +148,8 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     last_edit_time = 0
                     continue
 
-                # 累积内容
-                if not self.send_buffer:
-                    self.send_buffer = chain
-                else:
-                    self.send_buffer.chain.extend(chain.chain)
+                # 累积内容（拷贝，避免上游复用 MessageChain 改写 buffer）
+                self._append_stream_delta(chain)
 
                 # 节流：按时间间隔发送中间分片
                 current_time = asyncio.get_running_loop().time()
@@ -148,6 +180,26 @@ class QQOfficialMessageEvent(AstrMessageEvent):
 
         return None
 
+    def _append_stream_delta(self, chain: MessageChain) -> None:
+        """Append stream delta into an owned buffer (copy components).
+
+        Holding the yielded MessageChain by reference drops leading characters
+        when upstream reuses/mutates the same chain between yields. Non-Plain
+        components are deep-copied for the same reason.
+        """
+        if not self.send_buffer:
+            self.send_buffer = MessageChain(
+                use_t2i_=chain.use_t2i_,
+                use_markdown_=chain.use_markdown_,
+                type=chain.type,
+            )
+        for comp in chain.chain:
+            if isinstance(comp, Plain):
+                # Preserve original text value (do not coerce falsy with `or ""`).
+                self.send_buffer.chain.append(Plain(text=comp.text))
+            else:
+                self.send_buffer.chain.append(copy.deepcopy(comp))
+
     @staticmethod
     def _extract_response_message_id(ret) -> str | None:
         """兼容 qq-botpy 返回 Message 对象或 dict 两种形态。"""
@@ -159,8 +211,60 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         ret_id = getattr(ret, "id", None)
         return str(ret_id) if ret_id is not None else None
 
+    @staticmethod
+    def _split_message_chain_by_media(message: MessageChain) -> list[MessageChain]:
+        chunks: list[MessageChain] = []
+        current_chain = []
+        current_has_media = False
+
+        for component in message.chain:
+            is_media = isinstance(component, Image | Record | Video | File)
+            if is_media and current_has_media:
+                chunks.append(
+                    MessageChain(
+                        chain=current_chain,
+                        use_t2i_=message.use_t2i_,
+                        type=message.type,
+                    )
+                )
+                current_chain = []
+                current_has_media = False
+
+            current_chain.append(component)
+            current_has_media = current_has_media or is_media
+
+        if current_chain or not message.chain:
+            chunks.append(
+                MessageChain(
+                    chain=current_chain,
+                    use_t2i_=message.use_t2i_,
+                    type=message.type,
+                )
+            )
+
+        return chunks
+
     async def _post_send(self, stream: dict | None = None):
         if not self.send_buffer:
+            return None
+
+        message_chains = self._split_message_chain_by_media(self.send_buffer)
+        stream_for_chain = stream if len(message_chains) == 1 else None
+
+        ret = None
+        for message_chain in message_chains:
+            ret = await self._post_send_one(message_chain, stream_for_chain)
+
+        self.send_buffer = None
+
+        return ret
+
+    async def _post_send_one(
+        self,
+        message_to_send: MessageChain,
+        stream: dict | None = None,
+    ):
+        if not message_to_send:
             return None
 
         source = self.message_obj.raw_message
@@ -183,10 +287,14 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             video_file_source,
             file_source,
             file_name,
-        ) = await QQOfficialMessageEvent._parse_to_qqofficial(self.send_buffer)
+        ) = await QQOfficialMessageEvent._parse_to_qqofficial(message_to_send)
+        if record_file_path:
+            self.track_temporary_local_file(record_file_path)
 
         # C2C 流式仅用于文本分片，富媒体时降级为普通发送，避免平台侧流式校验报错。
-        if stream and (image_base64 or record_file_path):
+        if stream and (
+            image_base64 or record_file_path or video_file_source or file_source
+        ):
             logger.debug("[QQOfficial] 检测到富媒体，降级为非流式发送。")
             stream = None
 
@@ -211,12 +319,20 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         ):
             plain_text = plain_text + "\n"
 
-        payload: dict = {
-            # "content": plain_text,
-            "markdown": MarkdownPayload(content=plain_text) if plain_text else None,
-            "msg_type": 2,
-            "msg_id": self.message_obj.message_id,
-        }
+        # 根据消息链的 use_markdown_ 标记决定发送模式
+        use_md = getattr(self.send_buffer, "use_markdown_", None)
+        if use_md is False:
+            payload: dict = {
+                "content": plain_text,
+                "msg_type": 0,
+                "msg_id": self.message_obj.message_id,
+            }
+        else:
+            payload = {
+                "markdown": MarkdownPayload(content=plain_text) if plain_text else None,
+                "msg_type": 2,
+                "msg_id": self.message_obj.message_id,
+            }
 
         if not isinstance(source, botpy.message.Message | botpy.message.DirectMessage):
             payload["msg_seq"] = random.randint(1, 10000)
@@ -384,9 +500,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             case _:
                 pass
 
-        await super().send(self.send_buffer)
-
-        self.send_buffer = None
+        await super().send(message_to_send)
 
         return ret
 
@@ -399,7 +513,22 @@ class QQOfficialMessageEvent(AstrMessageEvent):
     ):
         try:
             return await send_func(payload)
-        except botpy.errors.ServerError as err:
+        except _QQOFFICIAL_SEND_API_ERRORS as err:
+            logger.info("[QQOfficial] 回复消息失败: %s, 尝试使用主动发送接口。", err)
+            if payload.get("msg_id"):
+                fallback_payload = payload.copy()
+                fallback_payload.pop("msg_id", None)
+                try:
+                    ret = await send_func(fallback_payload)
+                    logger.info("[QQOfficial] 使用主动发送接口发送成功。")
+                    return ret
+                except _QQOFFICIAL_SEND_API_ERRORS as fallback_err:
+                    err = fallback_err
+                    payload = fallback_payload
+
+            if not isinstance(err, botpy.errors.ServerError):
+                raise
+
             # QQ 流式 markdown 分片校验：内容必须以换行结尾。
             # 某些边界场景服务端仍可能判定失败，这里做一次修正重试。
             if stream and self.STREAM_MARKDOWN_NEWLINE_ERROR in str(err):
@@ -453,21 +582,34 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             "srv_send_msg": False,
         }
 
-        result = None
-        if "openid" in kwargs:
-            payload["openid"] = kwargs["openid"]
-            route = Route("POST", "/v2/users/{openid}/files", openid=kwargs["openid"])
+        @_qqofficial_retry()
+        async def _do_upload():
+            if "openid" in kwargs:
+                payload["openid"] = kwargs["openid"]
+                route = Route(
+                    "POST", "/v2/users/{openid}/files", openid=kwargs["openid"]
+                )
+            elif "group_openid" in kwargs:
+                payload["group_openid"] = kwargs["group_openid"]
+                route = Route(
+                    "POST",
+                    "/v2/groups/{group_openid}/files",
+                    group_openid=kwargs["group_openid"],
+                )
+            else:
+                raise ValueError("Invalid upload parameters")
+
             result = await self.bot.api._http.request(route, json=payload)
-        elif "group_openid" in kwargs:
-            payload["group_openid"] = kwargs["group_openid"]
-            route = Route(
-                "POST",
-                "/v2/groups/{group_openid}/files",
-                group_openid=kwargs["group_openid"],
-            )
-            result = await self.bot.api._http.request(route, json=payload)
-        else:
-            raise ValueError("Invalid upload parameters")
+            if result is None:
+                err_msg = "上传图片API返回None，触发重试"
+                raise APIReturnNoneError(err_msg)
+            return result
+
+        try:
+            result = await _do_upload()
+        except APIReturnNoneError:
+            logger.warning(f"上传图片API返回None，共尝试5次后放弃: {payload}")
+            raise
 
         if not isinstance(result, dict):
             raise RuntimeError(
@@ -490,7 +632,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
     ) -> Media | None:
         """上传媒体文件"""
         # 构建基础payload
-        payload = {"file_type": file_type, "srv_send_msg": srv_send_msg}
+        payload: dict = {"file_type": file_type, "srv_send_msg": srv_send_msg}
         if file_name:
             payload["file_name"] = file_name
 
@@ -519,9 +661,16 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         else:
             return None
 
-        try:
-            # 使用底层HTTP请求
+        @_qqofficial_retry()
+        async def _do_upload():
             result = await self.bot.api._http.request(route, json=payload)
+            if result is None:
+                err_msg = "上传文件API返回None，触发重试"
+                raise APIReturnNoneError(err_msg)
+            return result
+
+        try:
+            result = await _do_upload()
 
             if result:
                 if not isinstance(result, dict):
@@ -533,6 +682,10 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     file_info=result["file_info"],
                     ttl=result.get("ttl", 0),
                 )
+        except APIReturnNoneError:
+            logger.warning(f"上传文件API返回None，共尝试5次后放弃: {file_source}")
+        except (botpy.errors.ServerError, botpy.errors.SequenceNumberError):
+            logger.error(f"上传媒体文件失败，共尝试5次后放弃: {file_source}")
         except Exception as e:
             logger.error(f"上传请求错误: {e}")
 
@@ -553,9 +706,11 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         markdown: message.MarkdownPayload | None = None,
         keyboard: message.Keyboard | None = None,
         stream: dict | None = None,
-    ) -> message.Message:
+    ) -> message.Message | None:
         payload = locals()
         payload.pop("self", None)
+        if payload.get("msg_id") is None:
+            payload.pop("msg_id", None)
         # QQ API does not accept stream.id=None; remove it when not yet assigned
         if "stream" in payload and payload["stream"] is not None:
             stream_data = dict(payload["stream"])
@@ -563,11 +718,26 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                 stream_data.pop("id", None)
             payload["stream"] = stream_data
         route = Route("POST", "/v2/users/{openid}/messages", openid=openid)
-        result = await self.bot.api._http.request(route, json=payload)
 
-        if result is None:
-            logger.warning("[QQOfficial] post_c2c_message: API 返回 None，跳过本次发送")
+        retry_times = 3
+
+        @_qqofficial_retry(retry_times)
+        async def _do_request():
+            result = await self.bot.api._http.request(route, json=payload)
+            if result is None:
+                err_msg = "发送消息API返回None，触发重试"
+                raise APIReturnNoneError(err_msg)
+            return result
+
+        result = None
+        try:
+            result = await _do_request()
+        except APIReturnNoneError:
+            logger.warning(
+                f"[QQOfficial] post_c2c_message: 发送消息失败，API 返回 None，共尝试{retry_times}次后放弃"
+            )
             return None
+
         if not isinstance(result, dict):
             logger.error(f"[QQOfficial] post_c2c_message: 响应不是 dict: {result}")
             return None
@@ -587,53 +757,46 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             if isinstance(i, Plain):
                 plain_text += i.text
             elif isinstance(i, Image) and not image_base64:
-                if i.file and i.file.startswith("file:///"):
-                    image_base64 = file_to_base64(i.file[8:])
-                    image_file_path = i.file[8:]
-                elif i.file and i.file.startswith("http"):
-                    image_file_path = await download_image_by_url(i.file)
-                    image_base64 = file_to_base64(image_file_path)
-                elif i.file and i.file.startswith("base64://"):
-                    image_base64 = i.file
-                elif i.file:
-                    image_base64 = file_to_base64(i.file)
-                else:
+                if not i.file:
                     raise ValueError("Unsupported image file format")
-                image_base64 = image_base64.removeprefix("base64://")
-            elif isinstance(i, Record):
-                if i.file:
-                    record_wav_path = await i.convert_to_file_path()  # wav 路径
-                    temp_dir = get_astrbot_temp_path()
-                    record_tecent_silk_path = os.path.join(
-                        temp_dir,
-                        f"qqofficial_{uuid.uuid4()}.silk",
-                    )
+                image_is_local = is_file_uri(i.file)
+                if not image_is_local:
                     try:
-                        duration = await wav_to_tencent_silk(
-                            record_wav_path,
-                            record_tecent_silk_path,
+                        image_is_local = os.path.exists(i.file)
+                    except OSError:
+                        image_is_local = False
+                resolver = MediaResolver(i.file, media_type="image")
+                if image_is_local:
+                    async with resolver.as_path() as resolved:
+                        image_file_path = str(resolved.path.resolve())
+                        image_base64 = resolved.to_base64()
+                else:
+                    image_base64 = await resolver.to_base64()
+            elif isinstance(i, Record):
+                record_ref = i.url or i.file
+                if record_ref:
+                    try:
+                        record_file_path = await MediaResolver(
+                            record_ref,
+                            media_type="audio",
+                            default_suffix=".wav",
+                        ).to_path(
+                            target_format="tencent_silk",
                         )
-                        if duration > 0:
-                            record_file_path = record_tecent_silk_path
-                        else:
-                            record_file_path = None
-                            logger.error("转换音频格式时出错：音频时长不大于0")
                     except Exception as e:
                         logger.error(f"处理语音时出错: {e}")
                         record_file_path = None
             elif isinstance(i, Video) and not video_file_source:
-                if i.file.startswith("file:///"):
-                    video_file_source = i.file[8:]
+                if is_file_uri(i.file):
+                    video_file_source = file_uri_to_path(i.file)
                 else:
                     video_file_source = i.file
             elif isinstance(i, File) and not file_source:
                 file_name = i.name
                 if i.file_:
                     file_path = i.file_
-                    if file_path.startswith("file:///"):
-                        file_path = file_path[8:]
-                    elif file_path.startswith("file://"):
-                        file_path = file_path[7:]
+                    if is_file_uri(file_path):
+                        file_path = file_uri_to_path(file_path)
                     file_source = file_path
                 elif i.url:
                     file_source = i.url

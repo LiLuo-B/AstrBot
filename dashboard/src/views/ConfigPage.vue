@@ -44,39 +44,41 @@
       <v-slide-y-transition mode="out-in">
         <div v-if="(selectedConfigID || isSystemConfig) && fetched" :key="configContentKey" class="config-content" style="width: 100%;">
           <!-- 可视化编辑 -->
-          <AstrBotCoreConfigWrapper 
-            :metadata="metadata" 
+          <AstrBotCoreConfigWrapper
+            :metadata="metadata"
             :config_data="config_data"
             :search-keyword="configSearchKeyword"
           />
-
-          <v-tooltip :text="tm('actions.save')" location="left">
-            <template v-slot:activator="{ props }">
-              <v-btn v-bind="props" icon="mdi-content-save" size="x-large" style="position: fixed; right: 52px; bottom: 52px;"
-                color="darkprimary" @click="updateConfig">
-              </v-btn>
-            </template>
-          </v-tooltip>
-
-          <v-tooltip :text="tm('codeEditor.title')" location="left">
-            <template v-slot:activator="{ props }">
-              <v-btn v-bind="props" icon="mdi-code-json" size="x-large" style="position: fixed; right: 52px; bottom: 124px;" color="primary"
-                @click="configToString(); codeEditorDialog = true">
-              </v-btn>
-            </template>
-          </v-tooltip>
-
-          <v-tooltip text="测试当前配置" location="left" v-if="!isSystemConfig">
-            <template v-slot:activator="{ props }">
-              <v-btn v-bind="props" icon="mdi-chat-processing" size="x-large" 
-                style="position: fixed; right: 52px; bottom: 196px;" color="secondary"
-                @click="openTestChat">
-              </v-btn>
-            </template>
-          </v-tooltip>
-
         </div>
       </v-slide-y-transition>
+
+      <!-- 浮动按钮放在 transition 外部 -->
+      <template v-if="(selectedConfigID || isSystemConfig) && fetched">
+        <v-tooltip :text="tm('actions.save')" location="left">
+          <template v-slot:activator="{ props }">
+            <v-btn v-bind="props" icon="mdi-content-save" size="x-large" style="position: fixed; right: 52px; bottom: 52px;"
+              color="darkprimary" @click="updateConfig">
+            </v-btn>
+          </template>
+        </v-tooltip>
+
+        <v-tooltip :text="tm('codeEditor.title')" location="left">
+          <template v-slot:activator="{ props }">
+            <v-btn v-bind="props" icon="mdi-code-json" size="x-large" style="position: fixed; right: 52px; bottom: 124px;" color="primary"
+              @click="configToString(); codeEditorDialog = true">
+            </v-btn>
+          </template>
+        </v-tooltip>
+
+        <v-tooltip text="测试当前配置" location="left" v-if="!isSystemConfig">
+          <template v-slot:activator="{ props }">
+            <v-btn v-bind="props" icon="mdi-chat-processing" size="x-large"
+              style="position: fixed; right: 52px; bottom: 196px;" color="secondary"
+              @click="openTestChat">
+            </v-btn>
+          </template>
+        </v-tooltip>
+      </template>
 
     </div>
   </div>
@@ -86,15 +88,15 @@
   <v-dialog v-model="codeEditorDialog" fullscreen transition="dialog-bottom-transition" scrollable>
     <v-card>
       <v-toolbar color="primary" dark>
-        <v-btn icon @click="codeEditorDialog = false">
+        <v-btn icon variant="text" @click="codeEditorDialog = false">
           <v-icon>mdi-close</v-icon>
         </v-btn>
         <v-toolbar-title>{{ tm('codeEditor.title') }}</v-toolbar-title>
         <v-spacer></v-spacer>
         <v-toolbar-items style="display: flex; align-items: center;">
-          <v-btn style="margin-left: 16px;" size="small" @click="configToString()">{{
+          <v-btn style="margin-left: 16px;" size="small" variant="text" @click="configToString()">{{
             tm('editor.revertCode') }}</v-btn>
-          <v-btn v-if="config_data_has_changed" style="margin-left: 16px;" size="small" @click="applyStrConfig()">{{
+          <v-btn v-if="config_data_has_changed" style="margin-left: 16px;" size="small" variant="tonal" @click="applyStrConfig()">{{
             tm('editor.applyConfig') }}</v-btn>
           <small style="margin-left: 16px;">💡 {{ tm('editor.applyTip') }}</small>
         </v-toolbar-items>
@@ -110,8 +112,8 @@
   <!-- Config Management Dialog -->
   <v-dialog v-model="configManageDialog" max-width="800px">
     <v-card>
-      <v-card-title class="d-flex align-center justify-space-between">
-        <span class="text-h4">{{ tm('configManagement.title') }}</span>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center justify-space-between">
+        <span>{{ tm('configManagement.title') }}</span>
         <v-btn icon="mdi-close" variant="text" @click="configManageDialog = false"></v-btn>
       </v-card-title>
 
@@ -126,11 +128,15 @@
         <!-- Config List -->
         <v-list lines="two">
           <v-list-item v-for="config in configInfoList" :key="config.id" :title="config.name">
-            <template v-slot:append v-if="config.id !== 'default'">
+            <template v-slot:append>
               <div class="d-flex align-center" style="gap: 8px;">
+                <v-btn icon="mdi-content-copy" size="small" variant="text" color="primary"
+                  @click="startCopyConfig(config)"></v-btn>
                 <v-btn icon="mdi-pencil" size="small" variant="text" color="warning"
+                  v-if="config.id !== 'default'"
                   @click="startEditConfig(config)"></v-btn>
                 <v-btn icon="mdi-delete" size="small" variant="text" color="error"
+                  v-if="config.id !== 'default'"
                   @click="confirmDeleteConfig(config)"></v-btn>
               </div>
             </template>
@@ -141,7 +147,7 @@
         <v-divider v-if="showConfigForm" class="my-6"></v-divider>
 
         <div v-if="showConfigForm">
-          <h3 class="mb-4">{{ isEditingConfig ? tm('configManagement.editConfig') : tm('configManagement.newConfig') }}</h3>
+          <h3 class="mb-4">{{ configFormTitle }}</h3>
 
           <h4>{{ tm('configManagement.configName') }}</h4>
 
@@ -150,8 +156,8 @@
 
           <div class="d-flex justify-end mt-4" style="gap: 8px;">
             <v-btn variant="text" @click="cancelConfigForm">{{ tm('buttons.cancel') }}</v-btn>
-            <v-btn color="primary" @click="saveConfigForm"
-              :disabled="!configFormData.name">
+            <v-btn color="primary" variant="tonal" @click="saveConfigForm"
+              :disabled="isConfigFormSaveDisabled">
               {{ isEditingConfig ? tm('buttons.update') : tm('buttons.create') }}
             </v-btn>
           </div>
@@ -160,11 +166,18 @@
     </v-card>
   </v-dialog>
 
-  <v-snackbar :timeout="3000" elevation="24" :color="save_message_success" v-model="save_message_snack">
+  <v-snackbar :timeout="3000" elevation="6" :color="save_message_success" v-model="save_message_snack">
     {{ save_message }}
   </v-snackbar>
 
-  <WaitingForRestart ref="wfr"></WaitingForRestart>
+  <DashboardTwoFactorDialog
+    v-model="configSave2faDialogVisible"
+    :error-message="configSave2faError"
+    :saving="configSave2faSaving"
+    :rotation-hint="configSave2faRotationHint"
+    @confirm="handleConfigSave2faConfirm"
+    @cancel="handleConfigSave2faCancel"
+  />
 
   <!-- 测试聊天抽屉 -->
   <v-overlay
@@ -201,18 +214,17 @@
 
 
 <script>
-import axios from 'axios';
+import { configProfileApi, systemConfigApi } from '@/api/v1';
 import AstrBotCoreConfigWrapper from '@/components/config/AstrBotCoreConfigWrapper.vue';
-import WaitingForRestart from '@/components/shared/WaitingForRestart.vue';
 import StandaloneChat from '@/components/chat/StandaloneChat.vue';
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import { useI18n, useModuleI18n } from '@/i18n/composables';
-import { restartAstrBot as restartAstrBotRuntime } from '@/utils/restartAstrBot';
 import {
   askForConfirmation as askForConfirmationDialog,
   useConfirmDialog
 } from '@/utils/confirmDialog';
 import UnsavedChangesConfirmDialog from '@/components/config/UnsavedChangesConfirmDialog.vue';
+import DashboardTwoFactorDialog from '@/components/shared/DashboardTwoFactorDialog.vue';
 import { normalizeTextInput } from '@/utils/inputValue';
 
 export default {
@@ -220,9 +232,9 @@ export default {
   components: {
     AstrBotCoreConfigWrapper,
     VueMonacoEditor,
-    WaitingForRestart,
     StandaloneChat,
-    UnsavedChangesConfirmDialog
+    UnsavedChangesConfirmDialog,
+    DashboardTwoFactorDialog
   },
   props: {
     initialConfigId: {
@@ -233,11 +245,13 @@ export default {
   setup() {
     const { t } = useI18n();
     const { tm } = useModuleI18n('features/config');
+    const { tm: tmMeta } = useModuleI18n('features/config-metadata');
     const confirmDialog = useConfirmDialog();
 
     return {
       t,
       tm,
+      tmMeta,
       confirmDialog
     };
   },
@@ -297,6 +311,19 @@ export default {
     selectedConfigInfo() {
       return this.configInfoList.find(info => info.id === this.selectedConfigID) || {};
     },
+    configFormTitle() {
+      if (this.isEditingConfig) {
+        return this.tm('configManagement.editConfig');
+      }
+      if (this.isCopyingConfig) {
+        return this.tm('configManagement.copyConfig');
+      }
+      return this.tm('configManagement.newConfig');
+    },
+    isConfigFormSaveDisabled() {
+      const isNameEmpty = !this.normalizeConfigName(this.configFormData.name);
+      return isNameEmpty || (this.isCopyingConfig && !this.copySourceConfigId);
+    },
     configSelectItems() {
       const items = [...this.configInfoList];
       items.push({
@@ -326,6 +353,10 @@ export default {
       }
     },
     async '$route.fullPath'(newVal) {
+      if (this.extractConfigTypeFromHash(newVal) === 'system') {
+        this.$router.replace('/settings#system-config');
+        return;
+      }
       await this.syncConfigTypeFromHash(newVal);
     },
     initialConfigId(newVal) {
@@ -343,6 +374,7 @@ export default {
       configManageDialog: false,
       showConfigForm: false,
       isEditingConfig: false,
+      isCopyingConfig: false,
       config_data_has_changed: false,
       config_data_str: "",
       config_data: {
@@ -353,8 +385,13 @@ export default {
       save_message_snack: false,
       save_message: "",
       save_message_success: "",
-  configContentKey: 0,
+      configContentKey: 0,
       lastSavedConfigSnapshot: '',
+      configSave2faDialogVisible: false,
+      configSave2faError: '',
+      configSave2faSaving: false,
+      configSave2faRotationHint: '',
+      configSavePendingPostData: null,
 
       // 配置类型切换
       configType: 'normal', // 'normal' 或 'system'
@@ -371,6 +408,7 @@ export default {
         name: '',
       },
       editingConfigId: null,
+      copySourceConfigId: '',
 
       // 测试聊天
       testChatDrawer: false,
@@ -386,6 +424,10 @@ export default {
     const hashConfigType = this.extractConfigTypeFromHash(
       this.$route?.fullPath || ''
     );
+    if (hashConfigType === 'system') {
+      this.$router.replace('/settings#system-config');
+      return;
+    }
     this.configType = hashConfigType || 'normal';
     this.isSystemConfig = this.configType === 'system';
 
@@ -413,15 +455,12 @@ export default {
     // 处理语言切换事件，重新加载配置以获取插件的 i18n 数据
     handleLocaleChange() {
       // 重新加载当前配置
-      if (this.selectedConfigID) {
-        this.getConfig(this.selectedConfigID);
-      } else if (this.isSystemConfig) {
+      if (this.isSystemConfig) {
         this.getConfig();
+      } else if (this.selectedConfigID) {
+        this.getConfig(this.selectedConfigID);
       }
     },
-
-  },
-  methods: {
     onConfigSearchInput(value) {
       this.configSearchKeyword = normalizeTextInput(value);
     },
@@ -446,7 +485,7 @@ export default {
     },
     getConfigInfoList(abconf_id) {
       // 获取配置列表
-      axios.get('/api/config/abconfs').then((res) => {
+      configProfileApi.list().then((res) => {
         this.configInfoList = res.data.data.info_list;
 
         if (abconf_id) {
@@ -476,17 +515,11 @@ export default {
     },
     getConfig(abconf_id) {
       this.fetched = false
-      const params = {};
+      const request = this.isSystemConfig
+        ? systemConfigApi.get()
+        : configProfileApi.get(abconf_id || this.selectedConfigID);
 
-      if (this.isSystemConfig) {
-        params.system_config = '1';
-      } else {
-        params.id = abconf_id || this.selectedConfigID;
-      }
-
-      axios.get('/api/config/abconf', {
-        params: params
-      }).then((res) => {
+      request.then((res) => {
         this.config_data = res.data.data.config;
         this.lastSavedConfigSnapshot = this.getConfigSnapshot(this.config_data);
         this.fetched = true
@@ -506,7 +539,7 @@ export default {
         this.save_message_success = "error";
       });
     },
-    updateConfig() {
+    async updateConfig() {
       if (!this.fetched) return;
 
       const postData = {
@@ -519,30 +552,99 @@ export default {
         postData.conf_id = this.selectedConfigID;
       }
 
-      return axios.post('/api/config/astrbot/update', postData).then((res) => {
+      return this.saveAstrbotConfig(postData);
+    },
+    async saveAstrbotConfig(postData, headers = {}, allow2faPrompt = true) {
+      try {
+        const confId = postData.conf_id || 'default';
+        const requestConfig = {
+          headers,
+          validateStatus: (status) => (status >= 200 && status < 300) || status === 401,
+        };
+        const res = this.isSystemConfig
+          ? await systemConfigApi.update(postData.config, requestConfig)
+          : await configProfileApi.update(confId, postData.config, requestConfig);
+
+        if (res.status === 401 && res.data?.data?.totp_required) {
+          if (allow2faPrompt && !headers['X-2FA-Code']) {
+            this.configSavePendingPostData = JSON.parse(JSON.stringify(postData));
+            this.configSave2faError = '';
+            this.configSave2faRotationHint = this._getConfigSaveRotationHint(postData);
+            this.configSave2faDialogVisible = true;
+            return { success: false, requires2fa: true };
+          }
+          this.configSave2faError = this.tmMeta('system_group.system.dashboard.totp.configSaveError');
+          this.configSave2faDialogVisible = true;
+          return { success: false, requires2fa: true };
+        }
+
         if (res.data.status === "ok") {
+          this.configSavePendingPostData = null;
+          this.configSave2faDialogVisible = false;
+          this.configSave2faError = '';
           this.lastSavedConfigSnapshot = this.getConfigSnapshot(this.config_data);
           this.save_message = res.data.message || this.messages.saveSuccess;
           this.save_message_snack = true;
           this.save_message_success = "success";
           this.onConfigSaved();
 
-          if (this.isSystemConfig) {
-            restartAstrBotRuntime(this.$refs.wfr).catch(() => {})
-          }
           return { success: true };
-        } else {
-          this.save_message = res.data.message || this.messages.saveError;
-          this.save_message_snack = true;
-          this.save_message_success = "error";
-          return { success: false };
         }
-      }).catch((err) => {
+
+        this.save_message = res.data.message || this.messages.saveError;
+        this.save_message_snack = true;
+        this.save_message_success = "error";
+        return { success: false };
+      } catch (err) {
         this.save_message = this.messages.saveError;
         this.save_message_snack = true;
         this.save_message_success = "error";
         return { success: false };
-      });
+      }
+    },
+    async handleConfigSave2faConfirm(payload) {
+      if (!this.configSavePendingPostData || this.configSave2faSaving) {
+        return;
+      }
+      this.configSave2faSaving = true;
+      this.configSave2faError = '';
+      const headers = {
+        'X-2FA-Code': payload,
+      };
+      try {
+        await this.saveAstrbotConfig(
+          JSON.parse(JSON.stringify(this.configSavePendingPostData)),
+          headers,
+          false,
+        );
+      } finally {
+        this.configSave2faSaving = false;
+      }
+    },
+    handleConfigSave2faCancel() {
+      if (this.lastSavedConfigSnapshot && this.config_data?.dashboard?.totp) {
+        try {
+          const savedConfig = JSON.parse(this.lastSavedConfigSnapshot);
+          const savedTotp = savedConfig?.dashboard?.totp;
+          if (savedTotp) {
+            this.config_data.dashboard.totp.enable = savedTotp.enable;
+            this.config_data.dashboard.totp.secret = savedTotp.secret;
+            this.config_data.dashboard.totp.recovery_code_hash = savedTotp.recovery_code_hash;
+          }
+        } catch (_) {
+          // ignore parse errors
+        }
+      }
+      this.configSavePendingPostData = null;
+      this.configSave2faError = '';
+      this.configSave2faDialogVisible = false;
+    },
+    _getConfigSaveRotationHint(postData) {
+      const postedSecret = postData?.config?.dashboard?.totp?.secret;
+      if (postedSecret && typeof postedSecret === 'string' && postedSecret.trim()) {
+        return this.tmMeta('system_group.system.dashboard.totp.configSaveRotationHint');
+      }
+      return '';
     },
     // 重置未保存状态
     onConfigSaved() {
@@ -567,9 +669,9 @@ export default {
         this.save_message_snack = true;
       }
     },
-    createNewConfig() {
-      axios.post('/api/config/abconf/new', {
-        name: this.configFormData.name
+    createNewConfig(configName) {
+      configProfileApi.create({
+        name: configName
       }).then((res) => {
         if (res.data.status === "ok") {
           this.save_message = res.data.message;
@@ -587,6 +689,24 @@ export default {
         this.save_message = this.tm('configManagement.createFailed');
         this.save_message_snack = true;
         this.save_message_success = "error";
+      });
+    },
+    normalizeConfigName(name) {
+      return typeof name === 'string' ? name.trim() : '';
+    },
+    hasDuplicateConfigName(name, excludeId = null) {
+      const normalizedName = this.normalizeConfigName(name);
+      if (!normalizedName) {
+        return false;
+      }
+      return this.configInfoList.some((config) => {
+        if (!config || !config.name) {
+          return false;
+        }
+        if (excludeId && config.id === excludeId) {
+          return false;
+        }
+        return this.normalizeConfigName(config.name) === normalizedName;
       });
     },
     async onConfigSelect(value) {
@@ -638,44 +758,89 @@ export default {
         }
       }
     },
+    setConfigFormState({ mode = 'create', config = null, visible = true } = {}) {
+      this.showConfigForm = visible;
+      this.isEditingConfig = mode === 'edit';
+      this.isCopyingConfig = mode === 'copy';
+      this.editingConfigId = this.isEditingConfig && config ? config.id : null;
+      this.copySourceConfigId = this.isCopyingConfig && config ? config.id : '';
+
+      let name = '';
+      if (this.isEditingConfig && config) {
+        name = config.name || '';
+      } else if (this.isCopyingConfig && config) {
+        name = `${config.name || ''}-copy`;
+      }
+      this.configFormData = { name };
+    },
     startCreateConfig() {
-      this.showConfigForm = true;
-      this.isEditingConfig = false;
-      this.configFormData = {
-        name: '',
-      };
-      this.editingConfigId = null;
+      this.setConfigFormState({ mode: 'create' });
     },
     startEditConfig(config) {
-      this.showConfigForm = true;
-      this.isEditingConfig = true;
-      this.editingConfigId = config.id;
-
-      this.configFormData = {
-        name: config.name || '',
-      };
+      this.setConfigFormState({ mode: 'edit', config });
+    },
+    startCopyConfig(config) {
+      this.setConfigFormState({ mode: 'copy', config });
     },
     cancelConfigForm() {
-      this.showConfigForm = false;
-      this.isEditingConfig = false;
-      this.editingConfigId = null;
-      this.configFormData = {
-        name: '',
-      };
+      this.setConfigFormState({ visible: false });
     },
     saveConfigForm() {
-      if (!this.configFormData.name) {
+      const normalizedName = this.normalizeConfigName(this.configFormData.name);
+      if (!normalizedName) {
         this.save_message = this.tm('configManagement.pleaseEnterName');
         this.save_message_snack = true;
         this.save_message_success = "error";
         return;
       }
-
-      if (this.isEditingConfig) {
-        this.updateConfigInfo();
-      } else {
-        this.createNewConfig();
+      const excludeId = this.isEditingConfig ? this.editingConfigId : null;
+      if (this.hasDuplicateConfigName(normalizedName, excludeId)) {
+        this.save_message = this.tm('configManagement.nameExists');
+        this.save_message_snack = true;
+        this.save_message_success = "error";
+        return;
       }
+      this.configFormData.name = normalizedName;
+      if (this.isEditingConfig) {
+        this.updateConfigInfo(normalizedName);
+      } else if (this.isCopyingConfig) {
+        this.copyConfig(normalizedName);
+      } else {
+        this.createNewConfig(normalizedName);
+      }
+    },
+    copyConfig(configName) {
+      configProfileApi.get(this.copySourceConfigId).then((res) => {
+        const sourceConfig = res.data?.data?.config;
+        if (!sourceConfig) {
+          this.save_message = this.tm('configManagement.copyFailed');
+          this.save_message_snack = true;
+          this.save_message_success = "error";
+          return;
+        }
+        return configProfileApi.create({
+          name: configName,
+          config: sourceConfig
+        });
+      }).then((res) => {
+        if (!res) return;
+        if (res.data.status === "ok") {
+          this.save_message = res.data.message;
+          this.save_message_snack = true;
+          this.save_message_success = "success";
+          this.getConfigInfoList(res.data.data.conf_id);
+          this.cancelConfigForm();
+        } else {
+          this.save_message = res.data.message;
+          this.save_message_snack = true;
+          this.save_message_success = "error";
+        }
+      }).catch((err) => {
+        console.error(err);
+        this.save_message = err?.response?.data?.message || this.tm('configManagement.copyFailed');
+        this.save_message_snack = true;
+        this.save_message_success = "error";
+      });
     },
     async confirmDeleteConfig(config) {
       const message = this.tm('configManagement.confirmDelete').replace('{name}', config.name);
@@ -684,9 +849,7 @@ export default {
       }
     },
     deleteConfig(configId) {
-      axios.post('/api/config/abconf/delete', {
-        id: configId
-      }).then((res) => {
+      configProfileApi.delete(configId).then((res) => {
         if (res.data.status === "ok") {
           this.save_message = res.data.message;
           this.save_message_snack = true;
@@ -706,11 +869,8 @@ export default {
         this.save_message_success = "error";
       });
     },
-    updateConfigInfo() {
-      axios.post('/api/config/abconf/update', {
-        id: this.editingConfigId,
-        name: this.configFormData.name
-      }).then((res) => {
+    updateConfigInfo(configName) {
+      configProfileApi.rename(this.editingConfigId, configName).then((res) => {
         if (res.data.status === "ok") {
           this.save_message = res.data.message;
           this.save_message_snack = true;
@@ -752,7 +912,7 @@ export default {
           await this.updateConfig();
           // 系统配置保存后不跳转
           if (this.isSystemConfig) {
-            this.$router.replace('/config#system');
+            this.$router.replace('/settings#system-config');
             return;
           }
         }

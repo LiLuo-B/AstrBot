@@ -1,4 +1,4 @@
-![AstrBot-Logo-Simplified](https://github.com/user-attachments/assets/ffd99b6b-3272-4682-beaa-6fe74250f7d9)
+![AstrBot-Logo-Simplified](https://github.com/user-attachments/assets/36fb04e4-cc75-4454-bd8b-049d11aa86f9)
 
 <div align="center">
 
@@ -6,12 +6,13 @@
 <a href="https://github.com/AstrBotDevs/AstrBot/blob/master/README.md">English</a> ｜
 <a href="https://github.com/AstrBotDevs/AstrBot/blob/master/README_zh-TW.md">繁體中文</a> ｜
 <a href="https://github.com/AstrBotDevs/AstrBot/blob/master/README_ja.md">日本語</a> ｜
-<a href="https://github.com/AstrBotDevs/AstrBot/blob/master/README_fr.md">Français</a>
+<a href="https://github.com/AstrBotDevs/AstrBot/blob/master/README_fr.md">Français</a> ｜
+<a href="https://github.com/AstrBotDevs/AstrBot/blob/master/README_es.md">Español</a>
 
 <br>
 
 <div>
-<a href="https://trendshift.io/repositories/12875" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12875" alt="Soulter%2FAstrBot | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/21369" target="_blank"><img src="https://trendshift.io/api/badge/repositories/21369" alt="AstrBotDevs%2FAstrBot | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 <a href="https://hellogithub.com/repository/AstrBotDevs/AstrBot" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=d127d50cd5e54c5382328acc3bb25483&claim_uid=ZO9by7qCXgSd6Lp&t=2" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 </div>
 
@@ -19,7 +20,7 @@
 
 <div>
 <img src="https://img.shields.io/github/v/release/AstrBotDevs/AstrBot?color=76bad9" href="https://github.com/AstrBotDevs/AstrBot/releases/latest">
-<img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="python">
+<img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="python">
 <img src="https://deepwiki.com/badge.svg" href="https://deepwiki.com/AstrBotDevs/AstrBot">
 <a href="https://zread.ai/AstrBotDevs/AstrBot" target="_blank"><img src="https://img.shields.io/badge/Ask_Zread-_.svg?style=flat&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFZIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjczODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff" alt="zread"/></a>
 <a href="https://hub.docker.com/r/soulter/astrbot"><img alt="Docker pull" src="https://img.shields.io/docker/pulls/soulter/astrbot.svg?color=76bad9"/></a>
@@ -76,12 +77,13 @@ AstrBot — это универсальная платформа Agent-чатб�
 Для пользователей, которые хотят быстро попробовать AstrBot, знакомы с командной строкой и могут самостоятельно установить окружение `uv`, мы рекомендуем использовать развёртывание в один клик через `uv` ⚡️:
 
 ```bash
-uv tool install astrbot
+uv tool install astrbot --python 3.12
 astrbot init # Выполните эту команду только при первом запуске для инициализации окружения
 astrbot run
 ```
 
 > Требуется установленный [uv](https://docs.astral.sh/uv/).
+> Для AstrBot требуется Python 3.12 или новее. Параметр `--python 3.12` гарантирует, что `uv` создаст tool-окружение с Python 3.12.
 
 > [!NOTE]
 > Для пользователей macOS: из-за проверок безопасности macOS первый запуск команды `astrbot` может занять больше времени (около 10-20 секунд).
@@ -89,14 +91,17 @@ astrbot run
 Обновить `astrbot`:
 
 ```bash
-uv tool upgrade astrbot
+uv tool upgrade astrbot --python 3.12
 ```
+
+> [!WARNING]
+> AstrBot, развёрнутый через `uv`, **не поддерживает обновление через WebUI**. Для обновления выполните указанную выше команду из командной строки.
 
 ### Развёртывание Docker
 
 Для пользователей, знакомых с контейнерами и которым нужен более стабильный и подходящий для production способ, мы рекомендуем разворачивать AstrBot через Docker / Docker Compose.
 
-См. официальную документацию [Развёртывание AstrBot с Docker](https://astrbot.app/deploy/astrbot/docker.html#%E4%BD%BF%E7%94%A8-docker-%E9%83%A8%E7%BD%B2-astrbot).
+См. официальную документацию [Развёртывание AstrBot с Docker](https://docs.astrbot.app/deploy/astrbot/docker.html#%E4%BD%BF%E7%94%A8-docker-%E9%83%A8%E7%BD%B2-astrbot).
 
 ### Развёртывание на RainYun
 
@@ -134,7 +139,7 @@ yay -S astrbot-git
 
 **Другие способы развёртывания**
 
-Если вам нужна панельная установка или более глубокая кастомизация, смотрите [Развёртывание BT-Panel](https://astrbot.app/deploy/astrbot/btpanel.html) (установка через BT Panel), [Развёртывание 1Panel](https://astrbot.app/deploy/astrbot/1panel.html) (развёртывание через маркетплейс 1Panel), [Развёртывание CasaOS](https://astrbot.app/deploy/astrbot/casaos.html) (визуальный вариант для NAS и домашних серверов) и [Ручное развёртывание](https://astrbot.app/deploy/astrbot/cli.html) (полностью настраиваемая установка из исходников через `uv`).
+Если вам нужна панельная установка или более глубокая кастомизация, смотрите [Развёртывание BT-Panel](https://docs.astrbot.app/deploy/astrbot/btpanel.html) (установка через BT Panel), [Развёртывание 1Panel](https://docs.astrbot.app/deploy/astrbot/1panel.html) (развёртывание через маркетплейс 1Panel), [Развёртывание CasaOS](https://docs.astrbot.app/deploy/astrbot/casaos.html) (визуальный вариант для NAS и домашних серверов) и [Ручное развёртывание](https://docs.astrbot.app/deploy/astrbot/cli.html) (полностью настраиваемая установка из исходников через `uv`).
 
 ## Поддерживаемые платформы обмена сообщениями
 
@@ -153,10 +158,12 @@ yay -S astrbot-git
 | Discord | Официальная |
 | LINE | Официальная |
 | Satori | Официальная |
+| KOOK | Официальная |
 | Misskey | Официальная |
+| Mattermost | Официальная |
 | WhatsApp (Скоро) | Официальная |
 | [Matrix](https://github.com/stevessr/astrbot_plugin_matrix_adapter) | Сообщество |
-| [KOOK](https://github.com/wuyan1003/astrbot_plugin_kook_adapter) | Сообщество |
+| [Rocket.Chat](https://github.com/NET-Homeless/astrbot_plugin_rocket_chat_adapter) | Сообщество |
 | [VoceChat](https://github.com/HikariFroya/astrbot_plugin_vocechat) | Сообщество |
 
 ## Поддерживаемые сервисы моделей
@@ -184,6 +191,7 @@ yay -S astrbot-git
 | Coze | Платформы LLMOps |
 | OpenAI Whisper | Сервисы распознавания речи |
 | SenseVoice | Сервисы распознавания речи |
+| Xiaomi MiMo Omni | Сервисы распознавания речи |
 | OpenAI TTS | Сервисы синтеза речи |
 | Gemini TTS | Сервисы синтеза речи |
 | GPT-Sovits-Inference | Сервисы синтеза речи |
@@ -193,6 +201,7 @@ yay -S astrbot-git
 | Alibaba Cloud Bailian TTS | Сервисы синтеза речи |
 | Azure TTS | Сервисы синтеза речи |
 | Minimax TTS | Сервисы синтеза речи |
+| Xiaomi MiMo TTS | Сервисы синтеза речи |
 | Volcano Engine TTS | Сервисы синтеза речи |
 
 ## ❤️ Вклад в проект
@@ -217,10 +226,17 @@ pre-commit install
 
 ### Группы QQ
 
-- Группа 1: 322154837
-- Группа 3: 630166526
-- Группа 5: 822130018
-- Группа 6: 753075035
+- Группа 12: 916228568 (новая)
+- Группа 9: 1076659624 (полная)
+- Группа 10: 1078079676 (полная)
+- Группа 11: 704659519 (полная)
+- Группа 1: 322154837 (полная)
+- Группа 3: 630166526 (полная)
+- Группа 4: 1077826412 (полная)
+- Группа 5: 822130018 (полная)
+- Группа 6: 753075035 (полная)
+- Группа 7: 743746109 (полная)
+- Группа 8: 1030353265 (полная)
 - Группа разработчиков: 975206796
 - Группа разработчиков (официальная): 1039761811
 
@@ -233,7 +249,7 @@ pre-commit install
 Особая благодарность всем контрибьюторам и разработчикам плагинов за их вклад в AstrBot ❤️
 
 <a href="https://github.com/AstrBotDevs/AstrBot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=AstrBotDevs/AstrBot&max=200&columns=14" />
+  <img src="https://contrib.rocks/image?repo=AstrBotDevs/AstrBot&max=300&columns=15" />
 </a>
 
 Кроме того, рождение этого проекта было бы невозможно без помощи следующих проектов с открытым исходным кодом:

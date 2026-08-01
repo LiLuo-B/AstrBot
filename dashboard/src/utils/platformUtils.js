@@ -38,6 +38,10 @@ export function getPlatformIcon(name) {
     return new URL('@/assets/images/platform_logos/misskey.png', import.meta.url).href
   } else if (name === 'line') {
     return new URL('@/assets/images/platform_logos/line.png', import.meta.url).href
+  } else if (name === 'matrix') {
+    return new URL('@/assets/images/platform_logos/matrix.svg', import.meta.url).href
+  } else if (name === 'mattermost') {
+    return new URL('@/assets/images/platform_logos/mattermost.svg', import.meta.url).href
   }
 }
 
@@ -50,7 +54,7 @@ export function getTutorialLink(platformType) {
   const tutorialMap = {
     "qq_official_webhook": "https://docs.astrbot.app/platform/qqofficial/webhook.html",
     "qq_official": "https://docs.astrbot.app/platform/qqofficial/websockets.html",
-    "aiocqhttp": "https://docs.astrbot.app/platform/aiocqhttp/napcat.html",
+    "aiocqhttp": "https://docs.astrbot.app/platform/aiocqhttp.html",
     "wecom": "https://docs.astrbot.app/platform/wecom.html",
     "weixin_oc": "https://docs.astrbot.app/platform/weixin_oc.html",
     "wecom_ai_bot": "https://docs.astrbot.app/platform/wecom_ai_bot.html",
@@ -62,9 +66,11 @@ export function getTutorialLink(platformType) {
     "slack": "https://docs.astrbot.app/platform/slack.html",
     "kook": "https://docs.astrbot.app/platform/kook.html",
     "vocechat": "https://docs.astrbot.app/platform/vocechat.html",
-    "satori": "https://docs.astrbot.app/platform/satori/llonebot.html",
+    "satori": "https://docs.astrbot.app/platform/satori/guide.html",
     "misskey": "https://docs.astrbot.app/platform/misskey.html",
     "line": "https://docs.astrbot.app/platform/line.html",
+    "matrix": "https://docs.astrbot.app/platform/matrix.html",
+    "mattermost": "https://docs.astrbot.app/platform/mattermost.html",
   }
   return tutorialMap[platformType] || "https://docs.astrbot.app";
 }
@@ -107,6 +113,7 @@ export function getPlatformDisplayName(platformId) {
     vocechat: 'vocechat (VoceChat)',
     satori: 'satori (Satori)',
     line: 'line (LINE)',
+    matrix: 'matrix (Matrix)',
   };
   return displayNameMap[platformId] || platformId;
 }

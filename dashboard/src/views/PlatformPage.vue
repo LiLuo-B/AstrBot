@@ -4,7 +4,7 @@
       <v-row class="d-flex justify-space-between align-center px-4 py-3 pb-8">
         <div>
           <h1 class="text-h1 font-weight-bold mb-2 d-flex align-center">
-            <v-icon color="black" class="me-2">mdi-robot</v-icon>{{ tm('title') }}
+            <v-icon class="me-2">mdi-robot</v-icon>{{ tm('title') }}
           </h1>
           <p class="text-subtitle-1 text-medium-emphasis mb-4">
             {{ tm('subtitle') }}
@@ -27,6 +27,7 @@
         <v-row v-else>
           <v-col v-for="(platform, index) in config_data.platform || []" :key="index" cols="12" md="6" lg="4" xl="3">
             <item-card :item="platform" title-field="id" enabled-field="enable"
+              variant="outlined"
               :bglogo="getPlatformIcon(platform.type || platform.id)" @toggle-enabled="platformStatusChange"
               @delete="deletePlatform" @edit="editPlatform">
               <template #item-details="{ item }">
@@ -90,25 +91,6 @@
         </v-row>
       </div>
 
-      <!-- 日志部分 -->
-      <v-card elevation="0" class="mt-4 mb-10">
-        <v-card-title class="d-flex align-center py-3 px-4">
-          <v-icon class="me-2">mdi-console-line</v-icon>
-          <span class="text-h4">{{ tm('logs.title') }}</span>
-          <v-spacer></v-spacer>
-          <v-btn variant="text" color="primary" @click="showConsole = !showConsole">
-            {{ showConsole ? tm('logs.collapse') : tm('logs.expand') }}
-            <v-icon>{{ showConsole ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
-          </v-btn>
-        </v-card-title>
-
-
-        <v-expand-transition>
-          <v-card-text class="pa-0" v-if="showConsole">
-            <ConsoleDisplayer style="background-color: #1e1e1e; height: 300px; border-radius: 0"></ConsoleDisplayer>
-          </v-card-text>
-        </v-expand-transition>
-      </v-card>
     </v-container>
 
     <!-- 添加平台适配器对话框 -->
@@ -119,7 +101,7 @@
     <!-- Webhook URL 对话框 -->
     <v-dialog v-model="showWebhookDialog" max-width="600">
       <v-card>
-        <v-card-title class="d-flex align-center pa-4">
+        <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
           <v-icon class="me-2" color="primary">mdi-webhook</v-icon>
           {{ tm('webhookDialog.title') }}
         </v-card-title>
@@ -155,7 +137,7 @@
 
     <v-dialog v-model="showQrDialog" max-width="480">
       <v-card>
-        <v-card-title class="d-flex align-center pa-4">
+        <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
           <v-icon class="me-2">mdi-qrcode</v-icon>
           {{ tm('platformQr.title') }}
         </v-card-title>
@@ -180,7 +162,7 @@
     <!-- 错误详情对话框 -->
     <v-dialog v-model="showErrorDialog" max-width="700">
       <v-card>
-        <v-card-title class="d-flex align-center pa-4">
+        <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
           <v-icon class="me-2" color="error">mdi-alert-circle</v-icon>
           {{ tm('errorDialog.title') }}
         </v-card-title>
@@ -219,7 +201,7 @@
     </v-dialog>
 
     <!-- 消息提示 -->
-    <v-snackbar :timeout="3000" elevation="24" :color="save_message_success" v-model="save_message_snack"
+    <v-snackbar :timeout="3000" elevation="6" :color="save_message_success" v-model="save_message_snack"
       location="top">
       {{ save_message }}
     </v-snackbar>
@@ -227,10 +209,9 @@
 </template>
 
 <script>
-import axios from 'axios';
+import { botApi, fileApi, systemConfigApi } from '@/api/v1';
 import AstrBotConfig from '@/components/shared/AstrBotConfig.vue';
 import WaitingForRestart from '@/components/shared/WaitingForRestart.vue';
-import ConsoleDisplayer from '@/components/shared/ConsoleDisplayer.vue';
 import ItemCard from '@/components/shared/ItemCard.vue';
 import AddNewPlatform from '@/components/platform/AddNewPlatform.vue';
 import QrCodeViewer from '@/components/shared/QrCodeViewer.vue';
@@ -241,13 +222,13 @@ import {
   askForConfirmation as askForConfirmationDialog,
   useConfirmDialog
 } from '@/utils/confirmDialog';
+import { copyToClipboard } from '@/utils/clipboard';
 
 export default {
   name: 'PlatformPage',
   components: {
     AstrBotConfig,
     WaitingForRestart,
-    ConsoleDisplayer,
     ItemCard,
     AddNewPlatform,
     QrCodeViewer,
@@ -277,8 +258,6 @@ export default {
       save_message: "",
       save_message_success: "success",
 
-      showConsole: localStorage.getItem('platformPage_showConsole') === 'true',
-
       showWebhookDialog: false,
       currentWebhookUuid: '',
 
@@ -297,10 +276,6 @@ export default {
   },
 
   watch: {
-    showConsole(newValue) {
-      localStorage.setItem('platformPage_showConsole', newValue.toString());
-    },
-
     showIdConflictDialog(newValue) {
       if (!newValue && this.idConflictResolve) {
         this.idConflictResolve(false);
@@ -348,13 +323,13 @@ export default {
       const template = this.metadata['platform_group']?.metadata?.platform?.config_template?.[platform_id];
       if (template && template.logo_token) {
           // 通过文件服务访问插件提供的 logo
-        return `/api/file/${template.logo_token}`;
+        return fileApi.tokenUrl(template.logo_token);
       }
       return getPlatformIcon(platform_id);
     },
 
     getConfig() {
-      axios.get('/api/config/get').then((res) => {
+      systemConfigApi.runtime().then((res) => {
         this.config_data = res.data.data.config;
         this.fetched = true
         this.metadata = res.data.data.metadata;
@@ -370,7 +345,7 @@ export default {
     },
 
     async getPlatformStats() {
-      await axios.get('/api/platform/stats').then((res) => {
+      await botApi.stats().then((res) => {
         if (res.data.status === 'ok') {
           // 将数组转换为以 id 为 key 的对象，方便查找
           const stats = {};
@@ -547,7 +522,7 @@ export default {
         return;
       }
 
-      axios.post('/api/config/platform/delete', { id: platform.id }).then((res) => {
+      botApi.delete(platform.id).then((res) => {
         this.getConfig();
         this.showSuccess(res.data.message || this.messages.deleteSuccess);
       }).catch((err) => {
@@ -558,10 +533,7 @@ export default {
     platformStatusChange(platform) {
       platform.enable = !platform.enable; // 切换状态
 
-      axios.post('/api/config/platform/update', {
-        id: platform.id,
-        config: platform
-      }).then((res) => {
+      botApi.setEnabled(platform.id, { enabled: platform.enable }).then((res) => {
         this.getConfig();
         this.showSuccess(res.data.message || this.messages.statusUpdateSuccess);
       }).catch((err) => {
@@ -596,9 +568,9 @@ export default {
         callbackBase = "http(s)://<your-domain-or-ip>";
       }
       if (callbackBase) {
-        return `${callbackBase.replace(/\/$/, '')}/api/platform/webhook/${webhookUuid}`;
+        return `${callbackBase.replace(/\/$/, '')}/api/v1/webhooks/platforms/${webhookUuid}`;
       }
-      return `/api/platform/webhook/${webhookUuid}`;
+      return `/api/v1/webhooks/platforms/${webhookUuid}`;
     },
 
     openWebhookDialog(webhookUuid) {
@@ -608,10 +580,10 @@ export default {
 
     async copyWebhookUrl(webhookUuid) {
       const url = this.getWebhookUrl(webhookUuid);
-      try {
-        await navigator.clipboard.writeText(url);
+      const ok = await copyToClipboard(url);
+      if (ok) {
         this.showSuccess(this.tm('webhookCopied'));
-      } catch (err) {
+      } else {
         this.showError(this.tm('webhookCopyFailed'));
       }
     }

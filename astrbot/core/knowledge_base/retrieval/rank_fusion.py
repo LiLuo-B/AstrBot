@@ -66,7 +66,10 @@ class RankFusion:
         dense_ranks = {
             r.data["doc_id"]: (idx + 1) for idx, r in enumerate(dense_results)
         }  # 这里的 doc_id 实际上是 chunk_id
-        sparse_ranks = {r.chunk_id: (idx + 1) for idx, r in enumerate(sparse_results)}
+        sparse_ranks = {
+            r.chunk_id: r.rank if r.rank is not None else idx + 1
+            for idx, r in enumerate(sparse_results)
+        }
 
         # 2. 收集所有唯一的 ID
         # 需要统一为 chunk_id
@@ -103,9 +106,13 @@ class RankFusion:
 
         # 4. 排序
         sorted_ids = sorted(
-            rrf_scores.keys(),
-            key=lambda cid: rrf_scores[cid],
-            reverse=True,
+            rrf_scores,
+            key=lambda cid: (
+                -rrf_scores[cid],
+                dense_ranks.get(cid, float("inf")),
+                sparse_ranks.get(cid, float("inf")),
+                cid,
+            ),
         )[:top_k]
 
         # 5. 构建融合结果

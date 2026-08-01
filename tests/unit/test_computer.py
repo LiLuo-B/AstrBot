@@ -4,6 +4,7 @@ This module tests the ComputerClient, Booter implementations (local, shipyard, b
 filesystem operations, Python execution, shell execution, and security restrictions.
 """
 
+import shlex
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,7 +16,6 @@ from astrbot.core.computer.booters.local import (
     LocalFileSystemComponent,
     LocalPythonComponent,
     LocalShellComponent,
-    _ensure_safe_path,
     _is_safe_command,
 )
 
@@ -54,8 +54,11 @@ class TestLocalBooterLifecycle:
     async def test_shutdown(self):
         """Test LocalBooter shutdown method."""
         booter = LocalBooter()
-        # Should not raise any exception
+        booter._shell.shutdown_sessions = AsyncMock()
+
         await booter.shutdown()
+
+        booter._shell.shutdown_sessions.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_available(self):
@@ -126,51 +129,6 @@ class TestSecurityRestrictions:
         for cmd in blocked_commands:
             assert _is_safe_command(cmd) is False, f"Command '{cmd}' should be blocked"
 
-    def test_ensure_safe_path_allowed(self, tmp_path):
-        """Test paths within allowed roots are accepted."""
-        # Create a test directory structure
-        test_file = tmp_path / "test.txt"
-        test_file.write_text("test")
-
-        # Mock get_astrbot_root, get_astrbot_data_path, get_astrbot_temp_path
-        with (
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_root",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
-                return_value=str(tmp_path),
-            ),
-        ):
-            result = _ensure_safe_path(str(test_file))
-            assert result == str(test_file)
-
-    def test_ensure_safe_path_blocked(self, tmp_path):
-        """Test paths outside allowed roots raise PermissionError."""
-        with (
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_root",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
-                return_value=str(tmp_path),
-            ),
-        ):
-            # Try to access a path outside the allowed roots
-            with pytest.raises(PermissionError) as exc_info:
-                _ensure_safe_path("/etc/passwd")
-            assert "Path is outside the allowed computer roots" in str(exc_info.value)
-
 
 class TestLocalShellComponent:
     """Tests for LocalShellComponent."""
@@ -212,18 +170,10 @@ class TestLocalShellComponent:
                 "astrbot.core.computer.booters.local.get_astrbot_root",
                 return_value=str(tmp_path),
             ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
-                return_value=str(tmp_path),
-            ),
         ):
             # Use python to read file to avoid Windows vs Unix command differences
             result = await shell.exec(
-                f'python -c "print(open(r\\"{test_file}\\"))"',
+                f'{shlex.quote(sys.executable)} -c "print(open(r\\"{test_file}\\").read())"',
                 cwd=str(tmp_path),
             )
             assert result["exit_code"] == 0
@@ -233,7 +183,7 @@ class TestLocalShellComponent:
         """Test command execution with custom environment variables."""
         shell = LocalShellComponent()
         result = await shell.exec(
-            'python -c "import os; print(os.environ.get(\\"TEST_VAR\\", \\"\\"))"',
+            f'{shlex.quote(sys.executable)} -c "import os; print(os.environ.get(\\"TEST_VAR\\", \\"\\"))"',
             env={"TEST_VAR": "test_value"},
         )
         assert result["exit_code"] == 0
@@ -294,14 +244,6 @@ class TestLocalFileSystemComponent:
                 "astrbot.core.computer.booters.local.get_astrbot_root",
                 return_value=str(tmp_path),
             ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
-                return_value=str(tmp_path),
-            ),
         ):
             result = await fs.create_file(str(test_path), "test content")
             assert result["success"] is True
@@ -320,14 +262,6 @@ class TestLocalFileSystemComponent:
                 "astrbot.core.computer.booters.local.get_astrbot_root",
                 return_value=str(tmp_path),
             ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
-                return_value=str(tmp_path),
-            ),
         ):
             result = await fs.read_file(str(test_path))
             assert result["success"] is True
@@ -342,14 +276,6 @@ class TestLocalFileSystemComponent:
         with (
             patch(
                 "astrbot.core.computer.booters.local.get_astrbot_root",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
                 return_value=str(tmp_path),
             ),
         ):
@@ -367,14 +293,6 @@ class TestLocalFileSystemComponent:
         with (
             patch(
                 "astrbot.core.computer.booters.local.get_astrbot_root",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
                 return_value=str(tmp_path),
             ),
         ):
@@ -395,14 +313,6 @@ class TestLocalFileSystemComponent:
                 "astrbot.core.computer.booters.local.get_astrbot_root",
                 return_value=str(tmp_path),
             ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
-                return_value=str(tmp_path),
-            ),
         ):
             result = await fs.delete_file(str(test_dir))
             assert result["success"] is True
@@ -420,14 +330,6 @@ class TestLocalFileSystemComponent:
         with (
             patch(
                 "astrbot.core.computer.booters.local.get_astrbot_root",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
                 return_value=str(tmp_path),
             ),
         ):
@@ -450,14 +352,6 @@ class TestLocalFileSystemComponent:
         with (
             patch(
                 "astrbot.core.computer.booters.local.get_astrbot_root",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_data_path",
-                return_value=str(tmp_path),
-            ),
-            patch(
-                "astrbot.core.computer.booters.local.get_astrbot_temp_path",
                 return_value=str(tmp_path),
             ),
         ):
@@ -614,6 +508,20 @@ class TestComputerClient:
         computer_client.local_booter = None
 
     @pytest.mark.asyncio
+    async def test_shutdown_local_booter_clears_singleton(self):
+        """Test local managed resources are released during lifecycle shutdown."""
+        from astrbot.core.computer import computer_client
+
+        booter = MagicMock(spec=LocalBooter)
+        booter.shutdown = AsyncMock()
+        computer_client.local_booter = booter
+
+        await computer_client.shutdown_local_booter()
+
+        booter.shutdown.assert_awaited_once()
+        assert computer_client.local_booter is None
+
+    @pytest.mark.asyncio
     async def test_get_booter_shipyard(self):
         """Test get_booter with shipyard type."""
         from astrbot.core.computer import computer_client
@@ -633,7 +541,7 @@ class TestComputerClient:
                     "shipyard_access_token": "test_token",
                     "shipyard_ttl": 3600,
                     "shipyard_max_sessions": 10,
-                }
+                },
             }
         }.get(key, default)
         mock_context.get_config = MagicMock(return_value=mock_config)
@@ -681,7 +589,7 @@ class TestComputerClient:
                 "computer_use_runtime": "sandbox",
                 "sandbox": {
                     "booter": "unknown_type",
-                }
+                },
             }
         }.get(key, default)
         mock_context.get_config = MagicMock(return_value=mock_config)
@@ -707,7 +615,7 @@ class TestComputerClient:
                     "booter": "shipyard",
                     "shipyard_endpoint": "http://localhost:8080",
                     "shipyard_access_token": "test_token",
-                }
+                },
             }
         }.get(key, default)
         mock_context.get_config = MagicMock(return_value=mock_config)
@@ -752,7 +660,7 @@ class TestComputerClient:
                     "booter": "shipyard",
                     "shipyard_endpoint": "http://localhost:8080",
                     "shipyard_access_token": "test_token",
-                }
+                },
             }
         }.get(key, default)
         mock_context.get_config = MagicMock(return_value=mock_config)

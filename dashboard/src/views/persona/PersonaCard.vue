@@ -1,6 +1,6 @@
 <template>
-    <v-card class="persona-card" :class="{ 'dragging': isDragging }" rounded="lg" @click="$emit('view')" elevation="1" hover
-        draggable="true" @dragstart="handleDragStart" @dragend="handleDragEnd">
+    <v-card class="persona-card" :class="{ 'dragging': isDragging }" rounded="lg" variant="outlined" @click="$emit('view')"
+        elevation="0" draggable="true" @dragstart="handleDragStart" @dragend="handleDragEnd">
         <v-card-title class="d-flex justify-space-between align-center">
             <div class="text-truncate ml-2">{{ persona.persona_id }}</div>
             <v-menu offset-y>
@@ -19,6 +19,12 @@
                             <v-icon size="small">mdi-folder-move</v-icon>
                         </template>
                         <v-list-item-title>{{ tm('persona.contextMenu.moveTo') }}</v-list-item-title>
+                    </v-list-item>
+                    <v-list-item @click.stop="exportPersona">
+                        <template v-slot:prepend>
+                            <v-icon size="small">mdi-download</v-icon>
+                        </template>
+                        <v-list-item-title>{{ tm('buttons.export') }}</v-list-item-title>
                     </v-list-item>
                     <v-divider class="my-1" />
                     <v-list-item @click.stop="$emit('delete')" class="text-error">
@@ -75,6 +81,10 @@
 <script lang="ts">
 import { defineComponent, type PropType } from 'vue';
 import { useModuleI18n } from '@/i18n/composables';
+import {
+    askForConfirmation as askForConfirmationDialog,
+    useConfirmDialog
+} from '@/utils/confirmDialog';
 
 interface Persona {
     persona_id: string;
@@ -97,10 +107,11 @@ export default defineComponent({
             required: true
         }
     },
-    emits: ['view', 'edit', 'move', 'delete'],
+    emits: ['view', 'edit', 'move', 'delete', 'export'],
     setup() {
         const { tm } = useModuleI18n('features/persona');
-        return { tm };
+        const confirmDialog = useConfirmDialog();
+        return { tm, confirmDialog };
     },
     data() {
         return {
@@ -135,6 +146,41 @@ export default defineComponent({
         formatDate(dateString: string | undefined | null): string {
             if (!dateString) return '';
             return new Date(dateString).toLocaleString();
+        },
+        async exportPersona() {
+            // 确认提示：告知用户导出仅包含系统提示词和预设对话
+            const confirmed = await askForConfirmationDialog(
+                this.tm('messages.exportConfirm'),
+                this.confirmDialog,
+            );
+            if (!confirmed) return;
+
+            try {
+                // 仅导出 persona_id, system_prompt, begin_dialogs
+                const exportData = {
+                    persona_id: this.persona.persona_id,
+                    system_prompt: this.persona.system_prompt,
+                    begin_dialogs: this.persona.begin_dialogs || []
+                };
+
+                const jsonStr = JSON.stringify(exportData, null, 2);
+                const blob = new Blob([jsonStr], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `persona_${this.persona.persona_id}.json`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+
+                // 通过事件通知父组件显示成功消息
+                this.$emit('export', this.tm('messages.exportSuccess'));
+            } catch (error: any) {
+                console.error('导出人格失败:', error);
+                // 通过事件通知父组件显示错误消息
+                this.$emit('export', this.tm('messages.exportError', { error: error.message || String(error) }));
+            }
         }
     }
 });
@@ -142,9 +188,15 @@ export default defineComponent({
 
 <style scoped>
 .persona-card {
+    background: rgb(var(--v-theme-surface));
     height: 100%;
     cursor: grab;
-    transition: all 0.2s ease;
+    transition: background-color 0.16s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
+.persona-card:hover,
+.persona-card:focus-within {
+    background: rgba(var(--v-theme-on-surface), 0.04);
 }
 
 .persona-card:active {
@@ -154,10 +206,6 @@ export default defineComponent({
 .persona-card.dragging {
     opacity: 0.5;
     transform: scale(0.95);
-}
-
-.persona-card:hover {
-    transform: translateY(-2px);
 }
 
 .system-prompt-preview {

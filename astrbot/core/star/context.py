@@ -20,6 +20,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.persona_mgr import PersonaManager
 from astrbot.core.platform import Platform
 from astrbot.core.platform.astr_message_event import AstrMessageEvent, MessageSesion
+from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform_message_history_mgr import PlatformMessageHistoryManager
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest, ProviderType
 from astrbot.core.provider.func_tool_manager import FunctionTool, FunctionToolManager
@@ -36,6 +37,7 @@ from astrbot.core.star.filter.platform_adapter_type import (
     PlatformAdapterType,
 )
 from astrbot.core.subagent_orchestrator import SubAgentOrchestrator
+from astrbot.core.utils.astrbot_path import get_astrbot_system_tmp_path
 
 from ..exceptions import ProviderNotFoundError
 from .filter.command import CommandFilter
@@ -48,15 +50,80 @@ logger = logging.getLogger("astrbot")
 if TYPE_CHECKING:
     from astrbot.core.cron.manager import CronJobManager
 
+WebApiHandler = Callable[..., Awaitable[Any]]
+RegisteredWebApi = tuple[str, WebApiHandler, list[str], str]
+_PLUGIN_MODULE_FLAGS = {"builtin_stars", "plugins"}
+
+
+def _split_module_path(module_path: Any) -> list[str]:
+    if not isinstance(module_path, str) or not module_path:
+        return []
+    return module_path.split(".")
+
+
+def _plugin_root_from_module_parts(parts: list[str]) -> tuple[str, str] | None:
+    for index, part in enumerate(parts):
+        if part in _PLUGIN_MODULE_FLAGS and index + 1 < len(parts):
+            return part, parts[index + 1]
+    return None
+
+
+def _plugin_root_from_metadata(metadata: StarMetadata) -> str | None:
+    if metadata.root_dir_name:
+        return metadata.root_dir_name
+
+    root_info = _plugin_root_from_module_parts(_split_module_path(metadata.module_path))
+    return root_info[1] if root_info else None
+
+
+def _registered_plugin_module_path(root_dir_name: str, flag: str | None) -> str | None:
+    for metadata in reversed(star_registry):
+        if not metadata.module_path:
+            continue
+        if _plugin_root_from_metadata(metadata) != root_dir_name:
+            continue
+        if flag and flag not in _split_module_path(metadata.module_path):
+            continue
+        return metadata.module_path
+    return None
+
+
+def _legacy_plugin_module_path(parts: list[str]) -> str:
+    resolved_parts = []
+    for index, part in enumerate(parts):
+        resolved_parts.append(part)
+        if part in _PLUGIN_MODULE_FLAGS and index + 1 < len(parts):
+            resolved_parts.append(parts[index + 1])
+            resolved_parts.append("main")
+            break
+    return ".".join(resolved_parts)
+
+
+def _resolve_tool_handler_module_path(tool: FunctionTool) -> str:
+    module_path = getattr(tool, "__module__", None)
+    module_parts = _split_module_path(module_path)
+    if not module_parts:
+        return module_path if isinstance(module_path, str) else ""
+
+    root_info = _plugin_root_from_module_parts(module_parts)
+    if root_info:
+        flag, root_dir_name = root_info
+        registered_module_path = _registered_plugin_module_path(root_dir_name, flag)
+        return registered_module_path or _legacy_plugin_module_path(module_parts)
+
+    registered_module_path = _registered_plugin_module_path(module_parts[0], "plugins")
+    return registered_module_path or ".".join(module_parts)
+
 
 class PlatformManagerProtocol(Protocol):
     platform_insts: list[Platform]
+    get_insts: Callable[[], list[Platform]]
 
 
 class Context:
     """暴露给插件的接口上下文。"""
 
-    registered_web_apis: list = []
+    registered_web_apis: list[RegisteredWebApi] = []
 
     # 向后兼容的变量
     _register_tasks: list[Awaitable] = []
@@ -107,6 +174,7 @@ class Context:
         chat_provider_id: str,
         prompt: str | None = None,
         image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
         tools: ToolSet | None = None,
         system_prompt: str | None = None,
         contexts: list[Message] | None = None,
@@ -120,6 +188,7 @@ class Context:
             chat_provider_id: The chat provider ID to use.
             prompt: The prompt to send to the LLM, if `contexts` and `prompt` are both provided, `prompt` will be appended as the last user message
             image_urls: List of image URLs to include in the prompt, if `contexts` and `prompt` are both provided, `image_urls` will be appended to the last user message
+            audio_urls: List of audio URLs or local paths to include in the prompt, if `contexts` and `prompt` are both provided, `audio_urls` will be appended to the last user message
             tools: ToolSet of tools available to the LLM
             system_prompt: System prompt to guide the LLM's behavior, if provided, it will always insert as the first system message in the context
             contexts: context messages for the LLM
@@ -135,6 +204,7 @@ class Context:
         llm_resp = await prov.text_chat(
             prompt=prompt,
             image_urls=image_urls,
+            audio_urls=audio_urls,
             func_tool=tools,
             contexts=contexts,
             system_prompt=system_prompt,
@@ -149,6 +219,7 @@ class Context:
         chat_provider_id: str,
         prompt: str | None = None,
         image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
         tools: ToolSet | None = None,
         system_prompt: str | None = None,
         contexts: list[Message] | None = None,
@@ -165,6 +236,7 @@ class Context:
             chat_provider_id: The chat provider ID to use.
             prompt: The prompt to send to the LLM, if `contexts` and `prompt` are both provided, `prompt` will be appended as the last user message
             image_urls: List of image URLs to include in the prompt, if `contexts` and `prompt` are both provided, `image_urls` will be appended to the last user message
+            audio_urls: List of audio URLs or local paths to include in the prompt, if `contexts` and `prompt` are both provided, `audio_urls` will be appended to the last user message
             tools: ToolSet of tools available to the LLM
             system_prompt: System prompt to guide the LLM's behavior, if provided, it will always insert as the first system message in the context
             contexts: context messages for the LLM
@@ -207,6 +279,7 @@ class Context:
         request = ProviderRequest(
             prompt=prompt,
             image_urls=image_urls or [],
+            audio_urls=audio_urls or [],
             func_tool=tools,
             contexts=context_,
             system_prompt=system_prompt or "",
@@ -226,6 +299,13 @@ class Context:
             for k, v in kwargs.items()
             if k not in ["stream", "agent_hooks", "agent_context"]
         }
+        if request.func_tool and request.func_tool.get_tool("astrbot_file_read_tool"):
+            other_kwargs.setdefault(
+                "tool_result_overflow_dir", get_astrbot_system_tmp_path()
+            )
+            other_kwargs.setdefault(
+                "read_tool", request.func_tool.get_tool("astrbot_file_read_tool")
+            )
 
         await agent_runner.reset(
             provider=prov,
@@ -322,7 +402,8 @@ class Context:
         prov = self.provider_manager.inst_map.get(provider_id)
         if provider_id and not prov:
             logger.warning(
-                f"没有找到 ID 为 {provider_id} 的提供商，这可能是由于您修改了提供商（模型）ID 导致的。"
+                f"Provider {provider_id} was not found. Its provider or model ID "
+                "may have been changed."
             )
         return prov
 
@@ -454,6 +535,35 @@ class Context:
         for platform in self.platform_manager.platform_insts:
             if platform.meta().id == session.platform_name:
                 await platform.send_by_session(session, message_chain)
+                settings = self.get_config(umo=str(session)).get(
+                    "provider_ltm_settings",
+                    {},
+                )
+                if (
+                    session.message_type == MessageType.GROUP_MESSAGE
+                    and platform.meta().name != "webchat"
+                    and settings.get("group_message_history_enable", False)
+                ):
+                    try:
+                        await self.message_history_manager.insert_message_chain(
+                            platform_id=session.platform_id,
+                            user_id=str(session),
+                            message_chain=message_chain,
+                            role="bot",
+                            sender_id="bot",
+                            sender_name="bot",
+                            max_messages=max(
+                                1,
+                                int(
+                                    settings.get(
+                                        "group_message_history_max_cnt",
+                                        700,
+                                    )
+                                ),
+                            ),
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist a proactive group message.")
                 return True
         logger.warning(
             f"cannot find platform for session {str(session)}, message not sent"
@@ -473,16 +583,7 @@ class Context:
         module_path = ""
         for tool in tools:
             if not module_path:
-                _parts = []
-                module_part = tool.__module__.split(".")
-                flags = ["builtin_stars", "plugins"]
-                for i, part in enumerate(module_part):
-                    _parts.append(part)
-                    if part in flags and i + 1 < len(module_part):
-                        _parts.append(module_part[i + 1])
-                        module_part.append("main")
-                        break
-                tool.handler_module_path = ".".join(_parts)
+                tool.handler_module_path = _resolve_tool_handler_module_path(tool)
                 module_path = tool.handler_module_path
             else:
                 tool.handler_module_path = module_path
@@ -491,15 +592,15 @@ class Context:
             )
 
             if tool.name in tool_name:
-                logger.warning("替换已存在的 LLM 工具: " + tool.name)
+                logger.warning("Replacing existing LLM tool: " + tool.name)
                 self.provider_manager.llm_tools.remove_func(tool.name)
             self.provider_manager.llm_tools.func_list.append(tool)
 
     def register_web_api(
         self,
         route: str,
-        view_handler: Awaitable,
-        methods: list,
+        view_handler: WebApiHandler,
+        methods: list[str],
         desc: str,
     ) -> None:
         """注册 Web API。
@@ -583,6 +684,7 @@ class Context:
         """
         self.provider_manager.provider_insts.append(provider)
 
+    @deprecated(reason="Use decorator-based tool registration instead.")
     def register_llm_tool(
         self,
         name: str,
@@ -615,6 +717,7 @@ class Context:
         star_handlers_registry.append(md)
         self.provider_manager.llm_tools.add_func(name, func_args, desc, func_obj)
 
+    @deprecated(reason="Use deactivate_llm_tool() to disable a tool instead.")
     def unregister_llm_tool(self, name: str) -> None:
         """[DEPRECATED]删除一个函数调用工具。
 
@@ -627,6 +730,7 @@ class Context:
         """
         self.provider_manager.llm_tools.remove_func(name)
 
+    @deprecated(reason="Use the command decorator (@filter.command) instead.")
     def register_commands(
         self,
         star_name: str,
@@ -668,6 +772,9 @@ class Context:
             )
         star_handlers_registry.append(md)
 
+    @deprecated(
+        reason="Start background tasks in the plugin's initialize() method instead."
+    )
     def register_task(self, task: Awaitable, desc: str) -> None:
         """[DEPRECATED]注册一个异步任务。
 

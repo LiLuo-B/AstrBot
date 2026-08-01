@@ -1,7 +1,7 @@
 <template>
-    <v-dialog v-model="showDialog" :max-width="$vuetify.display.smAndDown ? undefined : '1200px'" scrollable>
+    <v-dialog v-model="showDialog" :max-width="$vuetify.display.smAndDown ? undefined : '1200px'" scrollable persistent>
         <v-card class="persona-form-card" :class="{ 'persona-form-card-mobile': $vuetify.display.smAndDown }">
-            <v-card-title class="persona-form-title text-h2 px-6 pt-6 pl-6">
+            <v-card-title class="persona-form-title text-h3 pa-4 pb-0 pl-6">
                 {{ editingPersona ? tm('dialog.edit.title') : tm('dialog.create.title') }}
             </v-card-title>
 
@@ -90,31 +90,52 @@
                                     <div v-if="filteredTools.length > 0" class="tools-selection">
                                         <v-virtual-scroll :items="filteredTools" height="300" item-height="72">
                                             <template v-slot:default="{ item }">
-                                                <v-list-item :key="item.name" density="comfortable"
-                                                    @click="toggleTool(item.name)">
-                                                    <template v-slot:prepend>
-                                                        <v-checkbox-btn :model-value="isToolSelected(item.name)"
-                                                            @click.stop="toggleTool(item.name)" />
+                                                <v-tooltip
+                                                    :disabled="!isBuiltinTool(item)"
+                                                    location="top"
+                                                >
+                                                    <template v-slot:activator="{ props: tooltipProps }">
+                                                        <div v-bind="tooltipProps">
+                                                            <v-list-item
+                                                                :key="item.name"
+                                                                density="comfortable"
+                                                                :disabled="isBuiltinTool(item)"
+                                                                @click="toggleTool(item.name)"
+                                                            >
+                                                                <template v-slot:prepend>
+                                                                    <v-checkbox-btn
+                                                                        v-if="!isBuiltinTool(item)"
+                                                                        :model-value="isToolSelected(item.name)"
+                                                                        @click.stop="toggleTool(item.name)"
+                                                                    />
+                                                                    <div
+                                                                        v-else
+                                                                        class="builtin-tool-checkbox-placeholder"
+                                                                    />
+                                                                </template>
+
+                                                                <v-list-item-title>
+                                                                    {{ item.name }}
+
+                                                                    <v-chip v-if="item.origin" size="x-small" color="info" class="mr-2"
+                                                                        variant="tonal">
+                                                                        {{ item.origin }}
+                                                                    </v-chip>
+                                                                    <v-chip v-if="item.origin_name" size="x-small" color="info"
+                                                                        variant="outlined">
+                                                                        {{ item.origin_name }}
+                                                                    </v-chip>
+
+                                                                </v-list-item-title>
+
+                                                                <v-list-item-subtitle v-if="item.description">
+                                                                    {{ truncateText(item.description, 100) }}
+                                                                </v-list-item-subtitle>
+                                                            </v-list-item>
+                                                        </div>
                                                     </template>
-
-                                                    <v-list-item-title>
-                                                        {{ item.name }}
-
-                                                        <v-chip v-if="item.origin" size="x-small" color="info" class="mr-2"
-                                                            variant="tonal">
-                                                            {{ item.origin }}
-                                                        </v-chip>
-                                                        <v-chip v-if="item.origin_name" size="x-small" color="info"
-                                                            variant="outlined">
-                                                            {{ item.origin_name }}
-                                                        </v-chip>
-
-                                                    </v-list-item-title>
-
-                                                    <v-list-item-subtitle v-if="item.description">
-                                                        {{ truncateText(item.description, 100) }}
-                                                    </v-list-item-subtitle>
-                                                </v-list-item>
+                                                    <span>{{ tm('form.builtinToolDisabledHint') }}</span>
+                                                </v-tooltip>
                                             </template>
                                         </v-virtual-scroll>
                                     </div>
@@ -155,11 +176,26 @@
                                         </h4>
                                         <div v-if="Array.isArray(personaForm.tools) && personaForm.tools.length > 0"
                                             class="d-flex flex-wrap ga-1" style="max-height: 100px; overflow-y: auto;">
-                                            <v-chip v-for="toolName in personaForm.tools" :key="toolName" size="small"
-                                                color="primary" variant="tonal" closable
-                                                @click:close="removeTool(toolName)">
-                                                {{ toolName }}
-                                            </v-chip>
+                                            <v-tooltip
+                                                v-for="toolName in personaForm.tools"
+                                                :key="toolName"
+                                                :disabled="!isBuiltinToolName(toolName)"
+                                                location="top"
+                                            >
+                                                <template v-slot:activator="{ props: tooltipProps }">
+                                                    <v-chip
+                                                        v-bind="tooltipProps"
+                                                        size="small"
+                                                        color="primary"
+                                                        variant="tonal"
+                                                        :closable="!isBuiltinToolName(toolName)"
+                                                        @click:close="removeTool(toolName)"
+                                                    >
+                                                        {{ toolName }}
+                                                    </v-chip>
+                                                </template>
+                                                <span>{{ tm('form.builtinToolDisabledHint') }}</span>
+                                            </v-tooltip>
                                         </div>
                                         <div v-else class="text-body-2 text-medium-emphasis">
                                             {{ tm('form.noToolsSelected') }}
@@ -295,7 +331,7 @@
                                     </v-textarea>
                                 </div>
 
-                                <v-btn variant="outlined" prepend-icon="mdi-plus" @click="addDialogPair" block>
+                                <v-btn variant="tonal" prepend-icon="mdi-plus" @click="addDialogPair" block>
                                     {{ tm('buttons.addDialogPair') }}
                                 </v-btn>
                             </v-expansion-panel-text>
@@ -314,7 +350,7 @@
                 <v-btn color="grey" variant="text" @click="closeDialog">
                     {{ tm('buttons.cancel') }}
                 </v-btn>
-                <v-btn color="primary" variant="flat" @click="savePersona" :loading="saving" :disabled="!formValid">
+                <v-btn color="primary" variant="tonal" @click="savePersona" :loading="saving" :disabled="!formValid">
                     {{ tm('buttons.save') }}
                 </v-btn>
             </v-card-actions>
@@ -323,7 +359,7 @@
 </template>
 
 <script>
-import axios from 'axios';
+import { mcpApi, personaApi, skillApi, toolApi } from '@/api/v1';
 import { useModuleI18n } from '@/i18n/composables';
 import {
     askForConfirmation as askForConfirmationDialog,
@@ -380,7 +416,7 @@ export default {
             personaIdRules: [
                 v => !!v || this.tm('validation.required'),
                 v => (v && v.length >= 1) || this.tm('validation.minLength', { min: 1 }),
-                v => !this.existingPersonaIds.includes(v) || this.tm('validation.personaIdExists'),
+                v => this.editingPersona?.persona_id === v || !this.existingPersonaIds.includes(v) || this.tm('validation.personaIdExists'),
             ],
             systemPromptRules: [
                 v => !!v || this.tm('validation.required'),
@@ -529,7 +565,7 @@ export default {
 
         async loadMcpServers() {
             try {
-                const response = await axios.get('/api/tools/mcp/servers');
+                const response = await mcpApi.list();
                 if (response.data.status === 'ok') {
                     this.mcpServers = response.data.data || [];
                 } else {
@@ -544,7 +580,7 @@ export default {
         async loadTools() {
             this.loadingTools = true;
             try {
-                const response = await axios.get('/api/tools/list');
+                const response = await toolApi.list();
                 if (response.data.status === 'ok') {
                     this.availableTools = response.data.data || [];
                 } else {
@@ -561,7 +597,7 @@ export default {
         async loadSkills() {
             this.loadingSkills = true;
             try {
-                const response = await axios.get('/api/skills');
+                const response = await skillApi.list();
                 if (response.data.status === 'ok') {
                     const payload = response.data.data || [];
                     if (Array.isArray(payload)) {
@@ -583,7 +619,7 @@ export default {
 
         async loadExistingPersonaIds() {
             try {
-                const response = await axios.get('/api/persona/list');
+                const response = await personaApi.list();
                 if (response.data.status === 'ok') {
                     this.existingPersonaIds = (response.data.data || []).map(p => p.persona_id);
                 }
@@ -609,8 +645,9 @@ export default {
 
             this.saving = true;
             try {
-                const url = this.editingPersona ? '/api/persona/update' : '/api/persona/create';
-                const response = await axios.post(url, this.personaForm);
+                const response = this.editingPersona
+                    ? await personaApi.update(this.personaForm.persona_id, this.personaForm)
+                    : await personaApi.create(this.personaForm);
 
                 if (response.data.status === 'ok') {
                     this.$emit('saved', response.data.message || this.tm('messages.saveSuccess'));
@@ -638,9 +675,7 @@ export default {
 
             this.saving = true;
             try {
-                const response = await axios.post('/api/persona/delete', {
-                    persona_id: this.editingPersona.persona_id
-                });
+                const response = await personaApi.delete(this.editingPersona.persona_id);
 
                 if (response.data.status === 'ok') {
                     this.$emit('deleted', response.data.message || this.tm('messages.deleteSuccess'));
@@ -712,6 +747,9 @@ export default {
         },
 
         toggleTool(toolName) {
+            if (this.isBuiltinToolName(toolName)) {
+                return;
+            }
             // 如果当前是全选状态，需要先转换为具体的工具列表
             if (this.personaForm.tools === null) {
                 // 如果是全选状态，点击某个工具表示要取消选择该工具
@@ -735,6 +773,9 @@ export default {
         },
 
         removeTool(toolName) {
+            if (this.isBuiltinToolName(toolName)) {
+                return;
+            }
             // 如果当前是全选状态，需要先转换为具体的工具列表
             if (this.personaForm.tools === null) {
                 // 创建一个包含所有工具的数组，然后移除指定工具
@@ -782,6 +823,14 @@ export default {
         truncateText(text, maxLength) {
             if (!text) return '';
             return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
+        },
+
+        isBuiltinTool(tool) {
+            return tool?.origin === 'builtin' || tool?.readonly === true;
+        },
+
+        isBuiltinToolName(toolName) {
+            return this.availableTools.some(tool => tool.name === toolName && this.isBuiltinTool(tool));
         },
 
         getDialogRules(index) {
@@ -834,10 +883,6 @@ export default {
     overflow-y: auto;
 }
 
-.persona-form-title {
-    line-height: 1.3;
-}
-
 .persona-form-actions {
     position: sticky;
     bottom: 0;
@@ -857,6 +902,12 @@ export default {
 .tools-selection {
     max-height: 300px;
     overflow-y: auto;
+}
+
+.builtin-tool-checkbox-placeholder {
+    width: 40px;
+    height: 40px;
+    flex: 0 0 40px;
 }
 
 .skills-selection {
@@ -881,11 +932,6 @@ export default {
     .persona-basic-col,
     .persona-panels-col {
         padding-top: 0 !important;
-    }
-
-    .persona-form-title {
-        font-size: 1.15rem !important;
-        padding: 12px 16px !important;
     }
 
     .selected-config-area {

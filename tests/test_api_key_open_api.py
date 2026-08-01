@@ -1,35 +1,29 @@
 import asyncio
+import io
 import uuid
-from io import BytesIO
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from quart import Quart, g, request
 from werkzeug.datastructures import FileStorage
 
 from astrbot.core import LogBroker
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
 from astrbot.core.db.sqlite import SQLiteDatabase
-from astrbot.dashboard.routes.route import Response
+from astrbot.core.utils.auth_password import (
+    hash_dashboard_password,
+    hash_md5_dashboard_password,
+)
+from astrbot.dashboard.api import open_api as open_api_routes
+from astrbot.dashboard.asgi_runtime import FastAPIAppAdapter
+from astrbot.dashboard.responses import ok
 from astrbot.dashboard.server import AstrBotDashboard
 
-
-def _get_open_api_route(app: Quart):
-    rule = next(
-        (
-            item
-            for item in app.url_map.iter_rules()
-            if item.rule == "/api/v1/chat" and "POST" in item.methods
-        ),
-        None,
-    )
-    assert rule is not None
-    return app.view_functions[rule.endpoint].__self__
+_TEST_DASHBOARD_PASSWORD = "AstrbotTest123"
 
 
 async def _create_api_key(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
     *,
     scopes: list[str],
@@ -54,6 +48,24 @@ async def core_lifecycle_td(tmp_path_factory):
     log_broker = LogBroker()
     core_lifecycle = AstrBotCoreLifecycle(log_broker, db)
     await core_lifecycle.initialize()
+    generated_password = getattr(
+        core_lifecycle.astrbot_config,
+        "_generated_dashboard_password",
+        None,
+    )
+    dashboard_password = generated_password or _TEST_DASHBOARD_PASSWORD
+    if not generated_password:
+        core_lifecycle.astrbot_config["dashboard"]["pbkdf2_password"] = (
+            hash_dashboard_password(dashboard_password)
+        )
+        core_lifecycle.astrbot_config["dashboard"]["password"] = (
+            hash_md5_dashboard_password(dashboard_password)
+        )
+    object.__setattr__(
+        core_lifecycle,
+        "_dashboard_plain_password",
+        dashboard_password,
+    )
     try:
         yield core_lifecycle
     finally:
@@ -72,14 +84,26 @@ def app(core_lifecycle_td: AstrBotCoreLifecycle):
     return server.app
 
 
+def _resolve_dashboard_password(core_lifecycle_td: AstrBotCoreLifecycle) -> str:
+    generated_password = getattr(core_lifecycle_td, "_dashboard_plain_password", None)
+    if generated_password:
+        return generated_password
+    password = core_lifecycle_td.astrbot_config["dashboard"]["pbkdf2_password"]
+    if isinstance(password, str) and password.startswith("pbkdf2_sha256$"):
+        return "astrbot"
+    return password
+
+
 @pytest_asyncio.fixture(scope="module")
-async def authenticated_header(app: Quart, core_lifecycle_td: AstrBotCoreLifecycle):
+async def authenticated_header(
+    app: FastAPIAppAdapter, core_lifecycle_td: AstrBotCoreLifecycle
+):
     test_client = app.test_client()
     response = await test_client.post(
         "/api/auth/login",
         json={
             "username": core_lifecycle_td.astrbot_config["dashboard"]["username"],
-            "password": core_lifecycle_td.astrbot_config["dashboard"]["password"],
+            "password": _resolve_dashboard_password(core_lifecycle_td),
         },
     )
     data = await response.get_json()
@@ -88,7 +112,9 @@ async def authenticated_header(app: Quart, core_lifecycle_td: AstrBotCoreLifecyc
 
 
 @pytest.mark.asyncio
-async def test_api_key_scope_and_revoke(app: Quart, authenticated_header: dict):
+async def test_api_key_scope_and_revoke(
+    app: FastAPIAppAdapter, authenticated_header: dict
+):
     test_client = app.test_client()
 
     raw_key, key_id = await _create_api_key(
@@ -121,7 +147,13 @@ async def test_api_key_scope_and_revoke(app: Quart, authenticated_header: dict):
 
     denied_res = await test_client.post(
         "/api/v1/file",
-        data={},
+        files={
+            "file": FileStorage(
+                stream=io.BytesIO(b"scope denied"),
+                filename="denied.txt",
+                content_type="text/plain",
+            ),
+        },
         headers={"X-API-Key": raw_key},
     )
     assert denied_res.status_code == 403
@@ -143,7 +175,9 @@ async def test_api_key_scope_and_revoke(app: Quart, authenticated_header: dict):
 
 
 @pytest.mark.asyncio
-async def test_open_send_message_with_api_key(app: Quart, authenticated_header: dict):
+async def test_open_send_message_with_api_key(
+    app: FastAPIAppAdapter, authenticated_header: dict
+):
     test_client = app.test_client()
 
     raw_key, _ = await _create_api_key(
@@ -168,7 +202,7 @@ async def test_open_send_message_with_api_key(app: Quart, authenticated_header: 
 
 @pytest.mark.asyncio
 async def test_open_chat_send_auto_session_id_and_username(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
     core_lifecycle_td: AstrBotCoreLifecycle,
 ):
@@ -180,24 +214,21 @@ async def test_open_chat_send_auto_session_id_and_username(
         scopes=["chat"],
         name_prefix="chat-send-key",
     )
-    open_api_route = _get_open_api_route(app)
 
-    original_chat = open_api_route.chat_route.chat
-
-    async def fake_chat(post_data: dict | None = None):
-        payload = post_data or await request.get_json()
-        return (
-            Response()
-            .ok(
-                data={
-                    "session_id": payload.get("session_id"),
-                    "creator": g.get("username"),
-                }
-            )
-            .__dict__
+    async def fake_chat_response(_chat_service, username: str, post_data: dict):
+        return ok(
+            {
+                "session_id": post_data.get("session_id"),
+                "creator": username,
+            }
         )
 
-    open_api_route.chat_route.chat = fake_chat
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        open_api_routes,
+        "_build_streaming_chat_response",
+        fake_chat_response,
+    )
     try:
         send_res = await test_client.post(
             "/api/v1/chat",
@@ -209,7 +240,7 @@ async def test_open_chat_send_auto_session_id_and_username(
             headers={"X-API-Key": raw_key},
         )
     finally:
-        open_api_route.chat_route.chat = original_chat
+        monkeypatch.undo()
 
     assert send_res.status_code == 200
     send_data = await send_res.get_json()
@@ -259,7 +290,7 @@ async def test_open_chat_send_auto_session_id_and_username(
 
 @pytest.mark.asyncio
 async def test_open_chat_sessions_pagination(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
     core_lifecycle_td: AstrBotCoreLifecycle,
 ):
@@ -324,7 +355,7 @@ async def test_open_chat_sessions_pagination(
 
 @pytest.mark.asyncio
 async def test_open_chat_configs_list(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
 ):
     test_client = app.test_client()
@@ -354,7 +385,7 @@ async def test_open_chat_configs_list(
 
 @pytest.mark.asyncio
 async def test_open_api_auth_validation_and_key_carriers(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
 ):
     test_client = app.test_client()
@@ -398,7 +429,7 @@ async def test_open_api_auth_validation_and_key_carriers(
 
 @pytest.mark.asyncio
 async def test_open_chat_send_conversation_alias_and_blank_username(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
     core_lifecycle_td: AstrBotCoreLifecycle,
     monkeypatch: pytest.MonkeyPatch,
@@ -410,16 +441,18 @@ async def test_open_chat_send_conversation_alias_and_blank_username(
         scopes=["chat"],
         name_prefix="chat-conversation-key",
     )
-    open_api_route = _get_open_api_route(app)
 
-    async def fake_chat(post_data: dict | None = None):
-        payload = post_data or await request.get_json()
-        resolved_session_id = payload.get("session_id") or payload.get(
+    async def fake_chat_response(_chat_service, _username: str, post_data: dict):
+        resolved_session_id = post_data.get("session_id") or post_data.get(
             "conversation_id"
         )
-        return Response().ok(data={"session_id": resolved_session_id}).__dict__
+        return ok({"session_id": resolved_session_id})
 
-    monkeypatch.setattr(open_api_route.chat_route, "chat", fake_chat)
+    monkeypatch.setattr(
+        open_api_routes,
+        "_build_streaming_chat_response",
+        fake_chat_response,
+    )
 
     conversation_id = f"open_api_conversation_{uuid.uuid4().hex[:10]}"
     send_res = await test_client.post(
@@ -460,7 +493,7 @@ async def test_open_chat_send_conversation_alias_and_blank_username(
 
 @pytest.mark.asyncio
 async def test_open_chat_send_config_resolution(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -471,8 +504,6 @@ async def test_open_chat_send_config_resolution(
         scopes=["chat"],
         name_prefix="chat-config-resolution-key",
     )
-    open_api_route = _get_open_api_route(app)
-
     conf_list = [
         {
             "id": "default",
@@ -484,35 +515,38 @@ async def test_open_chat_send_config_resolution(
         {"id": "cfg-1", "name": "Duplicated", "path": "a.json", "is_default": False},
         {"id": "cfg-2", "name": "Duplicated", "path": "b.json", "is_default": False},
     ]
-    monkeypatch.setattr(open_api_route, "_get_chat_config_list", lambda: conf_list)
+    monkeypatch.setattr(
+        open_api_routes,
+        "_get_chat_config_list",
+        lambda _service: conf_list,
+    )
 
     update_route = AsyncMock()
     delete_route = AsyncMock()
     monkeypatch.setattr(
-        open_api_route.core_lifecycle.umop_config_router,
+        app._dashboard_server.core_lifecycle.umop_config_router,
         "update_route",
         update_route,
     )
     monkeypatch.setattr(
-        open_api_route.core_lifecycle.umop_config_router,
+        app._dashboard_server.core_lifecycle.umop_config_router,
         "delete_route",
         delete_route,
     )
 
-    async def fake_chat(post_data: dict | None = None):
-        payload = post_data or await request.get_json()
-        return (
-            Response()
-            .ok(
-                data={
-                    "session_id": payload.get("session_id"),
-                    "creator": g.get("username"),
-                }
-            )
-            .__dict__
+    async def fake_chat_response(_chat_service, username: str, post_data: dict):
+        return ok(
+            {
+                "session_id": post_data.get("session_id"),
+                "creator": username,
+            }
         )
 
-    monkeypatch.setattr(open_api_route.chat_route, "chat", fake_chat)
+    monkeypatch.setattr(
+        open_api_routes,
+        "_build_streaming_chat_response",
+        fake_chat_response,
+    )
 
     invalid_config_id_res = await test_client.post(
         "/api/v1/chat",
@@ -598,7 +632,7 @@ async def test_open_chat_send_config_resolution(
 
 @pytest.mark.asyncio
 async def test_open_chat_sessions_input_validation_and_filtering(
-    app: Quart,
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
     core_lifecycle_td: AstrBotCoreLifecycle,
 ):
@@ -674,7 +708,9 @@ async def test_open_chat_sessions_input_validation_and_filtering(
 
 
 @pytest.mark.asyncio
-async def test_open_send_message_error_paths(app: Quart, authenticated_header: dict):
+async def test_open_send_message_error_paths(
+    app: FastAPIAppAdapter, authenticated_header: dict
+):
     test_client = app.test_client()
     raw_key, _ = await _create_api_key(
         app,
@@ -729,41 +765,67 @@ async def test_open_send_message_error_paths(app: Quart, authenticated_header: d
 
 
 @pytest.mark.asyncio
-async def test_open_file_upload_requires_file_and_can_upload(
-    app: Quart,
+async def test_open_api_key_scope_normalization(
+    app: FastAPIAppAdapter,
     authenticated_header: dict,
 ):
     test_client = app.test_client()
-    raw_key, _ = await _create_api_key(
-        app,
-        authenticated_header,
-        scopes=["file"],
-        name_prefix="file-scope-key",
-    )
 
-    missing_file_res = await test_client.post(
-        "/api/v1/file",
-        data={},
-        headers={"X-API-Key": raw_key},
+    config_res = await test_client.post(
+        "/api/apikey/create",
+        json={"name": "config-contained-scopes-key", "scopes": ["config"]},
+        headers=authenticated_header,
     )
-    missing_file_data = await missing_file_res.get_json()
-    assert missing_file_data["status"] == "error"
-    assert missing_file_data["message"] == "Missing key: file"
+    config_data = await config_res.get_json()
+
+    assert config_res.status_code == 200
+    assert config_data["status"] == "ok"
+    assert set(config_data["data"]["scopes"]) == {"config", "bot", "provider"}
+
+    extra_scope_res = await test_client.post(
+        "/api/apikey/create",
+        json={"name": "mcp-skill-scope-key", "scopes": ["mcp", "skill"]},
+        headers=authenticated_header,
+    )
+    extra_scope_data = await extra_scope_res.get_json()
+
+    assert extra_scope_res.status_code == 200
+    assert extra_scope_data["status"] == "ok"
+    assert set(extra_scope_data["data"]["scopes"]) == {"mcp", "skill"}
+
+
+@pytest.mark.asyncio
+async def test_file_scope_is_available_for_developer_api_key(
+    app: FastAPIAppAdapter,
+    authenticated_header: dict,
+):
+    test_client = app.test_client()
+    create_res = await test_client.post(
+        "/api/apikey/create",
+        json={"name": "file-scope-key", "scopes": ["file"]},
+        headers=authenticated_header,
+    )
+    create_data = await create_res.get_json()
+
+    assert create_res.status_code == 200
+    assert create_data["status"] == "ok"
+    assert set(create_data["data"]["scopes"]) == {"file"}
 
     upload_res = await test_client.post(
         "/api/v1/file",
         files={
             "file": FileStorage(
-                stream=BytesIO(b"openapi-file-content"),
-                filename="openapi_test.txt",
+                stream=io.BytesIO(b"hello from api key"),
+                filename="api-key-upload.txt",
                 content_type="text/plain",
-            )
+            ),
         },
-        headers={"X-API-Key": raw_key},
+        headers={"X-API-Key": create_data["data"]["api_key"]},
     )
-    assert upload_res.status_code == 200
     upload_data = await upload_res.get_json()
+
+    assert upload_res.status_code == 200
     assert upload_data["status"] == "ok"
-    assert isinstance(upload_data["data"]["attachment_id"], str)
-    assert upload_data["data"]["filename"] == "openapi_test.txt"
+    assert upload_data["data"]["filename"] == "api-key-upload.txt"
     assert upload_data["data"]["type"] == "file"
+    assert upload_data["data"]["attachment_id"]
