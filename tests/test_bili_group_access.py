@@ -88,6 +88,61 @@ def test_execution_and_group_approval_use_same_access_and_ledger():
     assert "if not group_owner:\n                await self.flush_memory(event)" in incoming
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,date", [
+    ("[主人(474115040)] 今天刷了几条b站了", "今天"),
+    ("昨天逛了什么视频", "昨天"),
+    ("2026-11-07看了哪些B站视频", "2026-11-07"),
+])
+async def test_explicit_group_history_question_queries_before_answer(text, date):
+    import sys
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    module = ModuleType("bili_group_history_question")
+    module.re = __import__("re")
+    module.AstrMessageEvent = object
+    module.trim_tool_image_history = lambda *args, **kwargs: 0
+    module.group_access = lambda event, cfg, owner=False: True
+    module.logger = SimpleNamespace(info=lambda *args: None)
+    method = methods("guard_phone")
+    method.decorator_list = []
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"), vars(module))
+    controller = SimpleNamespace(cfg=lambda: config(),
+        bili_history=AsyncMock(return_value='{"counts":{"browsed_videos":2}}'))
+    current = event()
+    current.message_str = text
+    req = SimpleNamespace(contexts=[], system_prompt="persona", func_tool=None)
+    await module.guard_phone(controller, current, req)
+    controller.bili_history.assert_awaited_once_with(current, date)
+    assert "browsed_videos" in req.system_prompt
+    assert "不要用群聊活动" in req.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_group_small_talk_does_not_query_history():
+    import sys
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    module = ModuleType("bili_group_small_talk")
+    module.re = __import__("re")
+    module.AstrMessageEvent = object
+    module.trim_tool_image_history = lambda *args, **kwargs: 0
+    module.group_access = lambda event, cfg, owner=False: True
+    module.logger = SimpleNamespace(info=lambda *args: None)
+    method = methods("guard_phone")
+    method.decorator_list = []
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"), vars(module))
+    controller = SimpleNamespace(cfg=lambda: config(), bili_history=AsyncMock())
+    current = event()
+    current.message_str = "你们今天一直在调机器人"
+    req = SimpleNamespace(contexts=[], system_prompt="persona", func_tool=None)
+    await module.guard_phone(controller, current, req)
+    controller.bili_history.assert_not_awaited()
+    assert "已为本条浏览历史问题" not in req.system_prompt
+
+
 def test_invalid_group_switch_is_rejected():
     source = ast.get_source_segment(ROOT.read_text(encoding="utf-8"), methods("cfg"))
     assert '"group_history_enabled", "group_owner_actions_enabled"' in source
