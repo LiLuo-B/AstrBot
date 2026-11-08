@@ -330,6 +330,8 @@ class CommandHandler:
             return GLOBAL_MEMORY_SCOPE
         if key == "session":
             return str(getattr(event, "unified_msg_origin", "") or "")
+        if key == "adapter":
+            return "livingmemory:adapter:" + (str(event.get_platform_name() or "").casefold() or "unknown")
         if key == "user":
             platform = str(event.get_platform_name() or "").casefold()
             identity = resolve_event_identity(self.config_manager, event).casefold()

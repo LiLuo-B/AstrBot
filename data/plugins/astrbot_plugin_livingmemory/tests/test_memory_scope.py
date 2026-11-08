@@ -133,6 +133,9 @@ def test_scope_modes_and_isolated_override():
     assert resolve_memory_scope(user_config, first) == resolve_memory_scope(
         user_config, second
     )
+    adapter_config = _config(filtering_settings={"memory_scope_mode": "adapter"})
+    assert resolve_memory_scope(adapter_config, first) == "livingmemory:adapter:test"
+    assert resolve_memory_scope(adapter_config, first) == resolve_memory_scope(adapter_config, second)
 
     assert (
         resolve_memory_scope(

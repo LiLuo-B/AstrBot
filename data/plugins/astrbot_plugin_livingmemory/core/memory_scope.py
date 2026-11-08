@@ -237,6 +237,8 @@ def resolve_memory_scope(config: Any, event: Any) -> str | None:
     ).casefold()
     if mode == "session":
         return session_id
+    if mode == "adapter":
+        return "livingmemory:adapter:" + (_event_value(event, "get_platform_name", "platform") or "unknown")
     if mode == "global":
         return GLOBAL_MEMORY_SCOPE
     if mode == "user":

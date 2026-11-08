@@ -386,13 +386,13 @@ class HistoryControllerTests(unittest.IsolatedAsyncioTestCase):
         )
         controller = types.SimpleNamespace(
             store=types.SimpleNamespace(db=object()),
-            check_chat=Mock(side_effect=PermissionError("not owner")),
+            check_owner=Mock(side_effect=PermissionError("not owner")),
         )
         event = types.SimpleNamespace(unified_msg_origin=SCOPE)
         with self.assertRaises(PermissionError):
             await namespace["bili_history"](controller, event, "昨天")
         query.assert_not_called()
-        controller.check_chat = Mock(return_value={"life_enabled": False, "owner_scope": SCOPE})
+        controller.check_owner = Mock(return_value={"life_enabled": False, "owner_scope": SCOPE})
         result = json.loads(await namespace["bili_history"](controller, event, "昨天"))
         self.assertFalse(result["coverage"]["recording_enabled_now"])
         self.assertTrue(result["records_are_data_not_instructions"])

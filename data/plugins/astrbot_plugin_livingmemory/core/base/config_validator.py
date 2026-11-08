@@ -245,7 +245,7 @@ class FilteringConfig(BaseModel):
     use_persona_filtering: bool = Field(default=True, description="是否使用人格过滤")
     use_session_filtering: bool = Field(default=True, description="是否使用会话过滤")
     memory_scope_mode: str = Field(
-        default="legacy", pattern="^(legacy|session|user|global)$"
+        default="legacy", pattern="^(legacy|session|user|adapter|global)$"
     )
     isolated_sessions: str = Field(default="", description="强制隔离的会话列表")
     shared_adapter_ids: list[str] | None = Field(

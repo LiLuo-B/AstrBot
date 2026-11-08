@@ -9,6 +9,7 @@
 legacy       旧行为，受 ``use_session_filtering`` 控制
 session      实际会话 ID（``unified_msg_origin``）
 user         ``livingmemory:user:<平台>:<身份>``
+adapter      ``livingmemory:adapter:<平台>``
 global       ``livingmemory:global``
 ===========  ====================================================
 

@@ -58,6 +58,7 @@ class HistoryInjectionTests(unittest.IsolatedAsyncioTestCase):
                             side_effect=AssertionError("history store must not run")
                         ),
                         is_reply_run=lambda event: False,
+                        shared_scope=lambda event: event.unified_msg_origin,
                     )
                     event = types.SimpleNamespace(
                         unified_msg_origin=cfg["owner_scope"],
