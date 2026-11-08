@@ -1,4 +1,5 @@
 """Additive interaction policy around the existing proposal and Executor ledgers."""
+
 from __future__ import annotations
 
 import json
@@ -9,28 +10,45 @@ from contextlib import closing
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .core import ENGAGEMENT, PUBLIC, WRITES, canonical, digest
-
+from .core import ENGAGEMENT, PUBLIC, WRITES, digest
 
 DEFAULTS = {
-    "engagement_actions": False, "interaction_mode": "approval", "auto_public": False,
-    "allowed_uids": [], "allowed_keywords": [],
-    "max_actions_per_run": 3, "max_actions_per_day": 20,
-    "max_comments_per_day": 3, "max_replies_per_day": 5, "max_danmaku_per_day": 1,
-    "max_likes_per_day": 10, "max_coins_per_day": 1,
-    "action_interval_ms": [1500, 4000], "risk_cooldown_minutes": 60,
+    "engagement_actions": False,
+    "interaction_mode": "approval",
+    "auto_public": False,
+    "auto_collection_management": False,
+    "allowed_uids": [],
+    "allowed_keywords": [],
+    "max_actions_per_run": 3,
+    "max_actions_per_day": 20,
+    "max_comments_per_day": 3,
+    "max_replies_per_day": 5,
+    "max_danmaku_per_day": 1,
+    "max_likes_per_day": 10,
+    "max_coins_per_day": 1,
+    "action_interval_ms": [1500, 4000],
+    "risk_cooldown_minutes": 60,
 }
-ACTION_LIMITS = {"comment": "max_comments_per_day", "reply": "max_replies_per_day",
-                 "danmaku": "max_danmaku_per_day", "like": "max_likes_per_day", "coin": "max_coins_per_day"}
+ACTION_LIMITS = {
+    "comment": "max_comments_per_day",
+    "reply": "max_replies_per_day",
+    "danmaku": "max_danmaku_per_day",
+    "like": "max_likes_per_day",
+    "coin": "max_coins_per_day",
+}
 RISK_CODES = {12014, -412, -352}
 VISIBILITY = {"public", "not_public_or_folded", "unknown", "not_applicable"}
 
 
 def validate_config(cfg):
-    for key in ("engagement_actions", "auto_public"):
-        if type(cfg[key]) is not bool:
+    for key in ("engagement_actions", "auto_public", "auto_collection_management"):
+        if type(cfg.get(key, DEFAULTS[key])) is not bool:
             raise ValueError(f"{key} 必须是布尔开关")
-    if not isinstance(cfg["interaction_mode"], str) or cfg["interaction_mode"] not in {"approval", "auto_low_risk", "auto_public"}:
+    if not isinstance(cfg["interaction_mode"], str) or cfg["interaction_mode"] not in {
+        "approval",
+        "auto_low_risk",
+        "auto_public",
+    }:
         raise ValueError("无效 interaction_mode")
     for key in ("allowed_uids", "allowed_keywords"):
         values = cfg[key]
@@ -38,30 +56,53 @@ def validate_config(cfg):
             raise ValueError(f"invalid {key}")
         for value in values:
             if key == "allowed_uids":
-                if type(value) not in (str, int) or not str(value).isascii() or not str(value).isdigit() or int(value) <= 0:
+                if (
+                    type(value) not in (str, int)
+                    or not str(value).isascii()
+                    or not str(value).isdigit()
+                    or int(value) <= 0
+                ):
                     raise ValueError("allowed_uids 必须为 UID 数组")
             elif not isinstance(value, str) or not value.strip() or len(value) > 100:
                 raise ValueError("allowed_keywords 必须为非空关键词数组")
-    for key in (*ACTION_LIMITS.values(), "max_actions_per_run", "max_actions_per_day", "risk_cooldown_minutes"):
+    for key in (
+        *ACTION_LIMITS.values(),
+        "max_actions_per_run",
+        "max_actions_per_day",
+        "risk_cooldown_minutes",
+    ):
         if type(cfg[key]) is not int or not 0 <= cfg[key] <= 10000:
             raise ValueError(f"{key} 必须为 0..10000 的整数")
     if cfg["risk_cooldown_minutes"] < 1:
         raise ValueError("risk_cooldown_minutes 必须至少 1 分钟")
     interval = cfg["action_interval_ms"]
-    if (not isinstance(interval, list) or len(interval) != 2
-            or any(type(v) is not int or not 0 <= v <= 60000 for v in interval)
-            or interval[0] > interval[1]):
+    if (
+        not isinstance(interval, list)
+        or len(interval) != 2
+        or any(type(v) is not int or not 0 <= v <= 60000 for v in interval)
+        or interval[0] > interval[1]
+    ):
         raise ValueError("action_interval_ms 必须为递增的毫秒范围")
 
 
 def enabled(action, cfg):
-    return bool(cfg.get("public_interactions") if action in PUBLIC else
-                cfg.get("engagement_actions") if action in ENGAGEMENT else cfg.get("collection_management"))
+    return bool(
+        cfg.get("public_interactions")
+        if action in PUBLIC
+        else cfg.get("engagement_actions")
+        if action in ENGAGEMENT
+        else cfg.get("collection_management")
+    )
 
 
 def auto_allowed(action, target, cfg):
     """Explicit opt-in policy; unmatched actions retain the owner approval path."""
-    if not enabled(action, cfg) or cfg["max_actions_per_day"] <= 0 or cfg["max_actions_per_run"] <= 0:
+    if (
+        action not in WRITES
+        or not enabled(action, cfg)
+        or cfg["max_actions_per_day"] <= 0
+        or cfg["max_actions_per_run"] <= 0
+    ):
         return False
     mode = cfg["interaction_mode"]
     if action in PUBLIC:
@@ -70,15 +111,21 @@ def auto_allowed(action, target, cfg):
     elif action in ENGAGEMENT:
         if mode not in {"auto_low_risk", "auto_public"}:
             return False
-    else:
+    elif not cfg.get("auto_collection_management", False) or mode not in {
+        "auto_low_risk",
+        "auto_public",
+    }:
         return False
-    if cfg[ACTION_LIMITS[action]] <= 0:
+    limit_key = ACTION_LIMITS.get(action)
+    if limit_key and cfg[limit_key] <= 0:
         return False
-    owner = (target.get("owner") or {}).get("mid")
+    owner = (target.get("owner") or {}).get("mid") or target.get("uid")
     if cfg["allowed_uids"] and str(owner) not in {str(x) for x in cfg["allowed_uids"]}:
         return False
     title = target.get("title", "")
-    if cfg["allowed_keywords"] and not any(word.casefold() in str(title).casefold() for word in cfg["allowed_keywords"]):
+    if cfg["allowed_keywords"] and not any(
+        word.casefold() in str(title).casefold() for word in cfg["allowed_keywords"]
+    ):
         return False
     return True
 
@@ -91,7 +138,14 @@ def dedupe_key(action, args):
     if action in {"comment", "danmaku"}:
         return digest([action, args.get("bvid")])
     if action == "reply":
-        return digest([action, args.get("bvid"), str(args.get("root_rpid")), str(args.get("parent_rpid"))])
+        return digest(
+            [
+                action,
+                args.get("bvid"),
+                str(args.get("root_rpid")),
+                str(args.get("parent_rpid")),
+            ]
+        )
     if action == "follow":
         return digest([action, str(args.get("uid"))])
     return None
@@ -101,22 +155,48 @@ def safe_result(value):
     """Only typed ledger metadata can enter events/status, never remote bodies."""
     value = value if isinstance(value, dict) else {}
     visibility = value.get("visibility")
-    result = {"verified": value.get("verified") is True,
-              "visibility": visibility if isinstance(visibility, str) and visibility in VISIBILITY else "unknown",
-              "risk_code": value.get("risk_code") if type(value.get("risk_code")) is int else None}
+    result = {
+        "verified": value.get("verified") is True,
+        "visibility": visibility
+        if isinstance(visibility, str) and visibility in VISIBILITY
+        else "unknown",
+        "risk_code": value.get("risk_code")
+        if type(value.get("risk_code")) is int
+        else None,
+    }
     source = value.get("risk_source")
-    result["risk_source"] = source if isinstance(source, str) and source in {"authenticated", "visibility"} else None
+    result["risk_source"] = (
+        source
+        if isinstance(source, str) and source in {"authenticated", "visibility"}
+        else None
+    )
     # Older companions attached anonymous visibility failures to verified writes.
-    if result["risk_source"] == "visibility" or (result["verified"] and result["risk_source"] != "authenticated"):
+    if result["risk_source"] == "visibility" or (
+        result["verified"] and result["risk_source"] != "authenticated"
+    ):
         result["risk_code"] = None
     for key in ("rpid", "dmid"):
         text = str(value.get(key) or "")
         result[key] = text if text.isascii() and text.isdigit() else ""
-    result["accepted"] = value.get("accepted") is True and bool(result["dmid"]) and int(result["dmid"]) > 0
+    result["accepted"] = (
+        value.get("accepted") is True
+        and bool(result["dmid"])
+        and int(result["dmid"]) > 0
+    )
     if "like_ok" in value:
         result["like_ok"] = value["like_ok"] if type(value["like_ok"]) is bool else None
-    result["result"] = "verified" if result["verified"] else "accepted" if result["accepted"] else "uncertain"
-    if value.get("executed") is False and isinstance(value.get("reason"), str) and value["reason"] in {"switch_disabled", "interaction_blocked"}:
+    result["result"] = (
+        "verified"
+        if result["verified"]
+        else "accepted"
+        if result["accepted"]
+        else "uncertain"
+    )
+    if (
+        value.get("executed") is False
+        and isinstance(value.get("reason"), str)
+        and value["reason"] in {"switch_disabled", "interaction_blocked"}
+    ):
         result.update(executed=False, reason=value["reason"], result="blocked")
     # reason/error strings from a transport are deliberately discarded.
     return result
@@ -177,15 +257,21 @@ class Interactions:
     def __init__(self, store):
         self.store, self.db = store, store.db
         self.schema_backup = None
-        exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='interaction_meta'").fetchone()
+        exists = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='interaction_meta'"
+        ).fetchone()
         if exists:
-            version = self.db.execute("SELECT value FROM interaction_meta WHERE key='version'").fetchone()
+            version = self.db.execute(
+                "SELECT value FROM interaction_meta WHERE key='version'"
+            ).fetchone()
             if not version or version[0] != "1":
                 raise RuntimeError("unsupported interaction schema")
             return
         if self.db.in_transaction:
             raise RuntimeError("initialize interactions outside a transaction")
-        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name IN ('interactions','daily_actions')").fetchone():
+        if self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name IN ('interactions','daily_actions')"
+        ).fetchone():
             raise RuntimeError("incomplete interaction schema")
         directory = store.folder / "schema_backups"
         directory.mkdir(exist_ok=True)
@@ -211,20 +297,41 @@ class Interactions:
               count INTEGER NOT NULL CHECK(count>=0),PRIMARY KEY(scope,day,action));
             """)
             # Preserve pre-v0.5 successes/ambiguous attempts as business dedup evidence.
-            for row in self.db.execute("SELECT * FROM proposals WHERE status IN ('verified','executing','uncertain') ORDER BY created").fetchall():
+            for row in self.db.execute(
+                "SELECT * FROM proposals WHERE status IN ('verified','executing','uncertain') ORDER BY created"
+            ).fetchall():
                 args = json.loads(row["args"])
                 previous = json.loads(row["result"]) if row["result"] else {}
                 identity = previous.get("identity") or {}
                 # Old previews accepted av aliases. Their verified readback
                 # already contains the canonical identity; no network migration.
-                if (isinstance(identity, dict) and isinstance(identity.get("bvid"), str)
-                        and identity["bvid"].startswith("BV") and str(identity.get("cid", "")).isdigit()):
+                if (
+                    isinstance(identity, dict)
+                    and isinstance(identity.get("bvid"), str)
+                    and identity["bvid"].startswith("BV")
+                    and str(identity.get("cid", "")).isdigit()
+                ):
                     args.update(bvid=identity["bvid"], cid=identity["cid"])
-                self._insert(row["scope"], "legacy:" + row["id"], row["id"], row["action"], args, row["created"], ignore=True)
+                self._insert(
+                    row["scope"],
+                    "legacy:" + row["id"],
+                    row["id"],
+                    row["action"],
+                    args,
+                    row["created"],
+                    ignore=True,
+                )
                 value = safe_result(previous)
-                self.db.execute("UPDATE interactions SET result=?,verified=?,rpid=?,visibility=? WHERE proposal_id=?",
-                    ("verified" if row["status"] == "verified" else "uncertain", row["status"] == "verified",
-                     value["rpid"], value["visibility"], row["id"]))
+                self.db.execute(
+                    "UPDATE interactions SET result=?,verified=?,rpid=?,visibility=? WHERE proposal_id=?",
+                    (
+                        "verified" if row["status"] == "verified" else "uncertain",
+                        row["status"] == "verified",
+                        value["rpid"],
+                        value["visibility"],
+                        row["id"],
+                    ),
+                )
             self.db.execute("COMMIT")
         except BaseException:
             if self.db.in_transaction:
@@ -235,21 +342,50 @@ class Interactions:
         # Multiple historical successes may share a new business key. Keep all
         # counts/history, while the earliest one owns the unique guard.
         key = dedupe_key(action, args)
-        if ignore and key and self.db.execute("SELECT 1 FROM interactions WHERE scope=? AND dedupe_key=?", (scope, key)).fetchone():
+        if (
+            ignore
+            and key
+            and self.db.execute(
+                "SELECT 1 FROM interactions WHERE scope=? AND dedupe_key=?",
+                (scope, key),
+            ).fetchone()
+        ):
             key = None
         day = day_at(now)
-        self.db.execute("INSERT INTO interactions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, scope, run_id, action, digest([action, args]), key,
-             str(args.get("bvid", "")), str(args.get("cid", "")), str(args.get("uid", "")),
-             str(args.get("root_rpid", "")), str(args.get("parent_rpid", "")), "", now, day,
-             "uncertain", 0, "unknown", None))
-        self.db.execute("INSERT INTO daily_actions VALUES(?,?,?,1) ON CONFLICT(scope,day,action) DO UPDATE SET count=count+1",
-                        (scope, day, action))
+        self.db.execute(
+            "INSERT INTO interactions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                pid,
+                scope,
+                run_id,
+                action,
+                digest([action, args]),
+                key,
+                str(args.get("bvid", "")),
+                str(args.get("cid", "")),
+                str(args.get("uid", "")),
+                str(args.get("root_rpid", "")),
+                str(args.get("parent_rpid", "")),
+                "",
+                now,
+                day,
+                "uncertain",
+                0,
+                "unknown",
+                None,
+            ),
+        )
+        self.db.execute(
+            "INSERT INTO daily_actions VALUES(?,?,?,1) ON CONFLICT(scope,day,action) DO UPDATE SET count=count+1",
+            (scope, day, action),
+        )
 
     def guard(self, scope, run_id, now=None):
         now = time.time() if now is None else now
         if self.store.get_setting("interaction_login:" + scope) == "invalid":
-            raise InteractionBlocked("B站登录失效，请哥重新扫码后查询互动状态确认登录。")
+            raise InteractionBlocked(
+                "B站登录失效，请哥重新扫码后查询互动状态确认登录。"
+            )
         if self.store.get_setting("interaction_stopped:" + scope + ":" + run_id, False):
             raise InteractionBlocked("本轮因风控已停止，不再发送下一条。")
         until = self.store.get_setting("interaction_cooldown:" + scope, 0)
@@ -261,31 +397,56 @@ class Interactions:
         if action not in WRITES:
             raise ValueError("unsupported interaction")
         self.guard(scope, run_id, now)
-        if self.db.execute("SELECT 1 FROM interactions WHERE scope=? AND fingerprint=? AND result='uncertain'",
-                           (scope, digest([action, args]))).fetchone():
-            raise InteractionBlocked("相同参数存在未核实的执行记录；禁止重复，清理提议不授权重试原操作。")
+        if self.db.execute(
+            "SELECT 1 FROM interactions WHERE scope=? AND fingerprint=? AND result='uncertain'",
+            (scope, digest([action, args])),
+        ).fetchone():
+            raise InteractionBlocked(
+                "相同参数存在未核实的执行记录；禁止重复，清理提议不授权重试原操作。"
+            )
         key = dedupe_key(action, args)
-        if key and self.db.execute("SELECT 1 FROM interactions WHERE scope=? AND dedupe_key=?", (scope, key)).fetchone():
-            raise InteractionBlocked("相同视频/回复目标/关注对象已有动作记录；禁止重复评论、回复或自动重试。")
+        if (
+            key
+            and self.db.execute(
+                "SELECT 1 FROM interactions WHERE scope=? AND dedupe_key=?",
+                (scope, key),
+            ).fetchone()
+        ):
+            raise InteractionBlocked(
+                "相同视频/回复目标/关注对象已有动作记录；禁止重复评论、回复或自动重试。"
+            )
         day = day_at(now)
-        total = self.db.execute("SELECT COALESCE(SUM(count),0) FROM daily_actions WHERE scope=? AND day=?", (scope, day)).fetchone()[0]
+        total = self.db.execute(
+            "SELECT COALESCE(SUM(count),0) FROM daily_actions WHERE scope=? AND day=?",
+            (scope, day),
+        ).fetchone()[0]
         if total >= cfg["max_actions_per_day"]:
             raise InteractionBlocked("今日 max_actions_per_day 额度已用完。")
-        count = self.db.execute("SELECT COUNT(*) FROM interactions WHERE scope=? AND run_id=?", (scope, run_id)).fetchone()[0]
+        count = self.db.execute(
+            "SELECT COUNT(*) FROM interactions WHERE scope=? AND run_id=?",
+            (scope, run_id),
+        ).fetchone()[0]
         if count >= cfg["max_actions_per_run"]:
             raise InteractionBlocked("本轮 max_actions_per_run 额度已用完。")
         limit_key = ACTION_LIMITS.get(action)
         if limit_key:
-            row = self.db.execute("SELECT count FROM daily_actions WHERE scope=? AND day=? AND action=?", (scope, day, action)).fetchone()
+            row = self.db.execute(
+                "SELECT count FROM daily_actions WHERE scope=? AND day=? AND action=?",
+                (scope, day, action),
+            ).fetchone()
             if (row[0] if row else 0) >= cfg[limit_key]:
                 raise InteractionBlocked(f"今日 {limit_key} 额度已用完。")
 
     def reserve(self, scope, run_id, pid, action, args, cfg, now=None):
         now = time.time() if now is None else now
         with self.store.transaction():
-            existing = self.db.execute("SELECT * FROM interactions WHERE proposal_id=?", (pid,)).fetchone()
+            existing = self.db.execute(
+                "SELECT * FROM interactions WHERE proposal_id=?", (pid,)
+            ).fetchone()
             if existing:
-                if existing["scope"] != scope or existing["fingerprint"] != digest([action, args]):
+                if existing["scope"] != scope or existing["fingerprint"] != digest(
+                    [action, args]
+                ):
                     raise ValueError("proposal_id belongs to different arguments")
                 raise InteractionBlocked("该操作已经预留或执行，结果未知时不自动重试。")
             self.check(scope, run_id, action, args, cfg, now)
@@ -297,7 +458,13 @@ class Interactions:
             return
         if code in RISK_CODES:
             key = "interaction_cooldown:" + scope
-            self.store.setting(key, max(self.store.get_setting(key, 0), now + cfg["risk_cooldown_minutes"] * 60))
+            self.store.setting(
+                key,
+                max(
+                    self.store.get_setting(key, 0),
+                    now + cfg["risk_cooldown_minutes"] * 60,
+                ),
+            )
             self.store.setting("interaction_stopped:" + scope + ":" + run_id, True)
         elif code == -101:
             self.store.setting("interaction_login:" + scope, "invalid")
@@ -314,41 +481,108 @@ class Interactions:
         if action not in PUBLIC:
             value["visibility"] = "not_applicable"
         with self.store.transaction():
-            self.db.execute("UPDATE interactions SET result=?,verified=?,visibility=?,risk_code=?,rpid=? WHERE proposal_id=? AND scope=?",
-                (value["result"], value["verified"], value["visibility"], value["risk_code"], value["rpid"], pid, scope))
+            self.db.execute(
+                "UPDATE interactions SET result=?,verified=?,visibility=?,risk_code=?,rpid=? WHERE proposal_id=? AND scope=?",
+                (
+                    value["result"],
+                    value["verified"],
+                    value["visibility"],
+                    value["risk_code"],
+                    value["rpid"],
+                    pid,
+                    scope,
+                ),
+            )
             if action == "comment" and value["rpid"]:
-                self.db.execute("UPDATE interactions SET root_rpid=?,parent_rpid='0' WHERE proposal_id=? AND scope=?",
-                                (value["rpid"], pid, scope))
+                self.db.execute(
+                    "UPDATE interactions SET root_rpid=?,parent_rpid='0' WHERE proposal_id=? AND scope=?",
+                    (value["rpid"], pid, scope),
+                )
             self.risk(scope, run_id, value["risk_code"], cfg, now)
             value["risk_applied"] = value["risk_code"] in RISK_CODES | {-101}
-            self.store.setting("interaction_next:" + scope, now + random.uniform(*cfg["action_interval_ms"]) / 1000)
-            self.store.event(scope, "interaction_result", {"proposal_id": pid, "action": action,
-                "bvid": args.get("bvid", ""), "cid": args.get("cid", ""), **value})
+            self.store.setting(
+                "interaction_next:" + scope,
+                now + random.uniform(*cfg["action_interval_ms"]) / 1000,
+            )
+            self.store.event(
+                scope,
+                "interaction_result",
+                {
+                    "proposal_id": pid,
+                    "action": action,
+                    "bvid": args.get("bvid", ""),
+                    "cid": args.get("cid", ""),
+                    **value,
+                },
+            )
         return value
 
     def status(self, scope, cfg, now=None):
         now = time.time() if now is None else now
         day = day_at(now)
-        counts = {row["action"]: row["count"] for row in self.db.execute("SELECT * FROM daily_actions WHERE scope=? AND day=?", (scope, day))}
+        counts = {
+            row["action"]: row["count"]
+            for row in self.db.execute(
+                "SELECT * FROM daily_actions WHERE scope=? AND day=?", (scope, day)
+            )
+        }
         recent = []
-        for row in self.db.execute("SELECT i.proposal_id,i.action,i.bvid,i.cid,i.rpid,i.result,i.verified,i.visibility,i.risk_code,i.created,p.result AS evidence FROM interactions i LEFT JOIN proposals p ON p.id=i.proposal_id WHERE i.scope=? ORDER BY i.created DESC,i.rowid DESC LIMIT 5", (scope,)):
+        for row in self.db.execute(
+            "SELECT i.proposal_id,i.action,i.bvid,i.cid,i.rpid,i.result,i.verified,i.visibility,i.risk_code,i.created,p.result AS evidence FROM interactions i LEFT JOIN proposals p ON p.id=i.proposal_id WHERE i.scope=? ORDER BY i.created DESC,i.rowid DESC LIMIT 5",
+            (scope,),
+        ):
             entry = dict(row)
             evidence = safe_result(json.loads(entry.pop("evidence") or "{}"))
             # `accepted` is danmaku-only; never surface it for likes/coins.
             if entry["action"] == "danmaku":
-                entry.update({key: evidence[key] for key in ("dmid", "accepted") if key in evidence})
+                entry.update(
+                    {
+                        key: evidence[key]
+                        for key in ("dmid", "accepted")
+                        if key in evidence
+                    }
+                )
             if entry["action"] == "coin" and "like_ok" in evidence:
                 entry["like_ok"] = evidence["like_ok"]
-            entry["summary"] = human_result(entry["action"], {
-                **evidence, "verified": bool(entry["verified"]),
-                "visibility": entry["visibility"], "risk_code": entry["risk_code"]})
+            entry["summary"] = human_result(
+                entry["action"],
+                {
+                    **evidence,
+                    "verified": bool(entry["verified"]),
+                    "visibility": entry["visibility"],
+                    "risk_code": entry["risk_code"],
+                },
+            )
             recent.append(entry)
-        return {"day": day, "mode": cfg["interaction_mode"], "counting": "attempts_including_unknown",
+        return {
+            "day": day,
+            "mode": cfg["interaction_mode"],
+            "counting": "attempts_including_unknown",
             "report_note": "对哥只说 summary；不要念 accepted/verified/visibility/risk_code。",
-            "today": {action: {"count": counts.get(action, 0), "limit": cfg.get(ACTION_LIMITS.get(action), cfg["max_actions_per_day"])} for action in sorted(WRITES)},
-            "total": {"count": sum(counts.values()), "limit": cfg["max_actions_per_day"]},
+            "today": {
+                action: {
+                    "count": counts.get(action, 0),
+                    "limit": cfg.get(
+                        ACTION_LIMITS.get(action), cfg["max_actions_per_day"]
+                    ),
+                }
+                for action in sorted(WRITES)
+            },
+            "total": {
+                "count": sum(counts.values()),
+                "limit": cfg["max_actions_per_day"],
+            },
             "max_actions_per_run": cfg["max_actions_per_run"],
-            "pending": [dict(row) for row in self.db.execute("SELECT id,action,status FROM proposals WHERE scope=? AND ((status IN ('draft','offered') AND expires>?) OR status IN ('executing','uncertain')) ORDER BY created", (scope, now))],
-            "cooldown_remaining_seconds": max(0, self.store.get_setting("interaction_cooldown:" + scope, 0) - now),
+            "pending": [
+                dict(row)
+                for row in self.db.execute(
+                    "SELECT id,action,status FROM proposals WHERE scope=? AND ((status IN ('draft','offered') AND expires>?) OR status IN ('executing','uncertain')) ORDER BY created",
+                    (scope, now),
+                )
+            ],
+            "cooldown_remaining_seconds": max(
+                0, self.store.get_setting("interaction_cooldown:" + scope, 0) - now
+            ),
             "login": self.store.get_setting("interaction_login:" + scope, "unknown"),
-            "recent": recent}
+            "recent": recent,
+        }

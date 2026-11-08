@@ -625,7 +625,8 @@ class BiliActivity(Star):
             if not changed:
                 return None
             self.store.setting("interaction_target:" + pid, {
-                "owner": {"mid": (target.get("owner") or {}).get("mid")}, "title": target.get("title", "")})
+                "owner": {"mid": (target.get("owner") or {}).get("mid")},
+                "uid": target.get("uid"), "title": target.get("title", "")})
             self.store.event(scope, "policy_approval", {"proposal_id": pid, "action": proposal["action"],
                 "mode": cfg["interaction_mode"], "authorization": "owner_configuration", "owner_message": False})
         value = await self.execute_interaction(event, {**proposal, "args": json.loads(proposal["args"])}, automatic=True)
@@ -678,7 +679,8 @@ class BiliActivity(Star):
         if parts == ["/bili互动", "关"]:
             await self.pause_background("哥关闭了互动")
             self.save_interaction_config({"public_interactions": False, "engagement_actions": False,
-                "collection_management": False, "auto_public": False, "reply_watch_enabled": False,
+                "collection_management": False, "auto_collection_management": False,
+                "auto_public": False, "reply_watch_enabled": False,
                 "interaction_mode": "approval"})
             answer = "评论/回复/弹幕、点赞/投币、关注/收藏管理（collection_management）及回复监听已关闭，历史记录保留。"
         elif parts == ["/bili互动", "开"]:
