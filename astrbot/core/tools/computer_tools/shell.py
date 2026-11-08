@@ -4,6 +4,7 @@ import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from astrbot.api import FunctionTool
@@ -11,12 +12,14 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.computer.booters.local import LocalShellComponent
-from astrbot.core.computer.computer_client import get_booter
+from astrbot.core.computer.computer_client import get_booter, get_local_booter
 from astrbot.core.utils.astrbot_path import get_astrbot_system_tmp_path
 
 from ..registry import builtin_tool
+from .fs import _read_allowed_roots, _write_allowed_roots
 from .util import (
-    check_admin_permission,
+    check_local_execution_permission,
+    get_local_permission_policy,
     is_local_runtime,
     workspace_root_for_context,
 )
@@ -66,7 +69,7 @@ class ExecuteShellTool(FunctionTool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute in the current runtime shell (for example, cmd.exe on Windows). Equal to 'cd {working_dir} && {your_command}'.",
+                    "description": "The shell command to execute in the current runtime shell (for example, PowerShell on Windows). Equal to 'cd {working_dir} && {your_command}'.",
                 },
                 "background": {
                     "type": "boolean",
@@ -98,8 +101,13 @@ class ExecuteShellTool(FunctionTool):
         env: dict[str, Any] | None = None,
         yield_time_ms: int = 10_000,
     ) -> ToolExecResult:
-        if permission_error := check_admin_permission(context, "Shell execution"):
+        local_policy, permission_error = check_local_execution_permission(
+            context,
+            "Shell execution",
+        )
+        if permission_error:
             return permission_error
+        sandboxed = bool(local_policy and local_policy.requires_sandbox)
 
         sb = await get_booter(
             context.context.context,
@@ -122,20 +130,64 @@ class ExecuteShellTool(FunctionTool):
                 creator_id = context.context.event.get_sender_id()
                 if not creator_id:
                     return "Error executing command: sender identity is unavailable."
-                return json.dumps(
-                    await sb.shell.exec_managed(
-                        command,
-                        owner_id=context.context.event.unified_msg_origin,
-                        creator_id=creator_id,
-                        creator_is_admin=context.context.event.role == "admin",
-                        sandboxed=False,
-                        cwd=cwd,
-                        env=env,
-                        timeout=timeout,
-                        yield_time_ms=0 if background else yield_time_ms,
+                creator_is_admin = context.context.event.role == "admin"
+                sandbox_roots = {}
+                if local_policy and local_policy.filesystem_scope == "workspace":
+                    umo = context.context.event.unified_msg_origin
+                    sandbox_roots = {
+                        "readable_roots": _read_allowed_roots(
+                            umo, current_workspace_root
+                        ),
+                        "writable_roots": _write_allowed_roots(
+                            umo,
+                            current_workspace_root,
+                            include_installed_skills=context.context.event.role
+                            == "admin",
+                        ),
+                    }
+                started_at = monotonic()
+                result = await sb.shell.exec_managed(
+                    command,
+                    owner_id=context.context.event.unified_msg_origin,
+                    creator_id=creator_id,
+                    creator_is_admin=creator_is_admin,
+                    sandboxed=sandboxed,
+                    permission_check=lambda: (
+                        is_local_runtime(context)
+                        and get_local_permission_policy(context) == local_policy
+                        # The original event role does not reflect admin removal.
+                        and (
+                            not creator_is_admin
+                            or str(creator_id)
+                            in context.context.context.get_config(
+                                umo=context.context.event.unified_msg_origin
+                            ).get("admins_id", [])
+                        )
                     ),
-                    ensure_ascii=False,
+                    allow_network=(
+                        local_policy.allow_network if local_policy else True
+                    ),
+                    filesystem_scope=(
+                        local_policy.filesystem_scope if local_policy else "host"
+                    ),
+                    cwd=cwd,
+                    env=env,
+                    timeout=min(timeout or 300, 300) if sandboxed else timeout,
+                    yield_time_ms=0 if background else yield_time_ms,
+                    **sandbox_roots,
                 )
+                elapsed_seconds = monotonic() - started_at
+                if result.get("session_closed") and result.get("status") in {
+                    "completed",
+                    "failed",
+                }:
+                    message = (
+                        f"Command completed with exit code {result['exit_code']} "
+                        f"(wall time: {elapsed_seconds:.2f}s)."
+                    )
+                    output = f"{result['stdout']}{result['stderr']}"
+                    return f"{message}\nOutput:\n{output}"
+                return json.dumps(result, ensure_ascii=False)
 
             effective_background = background and not _is_self_detached_command(command)
 
@@ -174,7 +226,8 @@ class LocalExecuteShellTool(ExecuteShellTool):
 
     description: str = (
         "Execute a command in the shell. If it is still running after "
-        "yield_time_ms, the tool returns a managed shell session ID."
+        "yield_time_ms, the tool returns a managed shell session ID. "
+        "Restricted Linux and macOS calls run inside an operating-system sandbox."
     )
     parameters: dict = field(
         default_factory=lambda: {
@@ -244,7 +297,8 @@ class ShellSessionTool(FunctionTool):
 
     name: str = "astrbot_shell_session"
     description: str = (
-        "List, poll, write to, interrupt, or terminate managed shell sessions. "
+        "List, poll, write raw text or complete lines to, interrupt, or terminate "
+        "managed shell sessions. "
         "Sessions are isolated to the current conversation and sender. "
         "Administrators can manage all sessions in the conversation."
     )
@@ -254,7 +308,14 @@ class ShellSessionTool(FunctionTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "poll", "write", "interrupt", "terminate"],
+                    "enum": [
+                        "list",
+                        "poll",
+                        "write",
+                        "write_line",
+                        "interrupt",
+                        "terminate",
+                    ],
                     "description": "Session operation to perform.",
                 },
                 "session_id": {
@@ -263,24 +324,27 @@ class ShellSessionTool(FunctionTool):
                 },
                 "chars": {
                     "type": "string",
-                    "description": "Text written verbatim when action is write.",
+                    "description": (
+                        "Text sent verbatim by write. For write_line, provide one "
+                        "line without a line ending; a real LF is appended automatically."
+                    ),
                     "default": "",
                 },
                 "cursor": {
                     "type": "integer",
-                    "description": "Optional byte cursor for poll. Omit to continue from the last returned output.",
+                    "description": "Optional byte cursor for poll, write, or write_line. Omit to continue from the last returned output.",
                     "minimum": 0,
                 },
                 "yield_time_ms": {
                     "type": "integer",
-                    "description": "Maximum time poll or interrupt waits for output or exit.",
+                    "description": "Maximum wait in milliseconds for output or exit on poll, write, write_line, or interrupt (up to 5 minutes). Writes send input before waiting. Output or exit may return early; this does not stop the process.",
                     "default": 5000,
                     "minimum": 0,
-                    "maximum": 30000,
+                    "maximum": 300000,
                 },
                 "max_output_chars": {
                     "type": "integer",
-                    "description": "Maximum output bytes returned by poll, interrupt, or terminate.",
+                    "description": "Maximum output bytes returned by poll, write, write_line, interrupt, or terminate.",
                     "default": 10000,
                     "minimum": 1,
                     "maximum": 100000,
@@ -306,7 +370,7 @@ class ShellSessionTool(FunctionTool):
             context: Current agent tool context.
             action: Session operation to perform.
             session_id: Managed session identifier, except for list.
-            chars: Text written for the write action.
+            chars: Text written verbatim for write or with a trailing LF for write_line.
             cursor: Optional output byte cursor.
             yield_time_ms: Maximum wait for output or process exit.
             max_output_chars: Maximum output bytes to return.
@@ -314,19 +378,17 @@ class ShellSessionTool(FunctionTool):
         Returns:
             JSON session operation result or a user-facing error.
         """
-        if permission_error := check_admin_permission(
+        _, permission_error = check_local_execution_permission(
             context,
             "Shell session management",
-        ):
+        )
+        if permission_error and action != "terminate":
             return permission_error
-        if not is_local_runtime(context):
+        if not is_local_runtime(context) and action != "terminate":
             return "Error managing shell session: only local runtime is supported."
 
         try:
-            sb = await get_booter(
-                context.context.context,
-                context.context.event.unified_msg_origin,
-            )
+            sb = get_local_booter()
             if not isinstance(sb.shell, LocalShellComponent):
                 return "Error managing shell session: local shell component is unavailable."
 
@@ -347,7 +409,29 @@ class ShellSessionTool(FunctionTool):
                         "Error managing shell session: session_id is required "
                         f"when action={action}."
                     )
-                if action == "poll":
+                if action in {"poll", "write", "write_line"}:
+                    written = None
+                    if action in {"write", "write_line"}:
+                        # Validate polling arguments before sending input to the process.
+                        if yield_time_ms < 0 or yield_time_ms > 300_000:
+                            raise ValueError(
+                                "`yield_time_ms` must be between 0 and 300000."
+                            )
+                        if max_output_chars < 1:
+                            raise ValueError(
+                                "`max_output_chars` must be greater than 0."
+                            )
+                        if cursor is not None and cursor < 0:
+                            raise ValueError(
+                                "`cursor` must be greater than or equal to 0."
+                            )
+                        written = await sb.shell.write_session(
+                            owner_id=owner_id,
+                            requester_id=requester_id,
+                            requester_is_admin=requester_is_admin,
+                            session_id=session_id,
+                            chars=f"{chars}\n" if action == "write_line" else chars,
+                        )
                     result = await sb.shell.poll_session(
                         owner_id=owner_id,
                         requester_id=requester_id,
@@ -357,14 +441,8 @@ class ShellSessionTool(FunctionTool):
                         yield_time_ms=yield_time_ms,
                         max_output_chars=max_output_chars,
                     )
-                elif action == "write":
-                    result = await sb.shell.write_session(
-                        owner_id=owner_id,
-                        requester_id=requester_id,
-                        requester_is_admin=requester_is_admin,
-                        session_id=session_id,
-                        chars=chars,
-                    )
+                    if written is not None:
+                        result["written_chars"] = written["written_chars"]
                 elif action == "interrupt":
                     result = await sb.shell.interrupt_session(
                         owner_id=owner_id,

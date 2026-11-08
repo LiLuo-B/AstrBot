@@ -80,3 +80,7 @@ GenieData/
 .worktrees/
 
 dashboard/bun.lock
+
+# Local session/tooling state
+.dsh/
+.astrbot-tmp/
