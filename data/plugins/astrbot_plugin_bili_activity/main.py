@@ -1580,6 +1580,11 @@ class BiliActivity(Star):
                 answer = "B站历史暂时没查出来，不能据此说今天没刷。"
             await event.send(event.plain_result(answer))
             return
+        # Group messages share read-only activity tools, never owner-only commands.
+        if group_access(event, cfg):
+            return
+        if event.unified_msg_origin != cfg["owner_scope"] or str(event.get_sender_id()) != str(cfg["owner_id"]):
+            return
         if cfg["contact_coordination_enabled"]:
             self.contact_ledger().owner_message(event.unified_msg_origin,
                 getattr(event.message_obj, "message_id", None))

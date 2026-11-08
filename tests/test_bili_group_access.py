@@ -124,6 +124,31 @@ async def test_group_history_failure_does_not_deny_activity():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sender,text", [
+    ("474115040", "帮我搜下 github是不是今天被攻击了"),
+    ("474115040", "何意味"),
+    ("other", "普通群聊"),
+])
+async def test_group_small_talk_never_reaches_private_preference_or_approval(sender, text):
+    method = methods("incoming")
+    method.decorator_list = []
+    module = SimpleNamespace(AstrMessageEvent=object, group_access=lambda event, cfg: True,
+        re=__import__("re"), json=json)
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"), vars(module))
+    controller = SimpleNamespace(cfg=lambda: config(life_enabled=True),
+        store=SimpleNamespace(life=SimpleNamespace(
+            record_user_preference=Mock(side_effect=AssertionError("private preference must not run")))),
+        check_owner=Mock(side_effect=AssertionError("private approval must not run")))
+    current = event(sender=sender)
+    current.message_str = text
+    current.message_obj = SimpleNamespace(message_str=text, message_id="g1")
+    current.send = AsyncMock()
+    await module.incoming(controller, current)
+    current.send.assert_not_awaited()
+    controller.check_owner.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_group_request_does_not_rewrite_qq_scope_and_removes_write_tool():
     module = ModuleType("bili_group_shared_request")
     module.AstrMessageEvent = object
