@@ -1,0 +1,194 @@
+{% macro donut_chart(percent, title, caption, unavailable='未知') -%}
+{% set value = percent | number %}
+<div class="donut-chart" data-metric="{{ title }}">
+  <div class="chart-wrapper">
+    <svg class="chart" viewBox="0 0 150 150" aria-hidden="true" style="--percent: {{ (value | clamp_percent) / 100 }}">
+      <circle class="empty" cx="75" cy="75" r="67.5" />
+      {% if value is not none %}<circle class="slice {{ value | percent_to_color }}" cx="75" cy="75" r="67.5" />{% endif %}
+    </svg>
+    <div class="shadow"></div>
+    <div class="label{% if value is none %} unavailable{% endif %}">{{ value | percentage if value is not none else unavailable }}</div>
+  </div>
+  <div class="title">{{ title }}</div>
+  <div class="desc">{{ caption | br }}</div>
+</div>
+{%- endmacro %}
+
+{% macro header(d) -%}
+<div class="card header splitter">
+  {% for info in d.bots %}
+  <div class="account">
+    {% if info.avatar %}<img class="avatar" src="{{ info.avatar }}" alt="Bot 头像" />{% else %}<div class="avatar avatar-placeholder">?</div>{% endif %}
+    <div class="description">
+      <div class="nickname">{{ info.nick or '昵称未知' }}</div>
+      <div class="status label-container">
+        <span class="label purple">{{ info.adapter or '适配器未知' }}</span>
+        {% if info.connected is sameas true %}
+        <span class="label green">Bot已连接</span>
+        {% elif info.connected is sameas false %}
+        <span class="label red">Bot未连接</span>
+        {% else %}
+        <span class="label gray">连接状态未知</span>
+        {% endif %}
+        <span class="label blue">收 {{ info.msg_rec if info.msg_rec is defined and info.msg_rec is not none else '未知' }}</span>
+        <span class="label orange">发 {{ info.msg_sent if info.msg_sent is defined and info.msg_sent is not none else '未知' }}</span>
+      </div>
+      {% if info.bot_connected is defined and info.bot_connected is not none %}<div class="stats-scope">平台运行 {{ info.bot_connected | duration }}</div>{% endif %}
+      {% if info.stats_scope %}<div class="stats-scope">计数范围 · {{ info.stats_scope }}</div>{% endif %}
+    </div>
+  </div>
+  {% else %}
+  <div class="account">
+    {% if d.default_avatar %}<img class="avatar" src="{{ d.default_avatar }}" alt="默认头像" />{% else %}<div class="avatar avatar-placeholder">?</div>{% endif %}
+    <div class="description">
+      <div class="nickname">{{ d.hostname }}</div>
+      <div class="status label-container"><span class="label gray">暂无 Bot 账户信息</span></div>
+    </div>
+  </div>
+  {% endfor %}
+  <div class="extra label-container">
+    <span class="label gray">AstrBot运行 {{ d.astrbot_run_time | duration }}</span>
+    <span class="label gray">系统运行 {{ d.system_run_time | duration }}</span>
+  </div>
+</div>
+{%- endmacro %}
+
+{% macro cpu_mem(d) -%}
+{% set count = d.cpu_count if d.cpu_count else '未知' %}
+{% set logical = d.cpu_count_logical if d.cpu_count_logical else '未知' %}
+{% set ram_used = d.memory_stat.used | auto_convert_unit %}
+{% set ram_total = d.memory_stat.total | auto_convert_unit %}
+{% set swap_used = d.swap_stat.used | auto_convert_unit %}
+{% set swap_total = d.swap_stat.total | auto_convert_unit %}
+<div class="card cpu-mem-usage donut-chart-line">
+  {{ donut_chart(d.cpu_percent, 'CPU', '{}核 {}线程\n{}\n{}'.format(count, logical, d.cpu_freq | format_cpu_freq, d.cpu_brand)) }}
+  {{ donut_chart(d.memory_stat.percent, 'RAM', '{} / {}'.format(ram_used, ram_total)) }}
+  {{ donut_chart(d.swap_stat.percent, 'SWAP', '{} / {}{}'.format(swap_used, swap_total, '\n未启用' if d.swap_stat.total == 0 else '')) }}
+</div>
+{%- endmacro %}
+
+{% macro gpu(d) -%}
+{% set logical = d.cpu_count_logical | number %}
+{% set one = d.load_avg.load_1min | number if d.load_avg else none %}
+{% set five = d.load_avg.load_5min | number if d.load_avg else none %}
+{% set fifteen = d.load_avg.load_15min | number if d.load_avg else none %}
+{% set load_percent = one / logical * 100 if one is not none and logical is not none and logical > 0 else none %}
+{% set load_info = '1分 {} · 5分 {}\n15分 {}'.format('%.2f' | format(one) if one is not none else '未知', '%.2f' | format(five) if five is not none else '未知', '%.2f' | format(fifteen) if fifteen is not none else '未知') %}
+{% for device in d.gpu_stat or [none] %}
+<div class="card gpu-usage donut-chart-line">
+  {% if device %}
+  {% set used = device.memory_used | number %}
+  {% set total = device.memory_total | number %}
+  {% set temperature = device.temperature | number %}
+  {% set graphics_clock = device.clock_graphics | number %}
+  {% set memory_clock = device.clock_memory | number %}
+  {% set gpu_info = '{}\n{}'.format(device.name or '型号未知', '{}°C'.format('%g' | format(temperature)) if temperature is not none else '温度未知') %}
+  {% if graphics_clock is not none and graphics_clock > 0 %}{% set gpu_info = gpu_info ~ ' · 核心 {}'.format(graphics_clock | format_cpu_freq) %}{% endif %}
+  {% set memory_percent = used / total * 100 if used is not none and total is not none and total > 0 else none %}
+  {% set memory_info = '{} / {}'.format(used | auto_convert_unit, total | auto_convert_unit) %}
+  {% if memory_clock is not none and memory_clock > 0 %}{% set memory_info = memory_info ~ '\n显存频率 {}'.format(memory_clock | format_cpu_freq) %}{% endif %}
+  {{ donut_chart(device.utilization, 'GPU', gpu_info) }}
+  {{ donut_chart(memory_percent, 'VRAM', memory_info, '不可用') }}
+  {% else %}
+  {{ donut_chart(none, 'GPU', '未检测到可用 GPU 数据', '未检测') }}
+  {{ donut_chart(none, 'VRAM', '未检测到可用显存数据', '不可用') }}
+  {% endif %}
+  {{ donut_chart(load_percent, 'LOAD', load_info) }}
+</div>
+{% endfor %}
+{%- endmacro %}
+
+{% macro disk(d) -%}
+<div class="card disk-info">
+  <div class="section-title">磁盘 <span>DISK</span></div>
+  {% if d.disk_usage %}
+  <div class="list-grid disk-usage">
+    {% for item in d.disk_usage %}
+    <div class="disk-name">{{ item.name }}</div>
+    <div class="progress-bar">
+      <div class="background"></div>
+      {% if item.exception %}
+      <div class="label error">{{ item.exception }}</div>
+      {% else %}
+      {% set percent = item.percent | number %}
+      {% if percent is not none %}<div class="progress {{ percent | percent_to_color }}" style="width: {{ percent | clamp_percent }}%"></div>{% endif %}
+      <div class="label">{{ item.used | auto_convert_unit }} / {{ item.total | auto_convert_unit }}</div>
+      {% endif %}
+    </div>
+    <div class="align-right metric">{{ item.percent | percentage(1) if not item.exception else '—' }}</div>
+    {% endfor %}
+  </div>
+  {% else %}<div class="empty-state">磁盘用量数据不可用</div>{% endif %}
+  {% if d.disk_io %}
+  <div class="list-grid disk-io separated">
+    {% for item in d.disk_io %}
+    <div class="device-name">{{ item.name }}</div>
+    <div class="metric-key">读</div>
+    <div class="align-right metric">{{ item.read | auto_convert_unit(suffix='/s') }}</div>
+    <div class="separator">|</div>
+    <div class="metric-key">写</div>
+    <div class="align-right metric">{{ item.write | auto_convert_unit(suffix='/s') }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{% macro network(d) -%}
+<div class="card network-info">
+  <div class="section-title">网络 <span>NETWORK</span></div>
+  {% if d.network_io %}
+  <div class="list-grid network-io">
+    {% for item in d.network_io %}
+    <div class="device-name">{{ item.name }}</div>
+    <div class="metric-key">↑</div>
+    <div class="align-right metric">{{ item.sent | auto_convert_unit(suffix='/s') }}</div>
+    <div class="separator">|</div>
+    <div class="metric-key">↓</div>
+    <div class="align-right metric">{{ item.recv | auto_convert_unit(suffix='/s') }}</div>
+    {% endfor %}
+  </div>
+  {% else %}<div class="empty-state">网卡速率数据不可用</div>{% endif %}
+  {% if d.network_connection %}
+  <div class="list-grid network-connection-test separated">
+    {% for item in d.network_connection %}
+    <div class="device-name">{{ item.name }}</div>
+    {% if item.error %}
+    <div class="error">{{ item.display_error or item.reason or item.error }}</div>
+    {% else %}
+    <div class="probe-result">{{ item.status if item.status is not none else '未知' }} {{ item.reason or '' }}</div>
+    <div class="separator">|</div>
+    {% set delay = item.delay | number %}
+    <div class="align-right metric">{{ '%.2fms' | format(delay) if delay is not none else '耗时未知' }}</div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{% macro process(d) -%}
+<div class="card process-info">
+  <div class="section-title">进程 <span>TOP · CPU / RSS</span></div>
+  {% if d.process_status %}
+  <div class="list-grid process-usage">
+    {% for item in d.process_status %}
+    <div class="process-name">{{ item.name }}{% if item.pid is defined and item.pid is not none %}<span class="process-pid">PID {{ item.pid }}</span>{% endif %}</div>
+    <div class="metric-key">CPU</div>
+    <div class="align-right metric">{{ item.cpu | percentage(1) }}</div>
+    <div class="separator">|</div>
+    <div class="metric-key">MEM</div>
+    <div class="align-right metric">{{ item.mem | auto_convert_unit }}</div>
+    {% endfor %}
+  </div>
+  {% else %}<div class="empty-state">进程数据不可用</div>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro footer(d) -%}
+<footer class="footer">
+  <div>{{ d.hostname }} | {{ d.time }}</div>
+  <div>AstrBot {{ d.astrbot_version }} × PicStatus {{ d.plugin_version }} | Python {{ d.python_version }}</div>
+  <div>{{ d.system }}</div>
+</footer>
+{%- endmacro %}

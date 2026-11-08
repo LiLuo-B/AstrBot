@@ -1,0 +1,29 @@
+{% from 'macros.html.jinja' import header, cpu_mem, gpu, disk, network, process, footer %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
+  <title>PicStatus · {{ d.hostname }}</title>
+  <style>{{ css }}</style>
+</head>
+<body>
+  <div class="main-background">
+    {% if d.background_url %}<img class="background-image" src="{{ d.background_url }}" alt="" />{% endif %}
+    <div class="main-background-mask">
+      <main class="main">
+        {% for component in d.components %}
+        {% if component == 'header' %}{{ header(d) }}
+        {% elif component == 'cpu_mem' %}{{ cpu_mem(d) }}
+        {% elif component == 'gpu' %}{{ gpu(d) }}
+        {% elif component == 'disk' %}{{ disk(d) }}
+        {% elif component == 'network' %}{{ network(d) }}
+        {% elif component == 'process' %}{{ process(d) }}
+        {% elif component == 'footer' %}{{ footer(d) }}{% endif %}
+        {% endfor %}
+      </main>
+    </div>
+  </div>
+</body>
+</html>

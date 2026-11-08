@@ -1,0 +1,173 @@
+name: 📦 Draft Release (Tag with v)
+
+on:
+  push:
+    tags:
+      - "*v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: 编译 WebUI 并打包插件
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_NAME="astrbot_plugin_proactive_chat"
+          BUILD_ROOT="${RUNNER_TEMP}/plugin-build"
+          STAGE_DIR="${BUILD_ROOT}/${PACKAGE_NAME}"
+          ZIP_NAME="${PACKAGE_NAME}-${GITHUB_REF_NAME}.zip"
+          BUILD_JS_DIR="admin/.js-build"
+          BABEL_TOOLS_DIR="${RUNNER_TEMP}/babel-tools"
+
+          rm -rf "${BUILD_ROOT}"
+          mkdir -p "${STAGE_DIR}"
+
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.idea/' \
+            --exclude '.vscode/' \
+            --exclude '.devin/' \
+            --exclude '.pytest_cache/' \
+            --exclude '.ruff_cache/' \
+            --exclude '.mypy_cache/' \
+            --exclude '.cache/' \
+            --exclude '.venv/' \
+            --exclude 'venv/' \
+            --exclude '__pycache__/' \
+            --exclude 'dist/' \
+            --exclude 'build/' \
+            --exclude '*.pyc' \
+            --exclude '*.pyo' \
+            --exclude '.DS_Store' \
+            ./ "${STAGE_DIR}/"
+
+          pushd "${STAGE_DIR}"
+
+          if [[ ! -d "admin/js" ]]; then
+            echo "::error::未找到 admin/js，无法编译 WebUI"
+            exit 1
+          fi
+
+          if [[ ! -f "admin/index.html" ]]; then
+            echo "::error::未找到 admin/index.html，无法修正 WebUI 入口"
+            exit 1
+          fi
+
+          rm -rf "${BUILD_JS_DIR}"
+          mkdir -p "${BUILD_JS_DIR}"
+
+          rm -rf "${BABEL_TOOLS_DIR}"
+          mkdir -p "${BABEL_TOOLS_DIR}"
+          pushd "${BABEL_TOOLS_DIR}"
+          npm init -y >/dev/null 2>&1
+          # 必须锁定 Babel 7 且显式使用 classic runtime。
+          # Babel 8 的 @babel/preset-react 默认 runtime 已从 classic 改为 automatic，
+          # 产物会在每个文件首行注入 import "react/jsx-runtime"，
+          # 而 WebUI 用普通 script 标签加载（非 type="module"），
+          # 浏览器直接抛 SyntaxError: Cannot use import statement outside a module，整页白屏。
+          npm install --no-save "@babel/core@^7" "@babel/cli@^7" "@babel/preset-react@^7"
+          printf '%s\n' '{"presets":[["@babel/preset-react",{"runtime":"classic"}]]}' > babel.config.json
+          NODE_PATH="${BABEL_TOOLS_DIR}/node_modules" node -e "console.log('Babel core ' + require('@babel/core/package.json').version + ' | preset-react ' + require('@babel/preset-react/package.json').version)"
+          popd
+
+          NODE_ENV=production BABEL_ENV=production NODE_PATH="${BABEL_TOOLS_DIR}/node_modules" \
+          "${BABEL_TOOLS_DIR}/node_modules/.bin/babel" admin/js \
+            --extensions ".js,.jsx" \
+            --out-dir "${BUILD_JS_DIR}" \
+            --config-file "${BABEL_TOOLS_DIR}/babel.config.json" \
+            --no-babelrc
+
+          rm -rf admin/js
+          mv "${BUILD_JS_DIR}" admin/js
+
+          # 发布包中的前端已由 Babel 预编译为 .js，必须让 index.html 的引用与产物保持一致。
+          # 组件通过 ProactiveLoader.queueScript(src, isBabel) 动态加载，
+          # 这些是普通字符串参数而非 HTML 标签，旧的 sed 规则无法匹配，会导致 404 / “Babel is not loaded”。
+          # 1) 所有指向本地 js/ 的 .jsx 引用统一改写为预编译后的 .js。
+          sed -E -i 's|"(js/[^"]*)\.jsx"|"\1.js"|g' admin/index.html
+          # 2) 遗留的 text/babel 静态标签改写为普通脚本标签（源码已预编译，无需运行时编译）。
+          sed -E -i 's|<script type="text/babel" src="([^"]+)" defer></script>|<script src="\1" defer></script>|g' admin/index.html
+          sed -E -i 's|<script type="text/babel" src="([^"]+)"></script>|<script src="\1"></script>|g' admin/index.html
+          # 3) 关闭 queueScript 的 isBabel 标志：产物已是编译后的 JS。
+          sed -E -i 's|(queueScript\("[^"]*")([[:space:]]*,[[:space:]]*)true([[:space:]]*\))|\1\2false\3|g' admin/index.html
+          # 4) 移除 Babel standalone 依赖及其脚本文件。
+          sed -E -i '/@babel\/standalone|lib\/babel\.min\.js/d' admin/index.html
+          rm -f admin/lib/babel.min.js
+
+          if grep -q 'text/babel' admin/index.html; then
+            echo "::error::WebUI 编译后 index.html 仍包含 text/babel 引用"
+            exit 1
+          fi
+
+          if grep -q '@babel/standalone' admin/index.html; then
+            echo "::error::WebUI 编译后 index.html 仍包含 Babel Standalone 依赖"
+            exit 1
+          fi
+
+          if grep -Eq 'queueScript\("[^"]*\.jsx"' admin/index.html; then
+            echo "::error::WebUI 编译后 index.html 仍存在指向 .jsx 的 queueScript 调用，运行时会 404"
+            exit 1
+          fi
+
+          if grep -Eq 'queueScript\("[^"]*",[[:space:]]*true[[:space:]]*\)' admin/index.html; then
+            echo "::error::WebUI 编译后 index.html 仍存在 isBabel=true 的 queueScript 调用（缺少 Babel standalone 时会中断加载）"
+            exit 1
+          fi
+
+          if grep -q '\.jsx"' admin/index.html; then
+            echo "::error::WebUI 编译后 index.html 仍存在 .jsx 资源引用"
+            exit 1
+          fi
+
+          if find admin/js -type f -name '*.jsx' | grep -q .; then
+            echo "::error::WebUI 编译后仍存在 .jsx 源文件"
+            exit 1
+          fi
+
+          # 产物必须是可直接被普通 script 执行的脚本（UMD/IIFE 风格），
+          # 出现顶层 import/export 即说明 Babel 又切回了 automatic runtime 或产出了 ESM。
+          if grep -rEq '^[[:space:]]*(import|export)[[:space:]{*]' admin/js; then
+            echo "::error::WebUI 编译产物包含 ESM import/export，普通 script 加载会白屏"
+            grep -rEn '^[[:space:]]*(import|export)[[:space:]{*]' admin/js | head -n 10
+            exit 1
+          fi
+
+          if grep -rq 'react/jsx-runtime' admin/js; then
+            echo "::error::WebUI 编译产物引用了 react/jsx-runtime，说明 preset-react 使用了 automatic runtime"
+            exit 1
+          fi
+
+          popd
+
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          cd "${BUILD_ROOT}"
+          zip -r "${GITHUB_WORKSPACE}/dist/${ZIP_NAME}" "${PACKAGE_NAME}"
+
+      - name: 上传打包产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-zip-${{ github.ref_name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: 发布 Draft Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*.zip

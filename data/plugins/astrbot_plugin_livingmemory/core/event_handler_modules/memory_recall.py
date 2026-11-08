@@ -1,0 +1,603 @@
+"""
+记忆召回模块
+负责长期记忆的检索和注入
+"""
+
+import asyncio
+import time
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
+from astrbot.api.platform import MessageType
+from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import TextPart
+
+from ..memory_scope import (
+    is_event_memory_allowed,
+    is_suspicious_session_id,
+    resolve_memory_scope,
+)
+from ..utils import (
+    OperationContext,
+    format_memories_for_injection,
+    get_persona_id,
+)
+from .memory_reflection import cancel_session_storage_task
+
+if TYPE_CHECKING:
+    from ..base.config_manager import ConfigManager
+    from ..managers.conversation_manager import ConversationManager
+    from ..managers.memory_engine import MemoryEngine
+    from ..utils.injection_adapter import InjectionAdapter
+    from .message_utils import MessageUtils
+
+
+class MemoryRecall:
+    """记忆召回类"""
+
+    def __init__(
+        self,
+        context,
+        config_manager: "ConfigManager",
+        memory_engine: "MemoryEngine",
+        conversation_manager: "ConversationManager",
+        message_utils: "MessageUtils",
+        injection_adapter: "InjectionAdapter",
+        storage_session_tasks: dict[str, asyncio.Task] | None = None,
+    ):
+        """
+        初始化记忆召回模块
+
+        Args:
+            context: AstrBot上下文
+            config_manager: 配置管理器
+            memory_engine: 记忆引擎
+            conversation_manager: 会话管理器
+            message_utils: 消息处理工具
+            injection_adapter: 注入适配器
+            storage_session_tasks: 会话 -> 进行中总结任务映射（共享状态），
+                用于在检测到 WebUI 编辑/重试回滚后取消过期总结任务
+        """
+        self.context = context
+        self.config_manager = config_manager
+        self.memory_engine = memory_engine
+        self.conversation_manager = conversation_manager
+        self.message_utils = message_utils
+        self.injection_adapter = injection_adapter
+        self._storage_session_tasks: dict[str, asyncio.Task] = (
+            storage_session_tasks if storage_session_tasks is not None else {}
+        )
+
+    @staticmethod
+    def _message_timestamp_seconds(value) -> float | None:
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                timestamp = float(stripped)
+            except ValueError:
+                try:
+                    timestamp = datetime.fromisoformat(
+                        stripped.replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    return None
+        else:
+            return None
+
+        if timestamp > 100_000_000_000:
+            timestamp /= 1000.0
+        return timestamp if timestamp > 0 else None
+
+    async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
+        """Query and inject long-term memory before LLM request"""
+        try:
+            if not is_event_memory_allowed(self.config_manager, event):
+                logger.debug("当前事件不在记忆白名单中，跳过记忆召回")
+                return
+            session_id = event.unified_msg_origin
+            logger.debug(f"[DEBUG-Recall] 获取到 unified_msg_origin: {session_id}")
+
+            # 检测异常session_id
+            if is_suspicious_session_id(session_id):
+                logger.warning(
+                    f"[{session_id}] 检测到异常的session_id，这可能导致记忆功能异常。"
+                )
+
+            async with OperationContext("记忆召回", session_id):
+                prompt_text = getattr(req, "prompt", "")
+                extra_parts = getattr(req, "extra_user_content_parts", [])
+                has_prompt_text = isinstance(prompt_text, str) and bool(
+                    prompt_text.strip()
+                )
+                has_extra_parts = bool(extra_parts)
+
+                if not has_prompt_text and not has_extra_parts:
+                    logger.debug(f"[{session_id}] 请求中无可用用户内容，跳过记忆召回")
+                    return
+
+                # 自动删除旧的注入记忆
+                if self.config_manager.get("recall_engine.auto_remove_injected", True):
+                    removed = self._remove_injected_memories_from_context(
+                        req, session_id
+                    )
+                    removed += self._remove_fake_tool_call_from_context(req, session_id)
+                    if removed > 0:
+                        logger.info(
+                            f"[{session_id}] 已清理 {removed} 处历史记忆注入片段"
+                        )
+                # 新规则的临时片段只携带本插件专用标记，去重独立于旧清理开关，
+                # 重复执行钩子也不会叠加。
+                self._remove_agent_recall_policy_from_context(req)
+
+                # 先提取用户消息（消息存储和召回都需要）
+                actual_query = await self.message_utils.get_event_message_str(event)
+
+                request_query = (
+                    prompt_text.strip() if isinstance(prompt_text, str) else ""
+                )
+
+                # 存储用户消息（仅私聊），无论是否启用召回都需要
+                is_group = event.get_message_type() == MessageType.GROUP_MESSAGE
+
+                # 与 AstrBot LLM 历史对账：WebUI 编辑/重试会截断 LLM 历史，
+                # 插件会话库需同步清理被撤销的尾部轮次（仅私聊；群聊被动
+                # 捕获的消息不在 LLM 历史中，无法对账；内部会先校验事件
+                # 是否携带 webchat 的 llm_checkpoint_id 标记）
+                if not is_group:
+                    await self._reconcile_with_llm_context(event, session_id, req)
+
+                if not is_group and actual_query:
+                    message_to_store = request_query
+                    if not message_to_store:
+                        message_to_store = (
+                            await self.message_utils.extract_message_content(event, req)
+                        )
+                    if not message_to_store:
+                        message_to_store = actual_query.strip()
+                    await self.conversation_manager.add_message_from_event(
+                        event=event,
+                        role="user",
+                        content=message_to_store,
+                    )
+                    await self.message_utils.enforce_message_limit(session_id)
+
+                # Beta 自主回忆规则：独立于自动召回是否命中；即使 top_k=0
+                # 也可为当前请求可用的主动工具提供规则说明。
+                self._maybe_inject_agent_recall_policy(req, session_id)
+
+                # 若 top_k <= 0，跳过记忆检索和注入，但上述清理和消息存储已执行
+                top_k = self.config_manager.get("recall_engine.top_k", 5)
+                if top_k <= 0:
+                    logger.info(
+                        f"[{session_id}] top_k={top_k} <= 0，跳过记忆检索和注入"
+                    )
+                    return
+
+                if not actual_query:
+                    logger.warning(f"[{session_id}] 原始用户消息为空，跳过记忆召回")
+                    return
+
+                # 获取过滤配置
+                filtering_config = self.config_manager.filtering_settings
+                use_persona_filtering = filtering_config.get(
+                    "use_persona_filtering", True
+                )
+
+                # 获取 persona_id，与 AstrBot 主流程保持一致的三级优先级：
+                # 1. session_service_config（最高）
+                # 2. req.conversation.persona_id（会话级）
+                # 3. 全局默认人格（最低）
+                # 注意：on_llm_request 钩子在 _ensure_persona_and_skills 之前触发，
+                # 因此不能直接依赖 req.system_prompt 已注入人格，需自行走完整优先级。
+                persona_id = await get_persona_id(self.context, event)
+
+                recall_session_id = resolve_memory_scope(self.config_manager, event)
+                recall_persona_id = persona_id if use_persona_filtering else None
+
+                # 使用原始用户输入作为召回关键字
+                query_for_search = actual_query
+
+                # 上下文扩展：拼接最近2轮对话作为查询，提升检索精准度
+                if self.config_manager.get(
+                    "recall_engine.inject_with_recent_context", False
+                ):
+                    try:
+                        recent_messages = await self.conversation_manager.get_context(
+                            session_id,
+                            max_messages=5,
+                            format_for_llm=False,
+                        )
+                        if recent_messages and len(recent_messages) > 1:
+                            # recent_messages 按 timestamp DESC 排列（最新在前）
+                            # 跳过索引0（当前消息），取后续消息作为扩展上下文
+                            context_parts = []
+                            max_age_seconds = self.config_manager.get(
+                                "recall_engine.recent_context_max_age_seconds", 7200
+                            )
+                            now = time.time()
+                            skipped_by_age = 0
+                            for msg in reversed(recent_messages[1:]):
+                                if max_age_seconds > 0:
+                                    timestamp = self._message_timestamp_seconds(
+                                        msg.get("timestamp")
+                                    )
+                                    if (
+                                        timestamp is None
+                                        or now - timestamp > max_age_seconds
+                                    ):
+                                        skipped_by_age += 1
+                                        continue
+                                content = msg.get("content", "")
+                                if content and content.strip():
+                                    context_parts.append(content.strip())
+                            if context_parts:
+                                expanded = " | ".join(context_parts)
+                                query_for_search = expanded + " " + actual_query
+                                logger.info(
+                                    f"[{session_id}] 上下文扩展查询: "
+                                    f"{len(context_parts)}条历史消息 + 当前消息，"
+                                    f"按时间跳过={skipped_by_age}条"
+                                )
+                    except Exception as e:
+                        logger.warning(f"[{session_id}] 获取上下文扩展失败: {e}")
+
+                # 执行记忆召回
+                logger.info(
+                    f"[{session_id}] 开始记忆召回，查询='{query_for_search[:80]}...'"
+                )
+
+                recalled_memories = await self.memory_engine.search_memories(
+                    query=query_for_search,
+                    k=self.config_manager.get("recall_engine.top_k", 5),
+                    session_id=recall_session_id,
+                    persona_id=recall_persona_id,
+                )
+
+                if recalled_memories:
+                    logger.info(
+                        f"[{session_id}] 检索到 {len(recalled_memories)} 条记忆"
+                    )
+
+                    # 格式化并注入记忆
+                    memory_list = [
+                        {
+                            "id": getattr(mem, "doc_id", None),
+                            "content": mem.content,
+                            "score": mem.final_score,
+                            "metadata": mem.metadata,
+                            "timestamp": mem.metadata.get("create_time"),
+                        }
+                        for mem in recalled_memories
+                    ]
+
+                    # 输出详细记忆信息
+                    for i, mem in enumerate(recalled_memories, 1):
+                        logger.debug(
+                            f"[{session_id}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
+                            f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
+                            f"内容={mem.content[:100]}..."
+                        )
+
+                    # 注入策略适配层负责把历史配置值映射到唯一的 add-only
+                    # 注入方式，废弃模式会返回回退原因供日志提示。
+                    configured_method = self.config_manager.get(
+                        "recall_engine.injection_method", "extra_user_content"
+                    )
+                    injection_method, fallback_reason = self.injection_adapter.resolve(
+                        configured_method
+                    )
+                    if fallback_reason:
+                        logger.warning(
+                            f"[{session_id}] 注入方式从 {configured_method} 回退为 "
+                            f"{injection_method}: {fallback_reason}"
+                        )
+
+                    memory_str = format_memories_for_injection(memory_list)
+
+                    # 唯一注入方式（add-only）：将记忆作为临时片段追加到
+                    # 当前用户消息末尾。mark_as_temp 标记的 part 由 AstrBot
+                    # 在保存对话历史时过滤，注入不会写入 AstrBot 的历史，
+                    # 也不影响前缀缓存。
+                    req.extra_user_content_parts.append(
+                        TextPart(text=memory_str).mark_as_temp()
+                    )
+                    logger.info(
+                        f"[{session_id}] 成功向用户消息末尾注入 "
+                        f"{len(recalled_memories)} 条记忆"
+                    )
+                else:
+                    logger.info(f"[{session_id}] 未找到相关记忆")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+
+    def _remove_agent_recall_policy_from_context(self, req: ProviderRequest) -> int:
+        """移除本插件上一轮注入的自主回忆规则临时片段（重复钩子去重）。
+
+        只识别带本插件专用边界标记的临时片段，不动记忆注入片段、
+        真实工具结果或其他插件的临时内容。
+        """
+        from ..base.constants import (
+            AGENT_RECALL_POLICY_FOOTER,
+            AGENT_RECALL_POLICY_HEADER,
+        )
+
+        parts = getattr(req, "extra_user_content_parts", None)
+        if not parts:
+            return 0
+        kept = [
+            part
+            for part in parts
+            if not self._is_agent_recall_policy_part(
+                part, AGENT_RECALL_POLICY_HEADER, AGENT_RECALL_POLICY_FOOTER
+            )
+        ]
+        removed = len(parts) - len(kept)
+        if removed:
+            req.extra_user_content_parts = kept
+        return removed
+
+    @staticmethod
+    def _is_agent_recall_policy_part(part, header: str, footer: str) -> bool:
+        text = getattr(part, "text", "")
+        return (
+            getattr(part, "_no_save", False)
+            and isinstance(text, str)
+            and header in text
+            and footer in text
+        )
+
+    def _load_agent_recall_policy(self) -> str | None:
+        """按 自定义覆盖 > 内置默认文件 顺序读取自主回忆规则。"""
+        try:
+            from ..prompts import get_prompt_manager
+
+            manager = get_prompt_manager()
+            if manager is not None:
+                content = manager.get_prompt("agent_recall_policy")
+                if content and content.strip():
+                    return content
+        except Exception:
+            pass
+        try:
+            from pathlib import Path
+
+            builtin = (
+                Path(__file__).resolve().parents[1]
+                / "prompts"
+                / "agent_recall_policy.txt"
+            )
+            if builtin.exists():
+                content = builtin.read_text(encoding="utf-8")
+                if content.strip():
+                    return content
+        except Exception:
+            pass
+        return None
+
+    def _maybe_inject_agent_recall_policy(
+        self, req: ProviderRequest, session_id: str
+    ) -> None:
+        """Beta：按需注入自主回忆规则（add-only 临时片段，先清后加可去重）。
+
+        仅在主动回忆工具与 Beta 开关同时开启、插件就绪、事件已放行、且当前
+        请求实际提供 recall_long_term_memory 工具时注入；能力说明严格以
+        当前请求的 func_tool 集合为准。
+        """
+        from ..base.constants import (
+            AGENT_RECALL_POLICY_FOOTER,
+            AGENT_RECALL_POLICY_HEADER,
+        )
+
+        try:
+            if not self.config_manager.get("agent_tools.enable_recall_tool", True):
+                return
+            if not self.config_manager.get(
+                "agent_tools.enable_agentic_recall_beta", False
+            ):
+                return
+            if self.memory_engine is None:
+                return
+            func_tool = getattr(req, "func_tool", None)
+            get_names = getattr(func_tool, "names", None)
+            names: list[str] = []
+            if callable(get_names):
+                try:
+                    names = list(get_names())
+                except Exception:
+                    names = []
+            if "recall_long_term_memory" not in names:
+                return
+            policy = self._load_agent_recall_policy()
+            if not policy:
+                return
+            available = [
+                "- recall_long_term_memory: search long-term memory by topic "
+                "keywords, or browse the current speaker's past experiences with "
+                'target="current_speaker" (query may be empty) when the question '
+                "has no usable keywords; refine follow-up searches with "
+                "exclude_ids / start_time / end_time / search_offset."
+            ]
+            if "read_memory_evidence" in names:
+                available.append(
+                    "- read_memory_evidence: deep-read one memory by its integer "
+                    "memory_id for exact facts or retained original messages "
+                    "(permission and lifecycle re-checked); pass the returned "
+                    "next_cursor unchanged as cursor to continue long evidence. "
+                    "For original-message pages, keep include_source=true."
+                )
+            policy_text = policy.replace("{available_tools}", "\n".join(available))
+            wrapped = (
+                f"{AGENT_RECALL_POLICY_HEADER}\n"
+                f"{policy_text.strip()}\n"
+                f"{AGENT_RECALL_POLICY_FOOTER}"
+            )
+            req.extra_user_content_parts.append(TextPart(text=wrapped).mark_as_temp())
+            logger.info(f"[{session_id}] 已注入自主回忆规则（Beta）")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[{session_id}] 注入自主回忆规则失败: {e}")
+
+    async def _reconcile_with_llm_context(
+        self, event: AstrMessageEvent, session_id: str, req: ProviderRequest
+    ) -> None:
+        """以 LLM 请求上下文为锚点，对账插件会话库的尾部轮次。
+
+        WebUI 的「编辑上一条消息并重新请求」「换模型重试上一条对话」只作用于
+        AstrBot 侧会话历史，插件无感知；此处从 req.contexts 提取 ``_checkpoint``
+        段并清理会话库中已被撤销的轮次（见 core/utils/history_alignment.py）。
+
+        前置门槛：仅当事件携带 webchat 的 ``llm_checkpoint_id`` extra 时才执行
+        （非 webchat 平台与旧版 AstrBot 无此标记，库内也不会有 checkpoint 行，
+        直接跳过，避免每个私聊请求都读取全量会话库）。任何异常都不影响召回
+        主流程。
+        """
+        checkpoint_id = None
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            try:
+                checkpoint_id = get_extra("llm_checkpoint_id")
+            except Exception:
+                checkpoint_id = None
+        if not (isinstance(checkpoint_id, str) and checkpoint_id):
+            return
+
+        contexts = getattr(req, "contexts", None)
+        if not isinstance(contexts, list):
+            return
+        ctx_checkpoints: list[str] = []
+        for message in contexts:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "_checkpoint":
+                continue
+            content = message.get("content")
+            checkpoint_id = content.get("id") if isinstance(content, dict) else None
+            if isinstance(checkpoint_id, str) and checkpoint_id:
+                ctx_checkpoints.append(checkpoint_id)
+        try:
+            deleted = await self.conversation_manager.reconcile_session_tail(
+                session_id, ctx_checkpoints
+            )
+        except Exception as exc:
+            logger.warning(f"[{session_id}] 对话历史对账调用失败（已跳过）: {exc}")
+            return
+        if deleted > 0:
+            # 已确认发生回滚：取消进行中的总结任务，避免它继续用旧范围调用 LLM
+            # 并写入过期内容（修订号校验是最终防线，取消负责尽早止损）
+            cancel_session_storage_task(self._storage_session_tasks, session_id)
+
+    def _remove_injected_memories_from_context(
+        self, req: ProviderRequest, session_id: str
+    ) -> int:
+        """从请求上下文中移除临时注入的记忆片段"""
+        import re
+        from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
+
+        removed = 0
+
+        # 清理 system_prompt（兼容旧版本注入残留）
+        if hasattr(req, "system_prompt") and req.system_prompt:
+            if isinstance(req.system_prompt, str):
+                original_prompt = req.system_prompt
+                if (
+                    MEMORY_INJECTION_HEADER in original_prompt
+                    and MEMORY_INJECTION_FOOTER in original_prompt
+                ):
+                    # 使用正则清理记忆片段
+                    pattern = re.compile(
+                        re.escape(MEMORY_INJECTION_HEADER)
+                        + r".*?"
+                        + re.escape(MEMORY_INJECTION_FOOTER),
+                        re.DOTALL,
+                    )
+                    cleaned_prompt = pattern.sub("", original_prompt)
+                    cleaned_prompt = re.sub(r"\n{3,}", "\n\n", cleaned_prompt).strip()
+                    req.system_prompt = cleaned_prompt
+                    if cleaned_prompt != original_prompt:
+                        removed += 1
+
+        # 清理 extra_user_content_parts（通过 mark_as_temp/_no_save 标记）
+        parts_before = len(getattr(req, "extra_user_content_parts", []))
+        if parts_before > 0:
+            req.extra_user_content_parts = [
+                part
+                for part in req.extra_user_content_parts
+                if not self._is_livingmemory_temp_part(part)
+            ]
+            parts_after = len(req.extra_user_content_parts)
+            removed += parts_before - parts_after
+
+        return removed
+
+    def _is_livingmemory_temp_part(self, part) -> bool:
+        """判断是否为 LivingMemory 本轮临时注入的 extra_user_content part"""
+        from ..base.constants import MEMORY_INJECTION_FOOTER, MEMORY_INJECTION_HEADER
+
+        text = getattr(part, "text", "")
+        return (
+            getattr(part, "_no_save", False)
+            and isinstance(text, str)
+            and MEMORY_INJECTION_HEADER in text
+            and MEMORY_INJECTION_FOOTER in text
+        )
+
+    def _remove_fake_tool_call_from_context(
+        self, req: ProviderRequest, session_id: str
+    ) -> int:
+        """从请求上下文中移除伪造的工具调用记忆（legacy 兼容清理）
+
+        老版本 fake_tool_call 注入方式会把伪造的
+        assistant(tool_calls) + tool(result) 消息对持久化进 AstrBot 历史。
+        该注入方式已废弃、不再产生新消息，此方法仅在请求视图里识别并
+        移除以 FAKE_TOOL_CALL_ID_PREFIX 为 ID 前缀的历史残留消息对，
+        不改写用户自身的任何历史消息。
+        """
+        from ..base.constants import FAKE_TOOL_CALL_ID_PREFIX
+
+        if not hasattr(req, "contexts") or not req.contexts:
+            return 0
+
+        removed = 0
+        indices_to_remove: set[int] = set()
+        fake_call_ids: set[str] = set()
+
+        try:
+            # 单轮扫描：同时收集伪造 assistant(tool_calls) 和对应 tool(result) 消息
+            for i, msg in enumerate(req.contexts):
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        tc_id = (
+                            tc.get("id", "")
+                            if isinstance(tc, dict)
+                            else getattr(tc, "id", "")
+                        )
+                        if tc_id.startswith(FAKE_TOOL_CALL_ID_PREFIX):
+                            fake_call_ids.add(tc_id)
+                            indices_to_remove.add(i)
+                elif role == "tool":
+                    tc_id = msg.get("tool_call_id", "")
+                    if tc_id in fake_call_ids:
+                        indices_to_remove.add(i)
+
+            # 从后往前删除，避免索引偏移
+            for i in sorted(indices_to_remove, reverse=True):
+                req.contexts.pop(i)
+                removed += 1
+
+        except Exception:
+            pass
+
+        return removed

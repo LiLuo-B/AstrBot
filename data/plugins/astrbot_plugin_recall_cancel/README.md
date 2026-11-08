@@ -2,17 +2,19 @@
 
 > **作者**: 木有知  
 > **仓库**: [https://github.com/muyouzhi6/astrbot_plugin_recall_cancel](https://github.com/muyouzhi6/astrbot_plugin_recall_cancel)  
-> **版本**: v2.0.0  
+> **版本**: v2.1.3
 > **标签**: 消息管理 | 撤回处理 | LLM控制 | 用户体验 | 自动化
 
 ## 📋 功能说明
 
 当用户撤回触发 LLM 回应的消息时，如果 LLM 的回复还没发送出去，插件会自动取消发送。
 
-**v2.0.0 新特性：**
+**v2.1.3 新特性：**
 - 🔗 **context_aware 联动**：撤回时同步清理 context_aware 插件中的消息记录，防止已撤回消息污染上下文
 - 🔧 **完全重构**：修复消息 ID 匹配问题，确保撤回检测准确可靠
-- ⚡ **高优先级处理**：确保撤回事件在其他插件之前处理
+- ⚡ **兼容撤回生态**：优先记录并取消目标 LLM/Agent 事件，但不再截断撤回通知本身，避免影响防撤回、群管等插件
+- 🛡️ **并发安全清理 Bot 回复**：默认仅在确认本次 LLM 回复对应的 context_aware 记录仍是最后一条 Bot 回复时才删除，避免误删旧回复或并发新回复
+- ⚙️ **配置面板支持**：新增 `_conf_schema.json`，可在 AstrBot WebUI 中调整记录保留时间、清理间隔和 context_aware 清理策略
 
 **解决场景：**
 - 🚫 用户发错消息后撤回，但机器人仍然回复
@@ -31,6 +33,7 @@
 3. **❌ 智能取消**：检测到原消息被撤回时，立即停止正在处理的事件
 4. **🔗 上下文清理**：如果安装了 context_aware 插件，同步删除已记录的消息
 5. **🧹 自动清理**：定期清理过期记录，防止内存泄漏
+6. **🤝 继续分发**：撤回通知继续向后传播，保证 anti_revoke、qqadmin 等插件仍能收到同一事件
 
 ## 🔌 支持平台
 
@@ -45,15 +48,30 @@
 如果同时安装了 [astrbot_plugin_context_aware](https://github.com/muyouzhi6/astrbot_plugin_context_aware) 插件（v2.5.1+），本插件会自动：
 
 1. **删除用户消息**：从 context_aware 的会话历史中删除被撤回的消息
-2. **删除 Bot 回复**：如果 Bot 的回复已被记录，也会一并删除
+2. **按策略删除 Bot 回复**：默认 `safe` 策略只在确认本次回复对应的 context_aware Bot 记录仍是最后一条时删除，避免误删会话里更早或更新的不相关 Bot 回复
 
 这确保了撤回的消息不会出现在后续的 LLM 上下文中，保持对话历史的准确性。
 
 **注意**：即使不安装 context_aware，本插件也能正常工作（仅取消回复，不清理上下文）。
 
+Bot 回复清理策略说明：
+
+| 策略 | 行为 | 建议 |
+|------|------|------|
+| `off` | 不删除 context_aware 中的 Bot 回复 | 最保守，适合只想删除用户消息的场景 |
+| `safe` | 仅在本插件确认本次 LLM 响应对应记录仍是最后一条 Bot 回复时删除 | 默认值，推荐使用 |
+| `legacy_last` | 只要检测到撤回就尝试删除最后一条 Bot 回复 | 兼容旧行为，可能误删同会话最近一条不相关 Bot 回复 |
+
 ## ⚙️ 配置
 
-本插件**开箱即用**，无需任何配置，安装后自动生效。
+本插件**开箱即用**，安装后自动生效。v2.1.2 起提供 AstrBot 配置面板支持，可按需调整：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `record_expire_seconds` | `300` | 待处理请求和撤回记录保留时间，单位秒 |
+| `cleanup_interval` | `60` | 后台清理过期记录的间隔，单位秒 |
+| `context_aware_cleanup` | `true` | 是否联动清理 context_aware 上下文 |
+| `remove_bot_response_policy` | `safe` | context_aware Bot 回复清理策略，可选 `off`、`safe`、`legacy_last` |
 
 ## 🧪 调试与测试
 
@@ -68,8 +86,11 @@
 阻止请求: 3 次
 阻止响应: 1 次
 阻止发送: 1 次
-清理上下文: 4 次
+清理用户上下文: 4 次
+清理Bot上下文: 1 次
 ━━━━━━━━━━━━━━━━━━━━
+Bot回复清理策略: safe
+上下文联动: 开启
 当前待处理: 2 条
 当前撤回记录: 3 条
 ```
@@ -88,8 +109,15 @@
 
 - **多层拦截**：在 `on_llm_request`、`on_llm_response`、`on_decorating_result` 三个阶段检查撤回状态
 - **事件引用**：保存原始事件引用，支持跨 Task 停止事件处理
-- **高优先级**：所有钩子使用 `priority=100`，确保在其他插件之前执行
+- **分层优先级**：撤回和阻断钩子使用 `priority=100` 提前执行，`on_llm_response_recorded(priority=-100)` 在 context_aware 默认钩子之后标记 Bot 回复可安全清理
 - **消息 ID 提取**：正确从 `raw_message.message_id` 获取被撤回消息的真实 ID
+- **发送前即时阻断**：在 `on_decorating_result` 阶段直接停止事件，不再人为 `sleep` 等待，减少竞态窗口
+- **上下文安全清理**：context_aware 的 Bot 回复在 `on_llm_response` 阶段记录，插件默认通过 Bot 记录 ID、响应时间和会话级响应序号复核目标仍是最后一条后再删除
+
+### 已知边界
+
+- 如果平台或 AstrBot 已经把 streaming 片段发送出去了，本插件只能阻止后续生成/发送，不能追回已经发出的片段。
+- 默认 `safe` 策略不会在无法确认本次 Bot 回复仍是 context_aware 最后一条 Bot 记录时删除 Bot 回复；如果你确实想恢复旧行为，请改为 `legacy_last`。
 
 ### 性能优化
 
@@ -104,17 +132,37 @@ PendingRequest:  # 正在处理的 LLM 请求
   - message_id: str      # 原始消息 ID
   - unified_msg_origin: str  # 会话标识
   - sender_id: str       # 发送者 ID
-  - timestamp: float     # 请求时间戳
+  - timestamp: float     # monotonic 请求时间戳
   - event: AstrMessageEvent  # 事件引用
+  - llm_response_preview: str | None  # 对齐 context_aware 记录的回复预览
+  - llm_response_started_at: float | None  # LLM 响应开始 wall time
+  - llm_response_sequence: int  # 会话级 LLM 响应序号
+  - context_bot_msg_id: str | None  # context_aware 中对应 Bot 记录 ID
 
 RecalledMessage:  # 已撤回的消息
   - message_id: str      # 被撤回消息 ID
   - unified_msg_origin: str  # 会话标识
   - operator_id: str     # 撤回操作者 ID
-  - timestamp: float     # 撤回时间戳
+  - timestamp: float     # monotonic 撤回时间戳
+  - context_user_removed: bool  # 用户消息是否已从 context_aware 删除
+  - context_bot_removed: bool  # Bot 回复是否已从 context_aware 删除
 ```
 
 ## 📚 版本历史
+
+### v2.1.3 (2026-05-23)
+- 🛡️ **并发安全清理**：`safe` 策略通过 Bot 记录 ID、响应时间和会话级响应序号复核目标仍是最后一条后再删除
+- 🧪 **竞态测试补齐**：覆盖并发新回复、同内容新回复、context_aware 已记录但低优先级钩子未执行等场景
+
+### v2.1.2 (2026-05-23)
+- 🛡️ **安全清理**：默认使用 `safe` 策略清理 context_aware Bot 回复，避免误删最近的不相关回复
+- ⚙️ **配置支持**：新增 `_conf_schema.json`，支持在 AstrBot WebUI 中配置记录 TTL、清理间隔和 context_aware 策略
+- ⚡ **时序优化**：移除发送前固定等待，减少撤回后仍发送的竞态窗口
+- 🧪 **测试补齐**：新增回归测试覆盖撤回传播、safe/legacy 策略、请求/响应/发送阶段阻断和配置默认值
+
+### v2.1.1 (2026-05-23)
+- 🧩 **兼容修复**：撤回通知处理后不再调用 `event.stop_event()`，避免阻断防撤回、群管等依赖同一撤回通知的插件
+- 📝 **版本同步**：统一代码、元数据、README 与 changelog 中的版本描述
 
 ### v2.0.0 (2025-01-18)
 - 🔄 **完全重构**：全新架构，修复核心消息 ID 匹配问题

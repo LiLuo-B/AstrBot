@@ -1,0 +1,130 @@
+"""
+AngelHeart 插件 - 时间相关工具函数
+"""
+
+import time
+from datetime import datetime, timezone, timedelta
+
+# 条件导入：当缺少astrbot依赖时使用Mock
+from astrbot.api import logger
+
+# 定义默认时间戳回退时间（1小时），用于当消息没有时间戳时提供一个基准时间
+DEFAULT_TIMESTAMP_FALLBACK_SECONDS = 3600
+
+
+def get_latest_message_time(messages: list[dict]) -> float:
+    """
+    获取消息列表中最新消息的时间戳。
+
+    Args:
+        messages (List[Dict]): 消息列表。
+
+    Returns:
+        float: 最新消息的时间戳。如果列表为空或所有消息都无有效时间戳，则返回回退时间。
+    """
+    if not messages:
+        return 0.0
+
+    # 尝试从消息中提取时间戳
+    latest_time = 0.0
+    for msg in messages:
+        # 优先使用消息自带的时间戳
+        msg_time = msg.get("timestamp", 0)
+        if isinstance(msg_time, (int, float)) and msg_time > latest_time:
+            latest_time = msg_time
+
+    # 如果所有消息都没有时间戳，使用当前时间作为基准
+    if latest_time == 0.0:
+        fallback_time = time.time() - DEFAULT_TIMESTAMP_FALLBACK_SECONDS
+        logger.debug(
+            f"AngelHeart: 消息时间戳回退到默认值 {fallback_time} ({DEFAULT_TIMESTAMP_FALLBACK_SECONDS}秒前)"
+        )
+        return fallback_time
+
+    return latest_time
+
+
+def format_relative_time(timestamp: float) -> str:
+    """
+    将Unix时间戳格式化为相对时间字符串。
+
+    Args:
+        timestamp (float): Unix时间戳。
+
+    Returns:
+        str: 相对时间字符串，例如 "(5分钟前)"。如果时间戳无效，则返回空字符串。
+    """
+    if not timestamp:
+        return ""
+
+    try:
+        # 确保 timestamp 是数字类型
+        timestamp = float(timestamp)
+    except (ValueError, TypeError):
+        return ""
+
+    now = time.time()
+    delta = now - timestamp
+
+    if delta < 0:
+        # 时间在未来，这通常表示有问题，返回空
+        return ""
+    elif delta < 60:
+        return " (刚刚)"
+    elif delta < 3600:
+        minutes = int(delta / 60)
+        return f" ({minutes}分钟前)"
+    elif delta < 86400:  # 24小时
+        hours = int(delta / 3600)
+        return f" ({hours}小时前)"
+    else:
+        # 超过一天，可以考虑返回日期，这里简化处理
+        days = int(delta / 86400)
+        return f" ({days}天前)"
+
+
+def get_beijing_time_str() -> str:
+    """
+    获取当前的东八区（北京）时间字符串。
+    格式: YYYY-MM-DD HH:MM:SS (周X)
+    """
+    # 创建东八区时区
+    beijing_tz = timezone(timedelta(hours=8))
+    now = datetime.now(beijing_tz)
+
+    # 格式化时间
+    time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 获取星期几
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday_str = weekdays[now.weekday()]
+
+    return f"{time_str} ({weekday_str})"
+
+
+def format_absolute_time(timestamp: float) -> str:
+    """
+    将 Unix 时间戳格式化为绝对时间字符串（精确到分钟）。
+
+    Args:
+        timestamp (float): Unix 时间戳。
+
+    Returns:
+        str: 形如 " (YYYY-MM-DD HH:MM)"，按系统当地时区格式化；时间无效时返回空字符串。
+    """
+    if not timestamp:
+        return ""
+
+    try:
+        timestamp = float(timestamp)
+    except (ValueError, TypeError):
+        return ""
+
+    if timestamp <= 0:
+        return ""
+
+    try:
+        msg_dt = datetime.fromtimestamp(timestamp).astimezone()
+        return f" ({msg_dt.strftime('%Y-%m-%d %H:%M')})"
+    except (OverflowError, OSError, ValueError):
+        return ""

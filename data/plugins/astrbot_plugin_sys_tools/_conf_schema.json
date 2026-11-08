@@ -1,0 +1,308 @@
+{
+  "ip_lookup": {
+    "description": "公网 IP 查询工具",
+    "type": "object",
+    "items": {
+      "enable_public_ip": {
+        "description": "启用公网 IP 查询",
+        "type": "bool",
+        "default": true
+      },
+      "timeout": {
+        "description": "IP 查询单个源超时（秒）",
+        "type": "int",
+        "default": 10
+      }
+    }
+  },
+  "status": {
+    "description": "原版 PicStatus 风格服务器状态图",
+    "type": "object",
+    "items": {
+      "enable_server_status": {
+        "description": "启用服务器状态图片工具",
+        "type": "bool",
+        "default": true
+      },
+      "top_processes": {
+        "description": "进程排行条数",
+        "type": "int",
+        "default": 10,
+        "hint": "对应 PS_PROC_LEN；0 隐藏进程排行，最多 100 条"
+      },
+      "process_sort_by": {
+        "description": "进程排序（mem=内存，cpu=CPU；保留独立 PID）",
+        "type": "string",
+        "default": "mem",
+        "options": [
+          "mem",
+          "cpu"
+        ],
+        "hint": "对应 PS_PROC_SORT_BY；保留当前 mem 默认，不强改现有偏好"
+      },
+      "show_gpu": {
+        "description": "显示 GPU/显存/温度/时钟（需要 nvidia-smi）",
+        "type": "bool",
+        "default": true
+      },
+      "only_admin": {
+        "description": "仅 AstrBot 管理员可查询服务器状态",
+        "type": "bool",
+        "default": false
+      },
+      "background_source": {
+        "description": "背景来源：loli 每次随机远程图，url 自定义图源，local 本地图/目录随机",
+        "type": "string",
+        "default": "loli",
+        "options": [
+          "loli",
+          "url",
+          "local"
+        ]
+      },
+      "background_path": {
+        "description": "本地背景文件或图片目录（仅 local；目录内每次随机，尽量避免连续重复）",
+        "type": "string",
+        "default": ""
+      },
+      "network_interfaces": {
+        "description": "网卡白名单（空=自动；不再强制截取前三项，数量由白名单/过滤规则决定）",
+        "type": "list",
+        "default": []
+      },
+      "disk_devices": {
+        "description": "磁盘 IO 白名单（空=上游自动发现所有设备，再按隐藏规则过滤；可指定整盘避免分区重复）",
+        "type": "list",
+        "default": []
+      },
+      "test_timeout": {
+        "description": "单个站点连通性测试超时（秒）",
+        "type": "int",
+        "default": 5,
+        "hint": "对应 PS_TEST_TIMEOUT；这是等待上限，不是固定延时，图中 ms 为实测 HTTP 耗时"
+      },
+      "test_sites": {
+        "description": "HTTP 连通性测试站点（添加/删除决定显示条数，支持带协议域名或 IP）",
+        "type": "template_list",
+        "default": [
+          {
+            "name": "百度",
+            "url": "https://www.baidu.com/",
+            "use_proxy": false,
+            "__template_key": "site"
+          },
+          {
+            "name": "Google",
+            "url": "https://www.google.com/",
+            "use_proxy": true,
+            "__template_key": "site"
+          },
+          {
+            "name": "Pixiv",
+            "url": "https://www.pixiv.net/",
+            "use_proxy": true,
+            "__template_key": "site"
+          }
+        ],
+        "templates": {
+          "site": {
+            "name": "测试站点",
+            "items": {
+              "name": {
+                "description": "显示名称",
+                "type": "string",
+                "default": "自定义站点"
+              },
+              "url": {
+                "description": "HTTP(S) URL（域名或 IP，可带端口）",
+                "type": "string",
+                "default": "https://example.com/"
+              },
+              "use_proxy": {
+                "description": "使用上方全局代理",
+                "type": "bool",
+                "default": false
+              }
+            }
+          }
+        },
+        "hint": "对应 PS_TEST_SITES；不是 ICMP Ping；空列表关闭测试，不限制条数"
+      },
+      "proxy": {
+        "description": "全局代理地址，仅 use_proxy=true 的测试站点使用（例如 http://127.0.0.1:7890），留空则这些站点报错而不静默直连",
+        "type": "string",
+        "default": "",
+        "hint": "对应上游 proxy；只供 use_proxy=true 的测试项使用，不影响模型和 IP 查询"
+      },
+      "sort_sites": {
+        "description": "按延迟排序（对应上游：失败项在前，成功项由快到慢）",
+        "type": "bool",
+        "default": true,
+        "hint": "对应 PS_SORT_SITES，关闭时保持站点列表顺序"
+      },
+      "components": {
+        "description": "显示区块及顺序（删除即隐藏）：header/cpu_mem/gpu/disk/network/process/footer",
+        "type": "list",
+        "default": [
+          "header",
+          "cpu_mem",
+          "gpu",
+          "disk",
+          "network",
+          "process",
+          "footer"
+        ],
+        "hint": "对应上游 PS_DEFAULT_COMPONENTS"
+      },
+      "image_format": {
+        "description": "图片格式（PNG 更清晰，JPEG 体积更小）",
+        "type": "string",
+        "default": "png",
+        "options": [
+          "png",
+          "jpeg"
+        ],
+        "hint": "对应上游 PS_DEFAULT_PIC_FORMAT"
+      },
+      "theme": {
+        "description": "卡片主题",
+        "type": "string",
+        "default": "dark",
+        "options": [
+          "dark",
+          "light"
+        ]
+      },
+      "additional_css": {
+        "description": "附加样式（可选 no-shadow/no-radius/no-blur）",
+        "type": "list",
+        "default": [],
+        "hint": "对应上游 PS_DEFAULT_ADDITIONAL_CSS"
+      },
+      "show_current_bot_only": {
+        "description": "仅显示当前机器人（关闭显示所有已装配聊天平台）",
+        "type": "bool",
+        "default": true,
+        "hint": "对应上游 PS_SHOW_CURRENT_BOT_ONLY"
+      },
+      "use_env_nick": {
+        "description": "使用下方自定义昵称，而非平台机器人昵称",
+        "type": "bool",
+        "default": false,
+        "hint": "对应上游 PS_USE_ENV_NICK"
+      },
+      "nickname": {
+        "description": "自定义机器人昵称",
+        "type": "string",
+        "default": ""
+      },
+      "ignore_parts": {
+        "description": "隐藏挂载点（正则列表，匹配路径）",
+        "type": "list",
+        "default": [],
+        "hint": "对应上游 PS_IGNORE_PARTS"
+      },
+      "ignore_bad_parts": {
+        "description": "隐藏无法读取的分区",
+        "type": "bool",
+        "default": false,
+        "hint": "对应上游 PS_IGNORE_BAD_PARTS"
+      },
+      "sort_parts": {
+        "description": "按磁盘使用百分比从高到低排序",
+        "type": "bool",
+        "default": true,
+        "hint": "对应上游 PS_SORT_PARTS"
+      },
+      "sort_parts_reverse": {
+        "description": "反转磁盘空间排序（低占用优先）",
+        "type": "bool",
+        "default": false,
+        "hint": "对应上游 PS_SORT_PARTS_REVERSE"
+      },
+      "ignore_disk_ios": {
+        "description": "隐藏磁盘 IO 设备（正则）",
+        "type": "list",
+        "default": [
+          "^(loop|zram)\\d*$"
+        ],
+        "hint": "对应上游 PS_IGNORE_DISK_IOS"
+      },
+      "ignore_no_io_disk": {
+        "description": "隐藏读写速率均为零的磁盘",
+        "type": "bool",
+        "default": false,
+        "hint": "对应上游 PS_IGNORE_NO_IO_DISK"
+      },
+      "sort_disk_ios": {
+        "description": "按读写合计速率排序磁盘 IO",
+        "type": "bool",
+        "default": true,
+        "hint": "对应上游 PS_SORT_DISK_IOS"
+      },
+      "ignore_nets": {
+        "description": "隐藏网卡（正则；默认额外排除容器桥和隧道，可自行删除）",
+        "type": "list",
+        "default": [
+          "^lo(op)?\\d*$|^(Loopback|本地连接)",
+          "^(veth|br-|tun|tap)"
+        ],
+        "hint": "对应上游 PS_IGNORE_NETS"
+      },
+      "ignore_0b_net": {
+        "description": "隐藏收发速率均为零的网卡",
+        "type": "bool",
+        "default": false,
+        "hint": "对应上游 PS_IGNORE_0B_NET"
+      },
+      "sort_nets": {
+        "description": "按收发合计速率排序网卡",
+        "type": "bool",
+        "default": true,
+        "hint": "对应上游 PS_SORT_NETS"
+      },
+      "ignore_procs": {
+        "description": "隐藏进程名（正则，先过滤后取排行）",
+        "type": "list",
+        "default": [
+          "^System Idle Process$"
+        ],
+        "hint": "对应上游 PS_IGNORE_PROCS"
+      },
+      "proc_cpu_max_100p": {
+        "description": "将单进程 CPU 除以逻辑核心数（相对全机占用，非截断）",
+        "type": "bool",
+        "default": false,
+        "hint": "对应上游 PS_PROC_CPU_MAX_100P"
+      },
+      "background_url": {
+        "description": "自定义随机图片 HTTP(S) URL（仅 url 模式）",
+        "type": "string",
+        "default": "",
+        "hint": "对应上游 PS_BG_URL"
+      },
+      "background_proxy": {
+        "description": "背景下载代理（空=直连；不影响站点测试或模型）",
+        "type": "string",
+        "default": ""
+      },
+      "background_retry_limit": {
+        "description": "背景取图尝试次数（1–5，共用总超时；随机链接 404 时重新取图）",
+        "type": "int",
+        "default": 3,
+        "hint": "对应上游 PS_BG_PRELOAD_RETRY_LIMIT 的有限重试意图，当前为请求内取图而非后台队列"
+      },
+      "background_timeout": {
+        "description": "背景下载总超时（秒，失败回退上次成功图片，下次查询重试）",
+        "type": "float",
+        "default": 5.0
+      },
+      "default_avatar": {
+        "description": "无平台头像时使用的默认头像 URL",
+        "type": "string",
+        "default": "",
+        "hint": "对应上游 PS_DEFAULT_AVATAR"
+      }
+    }
+  }
+}

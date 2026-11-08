@@ -1,0 +1,417 @@
+/**
+ * Settings Page - advanced plugin configuration moved out of the host page.
+ * Sections render as collapsed groups; a search box finds fields by label,
+ * hint or config path. Field metadata and localized labels come from the
+ * backend schema endpoint, so this page stays in sync without hand-written
+ * forms for every option.
+ */
+
+import { esc } from "./utils.js";
+
+const QUICK_PATHS = [
+  "graph_memory.enabled",
+  "memory_dedup.enabled",
+  "memory_dedup.similarity_threshold",
+  "memory_consolidation.enabled",
+  "recall_engine.top_k",
+  "reflection_engine.summary_trigger_rounds",
+  "filtering_settings.memory_scope_mode",
+  "agent_tools.enable_recall_tool",
+];
+
+const CATEGORIES = [
+  {
+    key: "memory",
+    titleKey: "settings.catMemory",
+    sections: [
+      "reflection_engine",
+      "importance_decay",
+      "memory_dedup",
+      "memory_consolidation",
+      "forgetting_agent",
+    ],
+  },
+  {
+    key: "recall",
+    titleKey: "settings.catRecall",
+    sections: ["recall_engine", "fusion_strategy", "agent_tools"],
+  },
+  { key: "graph", titleKey: "settings.catGraph", sections: ["graph_memory"] },
+  {
+    key: "scope",
+    titleKey: "settings.catScope",
+    sections: ["access_control", "filtering_settings", "session_manager"],
+  },
+  {
+    key: "system",
+    titleKey: "settings.catSystem",
+    sections: [
+      "backup_settings",
+      "migration_settings",
+      "index_rebuild_settings",
+    ],
+  },
+];
+
+export class SettingsPage {
+  constructor(state, apiClient) {
+    this.state = state;
+    this.api = apiClient;
+    this.sections = [];
+    this.adapterOwnership = [];
+    this._open = new Set();
+    this._query = "";
+    this._busy = false;
+    this._bound = false;
+  }
+
+  currentLang() {
+    if (typeof window.getLanguage === "function") return window.getLanguage();
+    return "zh";
+  }
+
+  showToast(message, isError = false) {
+    if (typeof window.lmShowToast === "function") {
+      window.lmShowToast(message, isError);
+    }
+  }
+
+  async fetch() {
+    const container = document.getElementById("settings-container");
+    if (!container) return;
+    if (!this._bound) this.bindEvents();
+    if (!this.sections.length) {
+      container.innerHTML =
+        '<p class="text-tertiary">' + esc(window.t("settings.loading")) + "</p>";
+    }
+    try {
+      const data = await this.api.get("config", { lang: this.currentLang() });
+      this.sections = Array.isArray(data.sections) ? data.sections : [];
+      this.adapterOwnership = data.adapter_ownership || [];
+      this.renderFeedback("");
+      this.render();
+    } catch (error) {
+      this.renderFeedback(error.message || window.t("settings.loadFailed"));
+      container.innerHTML =
+        '<p class="text-tertiary">' + esc(window.t("settings.loadFailed")) + "</p>";
+    }
+  }
+
+  renderFeedback(message) {
+    const bar = document.getElementById("settings-feedback");
+    const label = document.getElementById("settings-feedback-message");
+    if (!bar || !label) return;
+    bar.hidden = !message;
+    label.textContent = message || "";
+  }
+
+  matches(field, query) {
+    if (!query) return true;
+    const haystack = [field.label, field.hint, field.path].join(" ").toLowerCase();
+    return haystack.includes(query);
+  }
+
+  render() {
+    const container = document.getElementById("settings-container");
+    if (!container) return;
+    if (!this.sections.length) {
+      container.innerHTML =
+        '<p class="text-tertiary">' + esc(window.t("settings.empty")) + "</p>";
+      return;
+    }
+
+    const query = this._query.trim().toLowerCase();
+    const bySection = new Map();
+    this.sections.forEach((section) => bySection.set(section.key, section));
+    const quickSet = new Set(QUICK_PATHS);
+    const quickFields = [];
+    bySection.forEach((section) => {
+      (section.fields || []).forEach((field) => {
+        if (quickSet.has(field.path) && this.matches(field, query)) {
+          quickFields.push(field);
+        }
+      });
+    });
+
+    let html = "";
+    if (quickFields.length) {
+      html +=
+        '<section class="settings-quick">' +
+        '<div class="settings-quick-title">' +
+        esc(window.t("settings.quickTitle")) +
+        "</div>" +
+        '<div class="settings-fields">' +
+        quickFields.map((field) => this.renderField(field)).join("") +
+        "</div>" +
+        "</section>";
+    }
+
+    const categoryHtml = CATEGORIES.map((category) => {
+      const groups = category.sections
+        .map((key) => bySection.get(key))
+        .filter(Boolean)
+        .map((section) => {
+          const fields = (section.fields || []).filter(
+            (field) => !quickSet.has(field.path) && this.matches(field, query)
+          );
+          if (!fields.length) return "";
+          return (
+            '<div class="settings-subgroup">' +
+            '<div class="settings-subgroup-title">' +
+            esc(section.title) +
+            "</div>" +
+            '<div class="settings-fields">' +
+            fields.map((field) => this.renderField(field)).join("") +
+            "</div>" +
+            "</div>"
+          );
+        })
+        .filter(Boolean)
+        .join("");
+      if (!groups) return "";
+      const open = this._open.has(category.key) || Boolean(query);
+      return (
+        '<details class="settings-group settings-category" data-category="' +
+        esc(category.key) +
+        '"' +
+        (open ? " open" : "") +
+        ">" +
+        "<summary>" +
+        '<span class="settings-group-title">' +
+        esc(window.t(category.titleKey)) +
+        "</span>" +
+        "</summary>" +
+        groups +
+        "</details>"
+      );
+    }).join("");
+
+    html +=
+      '<div class="settings-categories-title">' +
+      esc(window.t("settings.advancedTitle")) +
+      "</div>" +
+      categoryHtml;
+
+    const ownership = this.adapterOwnership;
+    const adapterField = this.sections.flatMap(section => section.fields || [])
+      .find(field => field.type === "adapter-list");
+    if ((!query || window.t("settings.adapterOwnership").toLowerCase().includes(query)) && ownership.length && adapterField?.options?.length) {
+      const options = adapterField.options.map((id, i) => '<option value="' + esc(id) + '">' +
+        esc(adapterField.option_labels[i]) + '</option>').join("");
+      html += '<details class="settings-group"' + (query ? ' open' : '') + '><summary>' +
+        esc(window.t("settings.adapterOwnership")) + '</summary>' + ownership.map((row, i) =>
+        '<div class="adapter-ownership-row"><span>' + (row.adapter_id ? '' : esc(window.t("settings.adapterUnassigned")) + ' · ') + esc(row.adapter_id || row.session_id || window.t("settings.adapterUnknown")) +
+        ' · ' + esc(window.t('settings.adapterCount', row.count)) + '</span><select class="input" data-adapter-target="' + i + '">' +
+        options.replace('value="' + esc(row.adapter_id) + '"', 'value="' + esc(row.adapter_id) + '" selected') + '</select><button class="btn btn-secondary" data-adapter-assign="' + i + '"' + (row.adapter_id && adapterField.options.includes(row.adapter_id) ? ' disabled' : '') + '>' +
+        esc(window.t("settings.adapterAssign")) + '</button></div>'
+      ).join("") + '</details>';
+    }
+    container.innerHTML =
+      html ||
+      '<p class="text-tertiary">' + esc(window.t("settings.noMatches")) + "</p>";
+  }
+
+  renderField(field) {
+    const path = esc(field.path);
+    const common =
+      'data-setting-path="' + path + '" data-type="' + esc(field.type) + '"';
+    let control = "";
+    if (field.type === "adapter-list") {
+      const selected = field.value ?? field.options;
+      control = '<fieldset class="adapter-options" aria-label="' + esc(field.label) + '" ' + common +
+        ' data-original="' + (field.value === null ? "null" : "set") + '">' + field.options.map((id, i) =>
+        '<label><input type="checkbox" value="' + esc(id) + '"' +
+        (selected.includes(id) ? ' checked' : '') + '> ' + esc(field.option_labels[i]) + '</label>'
+      ).join("") + '</fieldset>';
+    } else if (field.type === "bool") {
+      control =
+        '<input type="checkbox" ' + common + (field.value ? " checked" : "") + ">";
+    } else if (Array.isArray(field.options)) {
+      const labels = Array.isArray(field.option_labels)
+        ? field.option_labels
+        : field.options;
+      const options = field.options
+        .map((option, index) => {
+          const label = labels[index] || option;
+          const selected = String(field.value) === String(option) ? " selected" : "";
+          return (
+            '<option value="' +
+            esc(option) +
+            '"' +
+            selected +
+            ">" +
+            esc(label) +
+            "</option>"
+          );
+        })
+        .join("");
+      control = '<select class="input" ' + common + ">" + options + "</select>";
+    } else if (field.type === "int" || field.type === "float") {
+      const attrs = [];
+      if (field.min !== undefined) attrs.push('min="' + esc(field.min) + '"');
+      if (field.max !== undefined) attrs.push('max="' + esc(field.max) + '"');
+      if (field.step !== undefined) attrs.push('step="' + esc(field.step) + '"');
+      control =
+        '<input class="input" type="number" ' +
+        common +
+        attrs.join(" ") +
+        ' value="' +
+        esc(field.value ?? "") +
+        '">';
+    } else if (field.type === "list") {
+      control =
+        '<textarea class="input textarea" rows="4" ' +
+        common +
+        ">" +
+        esc(JSON.stringify(field.value ?? field.default ?? [], null, 2)) +
+        "</textarea>";
+    } else {
+      control =
+        '<input class="input" type="text" ' +
+        common +
+        ' value="' +
+        esc(field.value ?? "") +
+        '">';
+    }
+    return (
+      '<div class="settings-field">' +
+      '<label class="settings-label">' + esc(field.label) + "</label>" +
+      control +
+      (field.hint ? '<div class="settings-hint">' + esc(field.hint) + "</div>" : "") +
+      "</div>"
+    );
+  }
+
+  bindEvents() {
+    const save = document.getElementById("settings-save-btn");
+    if (save && !save.dataset.bound) {
+      save.dataset.bound = "1";
+      save.addEventListener("click", () => this.save());
+    }
+    const expand = document.getElementById("settings-expand-all");
+    if (expand && !expand.dataset.bound) {
+      expand.dataset.bound = "1";
+      expand.addEventListener("click", () => {
+        CATEGORIES.forEach((category) => this._open.add(category.key));
+        this.render();
+      });
+    }
+    const collapse = document.getElementById("settings-collapse-all");
+    if (collapse && !collapse.dataset.bound) {
+      collapse.dataset.bound = "1";
+      collapse.addEventListener("click", () => {
+        this._open.clear();
+        this._query = "";
+        const search = document.getElementById("settings-search");
+        if (search) search.value = "";
+        this.render();
+      });
+    }
+    const search = document.getElementById("settings-search");
+    if (search && !search.dataset.bound) {
+      search.dataset.bound = "1";
+      search.addEventListener("input", () => {
+        this._query = search.value;
+        this.render();
+      });
+    }
+    const container = document.getElementById("settings-container");
+    if (container && !container.dataset.bound) {
+      container.dataset.bound = "1";
+      container.addEventListener("change", event => {
+        const group = event.target.closest('[data-type="adapter-list"]');
+        if (group) group.dataset.edited = "1";
+        if (event.target.dataset.adapterTarget !== undefined) {
+          const index = event.target.dataset.adapterTarget;
+          container.querySelector('[data-adapter-assign="' + index + '"]').disabled =
+            event.target.value === this.adapterOwnership[Number(index)].adapter_id;
+        }
+      });
+      container.addEventListener("click", async event => {
+        const button = event.target.closest("[data-adapter-assign]");
+        if (!button || button.disabled) return;
+        const index = Number(button.dataset.adapterAssign);
+        const row = this.adapterOwnership[index];
+        const target = container.querySelector('[data-adapter-target="' + index + '"]');
+        button.disabled = true;
+        try {
+          await this.api.post("adapters/assign", {adapter_id: target.value, source_adapter_id: row.adapter_id, session_id: row.session_id});
+          await this.fetch();
+        } catch (error) {
+          this.renderFeedback(error.message);
+          button.disabled = false;
+        }
+      });
+      container.addEventListener(
+        "toggle",
+        (event) => {
+          const details = event.target;
+          const key = details?.dataset?.category;
+          if (!key) return;
+          if (details.open) this._open.add(key);
+          else this._open.delete(key);
+        },
+        true
+      );
+    }
+    this._bound = true;
+  }
+
+  collectValues() {
+    const values = {};
+    document.querySelectorAll("[data-setting-path]").forEach((element) => {
+      const path = element.dataset.settingPath;
+      const type = element.dataset.type;
+      if (type === "adapter-list") {
+        values[path] = element.dataset.original === "null" && !element.dataset.edited
+          ? null : Array.from(element.querySelectorAll('input:checked'), input => input.value);
+      } else if (type === "bool") {
+        values[path] = Boolean(element.checked);
+      } else if (type === "int") {
+        const parsed = Number.parseInt(element.value, 10);
+        if (Number.isNaN(parsed)) throw new Error(path);
+        values[path] = parsed;
+      } else if (type === "float") {
+        const parsed = Number.parseFloat(element.value);
+        if (Number.isNaN(parsed)) throw new Error(path);
+        values[path] = parsed;
+      } else if (type === "list") {
+        let parsed;
+        try {
+          parsed = JSON.parse(element.value);
+        } catch {
+          throw new Error(path);
+        }
+        if (!Array.isArray(parsed)) throw new Error(path);
+        values[path] = parsed;
+      } else {
+        values[path] = element.value;
+      }
+    });
+    return values;
+  }
+
+  async save() {
+    if (this._busy) return;
+    const button = document.getElementById("settings-save-btn");
+    let values;
+    try {
+      values = this.collectValues();
+    } catch (error) {
+      this.showToast(window.t("settings.invalidValue", error.message), true);
+      return;
+    }
+    this._busy = true;
+    if (button) button.disabled = true;
+    try {
+      await this.api.post("config/update", { values });
+      this.showToast(window.t("settings.saved"));
+      await this.fetch();
+    } catch (error) {
+      this.showToast(error.message || window.t("settings.saveFailed"), true);
+    } finally {
+      this._busy = false;
+      if (button) button.disabled = false;
+    }
+  }
+}

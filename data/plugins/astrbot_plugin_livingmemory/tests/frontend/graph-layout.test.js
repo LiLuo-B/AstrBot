@@ -1,0 +1,793 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const source = readFileSync(join(here, "../../pages/dashboard/graph-2d.js"), "utf-8");
+const topologySource = readFileSync(join(here, "../../pages/dashboard/graph-topology.js"), "utf-8");
+const coreSource = readFileSync(join(here, "../../pages/dashboard/graph-layout-core.js"), "utf-8");
+const sharedSource = readFileSync(join(here, "../../pages/dashboard/graph-shared.js"), "utf-8");
+const rendererSource = readFileSync(join(here, "../../pages/dashboard/graph-renderer.js"), "utf-8");
+const interactionSource = readFileSync(join(here, "../../pages/dashboard/graph-interaction.js"), "utf-8");
+
+function makeCtx() {
+  const gradient = { addColorStop() {} };
+  const stack = [];
+  const ctx = {
+    save() {
+      stack.push({ font: this.font, fillStyle: this.fillStyle, textBaseline: this.textBaseline,
+        textAlign: this.textAlign, globalAlpha: this.globalAlpha });
+    },
+    restore() { Object.assign(this, stack.pop()); },
+    measureText: () => ({ width: 10 }),
+    createLinearGradient: () => gradient,
+    createRadialGradient: () => gradient,
+  };
+  return new Proxy(ctx, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      return () => {};
+    },
+    set(target, prop, value) {
+      target[prop] = value;
+      return true;
+    },
+  });
+}
+
+function makeCanvas() {
+  const parent = {
+    getBoundingClientRect: () => ({ width: 800, height: 600 }),
+    clientWidth: 800,
+    clientHeight: 600,
+    removeChild() {},
+  };
+  return {
+    getContext: () => makeCtx(),
+    parentElement: parent,
+    addEventListener() {},
+    removeEventListener() {},
+    style: {},
+    width: 800,
+    height: 600,
+  };
+}
+
+function makeContainer() {
+  return { innerHTML: "", appendChild() {} };
+}
+
+function loadGraph() {
+  const rafQueue = [];
+  global.window = {
+    devicePixelRatio: 1,
+    /* 渲染器现在通过 window.t 输出 hover 元信息，与页面其它文案一致 */
+    t: (key, ...args) => [key, ...args].join(" "),
+    matchMedia: () => ({ matches: true }),
+    ResizeObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  global.document = {
+    documentElement: { getAttribute: () => "light" },
+    createElement: () => makeCanvas(),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  global.getComputedStyle = () => ({ getPropertyValue: () => "" });
+  global.requestAnimationFrame = (cb) => {
+    rafQueue.push(cb);
+    return rafQueue.length;
+  };
+  global.cancelAnimationFrame = () => {};
+  class Observer {
+    observe() {}
+    disconnect() {}
+  }
+  global.ResizeObserver = Observer;
+  global.MutationObserver = Observer;
+  (0, eval)(sharedSource);
+  global.GraphShared = global.window.GraphShared;
+  (0, eval)(topologySource);
+  (0, eval)(coreSource);
+  (0, eval)(rendererSource);
+  (0, eval)(interactionSource);
+  global.GraphRenderer = global.window.GraphRenderer;
+  global.GraphInteraction = global.window.GraphInteraction;
+  (0, eval)(source);
+  return rafQueue;
+}
+
+function flushRaf(rafQueue) {
+  let guard = 0;
+  while (rafQueue.length && guard < 200000) {
+    const cb = rafQueue.shift();
+    cb(0);
+    guard++;
+  }
+}
+
+/* 渐进式布局现在是 async：需要交替排空微任务与 rAF 队列。 */
+async function settle(rafQueue) {
+  let guard = 0;
+  while (guard < 200000) {
+    guard++;
+    await Promise.resolve();
+    if (!rafQueue.length) break;
+    flushRaf(rafQueue);
+  }
+}
+
+function makePayload(nodeCount, edgeCount) {
+  const nodes = [];
+  for (let i = 1; i <= nodeCount; i++) {
+    nodes.push({ id: i, type: "topic", label: "N" + i, weight: 1 });
+  }
+  const edges = [];
+  for (let e = 0; e < edgeCount && e < nodeCount - 1; e++) {
+    edges.push({
+      id: e + 1,
+      source: e + 1,
+      target: e + 2,
+      relation_type: "relates",
+      memory_id: 1,
+      weight: 1,
+      confidence: 0.8,
+    });
+  }
+  return { enabled: true, mode: "query", snapshot: { nodes, edges } };
+}
+
+test("changing visual style invalidates the graph background without rebuilding layout", () => {
+  loadGraph();
+  let onThemeChange;
+  let observedAttributes;
+  global.MutationObserver = class {
+    constructor(callback) { onThemeChange = callback; }
+    observe(_element, options) { observedAttributes = options.attributeFilter; }
+  };
+  const graph = global.window.Graph2D;
+  graph.init(makeContainer());
+  assert.ok(observedAttributes.includes("data-style"));
+  assert.ok(observedAttributes.includes("data-theme"));
+  graph.renderer.drawBackground(false, false);
+  assert.ok(graph.renderer._bgCacheKey);
+  const layout = graph.animator._layout;
+  let wakes = 0;
+  graph.animator.wake = () => { wakes++; };
+  onThemeChange();
+  assert.equal(graph.renderer._bgCacheKey, null);
+  assert.equal(wakes, 1);
+  global.getComputedStyle = () => ({ getPropertyValue: key => key === "--accent" ? "#5145b8" : "#fcfcff" });
+  graph.renderer.drawBackground(false, false);
+  assert.equal(graph.renderer._backgroundAccent, "#5145b8");
+  assert.equal(graph.animator._layout, layout);
+});
+
+test("small graph layout completes synchronously with positions", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const payload = makePayload(50, 49);
+  g.loadData(payload);
+
+  assert.equal(g._nodes.length, 50);
+  assert.equal(Object.keys(g.animator._layout.positions).length, 50);
+  assert.equal(g.animator._layout._done, true);
+  await settle(rafQueue);
+  /* 空闲渲染后社区椭圆缓存应已填充。 */
+  assert.ok(g.renderer._communityCacheKey != null);
+  assert.ok(Array.isArray(g.renderer._communityCache));
+});
+
+test("label width cache populates when labels render", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const nodes = [];
+  for (let i = 1; i <= 30; i++) {
+    nodes.push({ id: i, type: "topic", label: "Prominent-Node-" + i, weight: 3, degree: 6 });
+  }
+  const edges = [];
+  for (let e = 0; e < 29; e++) {
+    edges.push({ id: e + 1, source: e + 1, target: e + 2, relation_type: "relates", memory_id: 1, weight: 1, confidence: 0.8 });
+  }
+  g.loadData({ enabled: true, mode: "query", snapshot: { nodes, edges } });
+  await settle(rafQueue);
+
+  assert.ok(Object.keys(g.renderer._labelWidthCache).length > 0, "标签宽度缓存应有条目");
+});
+
+test("zoomed reading freezes dense labels and stops idle frames; overview motion resumes", async () => {
+  const queue = loadGraph();
+  const graph = global.window.Graph2D;
+  graph.init(makeContainer());
+  const payload = makePayload(2, 0);
+  payload.snapshot.nodes.forEach(n => { n.degree = 6; n.memory_count = 4; });
+  graph.loadData(payload);
+  await settle(queue);
+  const animator = graph.animator;
+  const homes = { 1: { tx: 0, ty: 0 }, 2: { tx: 0, ty: 15 } };
+  animator._layout.getTarget = id => homes[id];
+  animator._layout.getRing = () => 1;
+  graph._nodes.forEach(n => { n.x = homes[n.id].tx; n.y = homes[n.id].ty; });
+  animator._ambientMotion = true;
+  graph.renderer.viewport = { scale: 2, ox: 0, oy: 0 };
+  let drawn = [];
+  graph.renderer.ctx.fillText = label => { if (label === "N1" || label === "N2") drawn.push(label); };
+  let first;
+  for (let frame = 0; frame < 120; frame++) {
+    drawn = [];
+    animator.wake();
+    flushRaf(queue);
+    if (frame === 0) first = drawn;
+    assert.deepEqual(drawn, first);
+    assert.equal(animator._running, false);
+    for (const node of graph._nodes) {
+      assert.equal(node.x, homes[node.id].tx);
+      assert.equal(node.y, homes[node.id].ty);
+    }
+  }
+  assert.ok(first.length > 0);
+  graph.renderer.viewport.scale = 0.5;
+  animator.wake();
+  queue.shift()();
+  assert.equal(animator._running, true);
+  assert.ok(graph._nodes.some(n => n.x !== homes[n.id].tx || n.y !== homes[n.id].ty));
+  animator.stop();
+  queue.length = 0;
+});
+
+test("hover and selection pause overview motion without changing dragged node positions", async () => {
+  const queue = loadGraph();
+  const graph = global.window.Graph2D;
+  graph.init(makeContainer());
+  graph.loadData(makePayload(2, 1));
+  await settle(queue);
+  graph.renderer.viewport.scale = 0.5;
+  graph.animator._ambientMotion = true;
+  graph._nodes[0].fixed = true;
+  graph._nodes[0].x = 41;
+  graph._nodes[0].y = 32;
+  const positions = graph._nodes.map(n => [n.x, n.y]);
+  graph.interaction._hoverId = graph._nodes[0].id;
+  graph.animator.wake();
+  flushRaf(queue);
+  assert.equal(graph.animator._running, false);
+  assert.deepEqual(graph._nodes.map(n => [n.x, n.y]), positions);
+  graph.interaction._hoverId = null;
+  graph.renderer._selection = { type: "node", id: graph._nodes[1].id };
+  graph.animator.wake();
+  flushRaf(queue);
+  assert.equal(graph.animator._running, false);
+  assert.deepEqual(graph._nodes.map(n => [n.x, n.y]), positions);
+  graph.renderer._selection = null;
+  graph.animator.wake();
+  queue.shift()();
+  assert.equal(graph.animator._running, true);
+  assert.deepEqual([graph._nodes[0].x, graph._nodes[0].y], [41, 32]);
+  graph.animator.stop();
+  queue.length = 0;
+});
+
+test("label priority is independent of input order and hovered labels reserve metadata space", () => {
+  loadGraph();
+  const renderer = new global.GraphRenderer(makeCanvas());
+  renderer.resize();
+  renderer.viewport.scale = 2;
+  const nodes = [
+    { id: 1, x: 0, y: 15, label: "Ordinary", degree: 6, labelScore: 20 },
+    { id: 2, x: 0, y: 0, label: "Important", degree: 6, labelScore: 30 },
+  ];
+  const map = Object.fromEntries(nodes.map(n => [n.id, n]));
+  let labels = [];
+  /* hover 元信息现在走 i18n（graph.nodeMeta），按 key 过滤以保留原意图 */
+  renderer.ctx.fillText = label => { if (!label.startsWith("graph.nodeMeta")) labels.push(label); };
+  renderer.ctx.measureText = () => ({ width: 80 });
+  renderer.render(nodes, [], map, null, 2, null, 1);
+  assert.deepEqual(labels, ["Important"], "The hovered metadata also excludes nearby ordinary labels");
+  nodes[0].y = 0;
+  labels = [];
+  renderer.render(nodes, [], map, null, null, null, 1);
+  assert.deepEqual(labels, ["Important"]);
+  labels = [];
+  renderer.render([...nodes].reverse(), [], map, null, null, null, 1);
+  assert.deepEqual(labels, ["Important"]);
+});
+
+test("zoomed fonts are bounded and measurement cache distinguishes the selected weight", () => {
+  loadGraph();
+  const renderer = new global.GraphRenderer(makeCanvas());
+  renderer.resize();
+  renderer.viewport.scale = 3.5;
+  const node = { id: 1, x: 0, y: 0, label: "Same label", degree: 6, labelScore: 30 };
+  const fonts = [];
+  renderer.ctx.fillText = function(label) { if (label === node.label) fonts.push(this.font); };
+  renderer.ctx.measureText = function() { return { width: this.font.startsWith("650 ") ? 110 : 80 }; };
+  renderer.render([node], [], { 1: node }, null, null, null, 1);
+  const normalWidth = renderer._labelBoxes[0].x2 - renderer._labelBoxes[0].x1;
+  renderer.render([node], [], { 1: node }, { type: "node", id: 1 }, null, null, 1);
+  const selectedWidth = renderer._labelBoxes[0].x2 - renderer._labelBoxes[0].x1;
+  assert.ok(selectedWidth > normalWidth, "A different font weight must be measured separately");
+  assert.equal(fonts.length, 2);
+  for (const font of fonts) assert.ok(Number(font.match(/(\d+)px/)[1]) <= 18);
+});
+
+test("returning to the graph redraws a settled inspection frame", async () => {
+  const queue = loadGraph();
+  const graph = global.window.Graph2D;
+  graph.init(makeContainer());
+  graph.loadData(makePayload(2, 1));
+  await settle(queue);
+  graph.setActive(false);
+  let renders = 0;
+  graph.renderer.render = () => { renders++; };
+  graph.setActive(true);
+  flushRaf(queue);
+  assert.equal(renders, 1);
+  assert.equal(graph.animator._running, false);
+});
+
+test("leaving the canvas clears the inspection hover and requests a fresh frame", () => {
+  loadGraph();
+  const events = {};
+  const canvas = makeCanvas();
+  canvas.addEventListener = (name, callback) => { events[name] = callback; };
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0 });
+  let renders = 0;
+  const hovered = [];
+  const interaction = new global.GraphInteraction(null, canvas, {}, {
+    onRenderRequest: () => { renders++; },
+    onNodeHover: id => { hovered.push(id); },
+  });
+  interaction._hoverId = 1;
+  interaction._hoverType = "node";
+  events.mouseleave({ clientX: 0, clientY: 0 });
+  assert.equal(interaction.getHoverId(), null);
+  assert.equal(interaction.getHoverType(), null);
+  assert.deepEqual(hovered, [null]);
+  assert.equal(renders, 1);
+});
+
+test("large graph layout completes via progressive stepping", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const payload = makePayload(300, 299);
+  g.loadData(payload);
+
+  /* Layout completes via progressive rAF chunks. */
+  await settle(rafQueue);
+  assert.equal(g._nodes.length, 300);
+  assert.equal(g.animator._layout._done, true);
+  assert.equal(Object.keys(g.animator._layout.positions).length, 300);
+});
+
+test("fact node canvas labels strip person name and date prefixes", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const nodes = [
+    { id: 1, type: "person", label: "人物A", weight: 10, degree: 30 },
+    { id: 2, type: "person", label: "人物B", weight: 10, degree: 30 },
+    { id: 3, type: "fact", label: "人物A 2026-08-14 深夜聊天时被催促去睡觉", weight: 1 },
+    { id: 4, type: "fact", label: "人物A 人物B 2026年8月15日 一起看了电影", weight: 1 },
+    { id: 5, type: "fact", label: "今天下雨了", weight: 1 },
+    { id: 6, type: "fact", label: "人物A 喜欢喝咖啡", weight: 1 },
+    { id: 7, type: "topic", label: "人物A 的喜好", weight: 1 },
+  ];
+  g.loadData({ enabled: true, mode: "query", snapshot: { nodes, edges: [] } });
+
+  const byId = {};
+  g._nodes.forEach(function(n) { byId[n.id] = n; });
+  /* person 节点标签保持不变。 */
+  assert.equal(byId[1].label, "人物A");
+  /* fact 标签去掉人物名与日期时间前缀（#248）。 */
+  assert.equal(byId[3].label, "深夜聊天时被催促去睡觉");
+  assert.equal(byId[4].label, "一起看了电影");
+  assert.equal(byId[5].label, "下雨了");
+  assert.equal(byId[6].label, "喜欢喝咖啡");
+  /* 非 fact 节点不做剥离。 */
+  assert.equal(byId[7].label, "人物A 的喜好");
+});
+
+test("identical graph structure reuses cached layout", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const payload = makePayload(80, 79);
+  g.loadData(payload);
+  await settle(rafQueue);
+  const firstPositions = Object.assign({}, g.animator._layout.positions);
+
+  /* Load the same structure again — should skip recompute and keep positions. */
+  g.loadData(payload);
+  assert.equal(g.animator._layout._done, true);
+  assert.deepEqual(
+    Object.keys(g.animator._layout.positions).sort(),
+    Object.keys(firstPositions).sort()
+  );
+  await settle(rafQueue);
+});
+
+test("selecting a node recenters without recomputing the layout", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const payload = makePayload(60, 59);
+  g.loadData(payload);
+
+  /* Record the layout progress marker; recenter must not re-run the simulation. */
+  const stepAfterLoad = g.animator._layout._step;
+  const doneAfterLoad = g.animator._layout._done;
+
+  g.selectNode(30);
+  assert.equal(g.animator._layout._done, doneAfterLoad);
+  assert.equal(g.animator._layout._step, stepAfterLoad);
+  await settle(rafQueue);
+});
+
+test("rapid double load leaves a consistent progressive layout", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  /* 两次快速加载：旧渐进链路应被代数守卫丢弃，新链路完成布局。 */
+  const first = makePayload(260, 259);
+  const second = makePayload(280, 279);
+  g.loadData(first);
+  g.loadData(second);
+  await settle(rafQueue);
+
+  assert.equal(g._nodes.length, 280);
+  assert.equal(g.animator._layout._done, true);
+  assert.equal(Object.keys(g.animator._layout.positions).length, 280);
+});
+
+/* ── Web Worker 布局测试 ─────────────────────────────────────── */
+
+const workerSource = readFileSync(
+  join(here, "../../pages/dashboard/graph-layout-worker.js"), "utf-8"
+);
+
+/* 在进程内模拟 Worker：把 worker 脚本的逻辑以假 self 跑起来，消息同步往返。 */
+function installFakeWorker() {
+  global.Worker = class {
+    constructor() {
+      const worker = this;
+      this.onmessage = null;
+      this._deferResponses = false;
+      const posts = [];
+      const fakeSelf = {
+        postMessage(msg) { posts.push(msg); },
+        importScripts() {
+          /* importScripts 把核心加载进 worker 全局作用域（即 globalThis）。 */
+          const saved = global.self;
+          global.self = global;
+          (0, eval)(topologySource);
+          (0, eval)(coreSource);
+          global.self = saved;
+        },
+      };
+      const saved = global.self;
+      const savedImportScripts = global.importScripts;
+      global.self = fakeSelf;
+      global.importScripts = fakeSelf.importScripts;
+      (0, eval)(workerSource);
+      global.self = saved;
+      global.importScripts = savedImportScripts;
+      this._dispatch = (msg) => {
+        /* 调用 worker 的 onmessage 时 self 应仍指向 worker 全局。 */
+        const saved = global.self;
+        global.self = fakeSelf;
+        fakeSelf.onmessage({ data: msg });
+        global.self = saved;
+      };
+      this._flush = (limit = Infinity) => {
+        while (posts.length && limit-- > 0) {
+          const msg = posts.shift();
+          if (worker.onmessage) worker.onmessage({ data: msg });
+        }
+      };
+    }
+    postMessage(msg) {
+      this._dispatch(msg);
+      if (!this._deferResponses) this._flush();
+    }
+    terminate() {}
+  };
+}
+
+test("small graph completes with worker layout via progressive steps", async () => {
+  const rafQueue = loadGraph();
+  installFakeWorker();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  assert.equal(g.animator._layout.isWorker, true, "Worker 布局应被启用");
+
+  /* ≤60 节点的小图在 Worker 布局下也必须真正跑完：此前同步分支只发
+     begin 消息，位置永远不回传，导致所有节点堆在原点（#248 演示发现）。 */
+  const payload = makePayload(50, 49);
+  g.loadData(payload);
+  await settle(rafQueue);
+
+  assert.equal(g._nodes.length, 50);
+  assert.equal(g.animator._layout._done, true);
+  assert.equal(Object.keys(g.animator._layout.positions).length, 50);
+});
+
+test("progressive layout does not render unstable intermediate states", async () => {
+  const rafQueue = loadGraph();
+  installFakeWorker();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  let renders = 0;
+  const renderer = g.renderer;
+  const orig = renderer.render.bind(renderer);
+  renderer.render = function () { renders += 1; return orig.apply(renderer, arguments); };
+
+  g.loadData(makePayload(300, 299));
+
+  /* 渐进期间推几帧：布局未完时不得渲染中间态（此前 _tick 的漂浮/渲染会
+     在旧视口里重绘乱动的节点，整幅图表现为抽搐——#248 演示反馈）。 */
+  for (let i = 0; i < 8; i++) {
+    flushRaf(rafQueue);
+    await Promise.resolve();
+  }
+  assert.equal(g.animator._layout._done, false, "前置：布局尚未完成");
+  assert.equal(renders, 0, "渐进期间不应渲染中间态");
+
+  await settle(rafQueue);
+  assert.equal(g.animator._layout._done, true);
+  assert.ok(renders > 0, "布局完成后应开始渲染");
+});
+
+test("switching back to a previously loaded graph reuses cached layout instantly", async () => {
+  const rafQueue = loadGraph();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  const small = makePayload(60, 59);
+  const large = makePayload(200, 199);
+
+  g.loadData(small);
+  await settle(rafQueue);
+  assert.equal(g.animator._layout._done, true);
+
+  g.loadData(large);
+  await settle(rafQueue);
+  assert.equal(g.animator._layout._done, true);
+
+  /* 切回小图：应立即命中多槽布局缓存，无需重新布局（#248 反馈）。 */
+  g.loadData(small);
+  assert.equal(g.animator._layout._done, true, "切换回已加载的图应直接复用布局");
+  assert.equal(Object.keys(g.animator._layout.positions).length, 60);
+  await settle(rafQueue);
+});
+
+test("worker layout completes via fake worker round trip", async () => {
+  const rafQueue = loadGraph();
+  installFakeWorker();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  assert.equal(g.animator._layout.isWorker, true, "Worker 布局应被启用");
+
+  const payload = makePayload(300, 299);
+  g.loadData(payload);
+  await settle(rafQueue);
+
+  assert.equal(g._nodes.length, 300);
+  assert.equal(g.animator._layout._done, true);
+  assert.equal(Object.keys(g.animator._layout.positions).length, 300);
+});
+
+test("worker layout backfills community ids so cluster boundaries can render", async () => {
+  const rafQueue = loadGraph();
+  installFakeWorker();
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  g.loadData(makePayload(300, 299));
+  await settle(rafQueue);
+
+  const layout = g.animator._layout;
+  assert.equal(layout.isWorker, true, "前置：本用例走 Worker 布局");
+  assert.ok(Object.keys(layout.communities || {}).length > 0, "前置：布局结果带社区编号");
+
+  const missing = g.animator._nodes.filter(node => node.community == null);
+  assert.equal(missing.length, 0, "Worker 路径下每个节点都必须带上社区编号");
+});
+
+test("worker layout falls back to inline when Worker unavailable", async () => {
+  const rafQueue = loadGraph();
+  const savedWorker = global.Worker;
+  global.Worker = undefined;
+  const g = global.window.Graph2D;
+  g.init(makeContainer(), {});
+
+  assert.notEqual(g.animator._layout.isWorker, true, "Worker 不可用时回退内联布局");
+
+  const payload = makePayload(120, 119);
+  g.loadData(payload);
+  await settle(rafQueue);
+
+  assert.equal(g.animator._layout._done, true);
+  assert.equal(Object.keys(g.animator._layout.positions).length, 120);
+  global.Worker = savedWorker;
+});
+
+test("delayed worker replies cannot settle or overwrite a newer graph", async t => {
+  const queue = loadGraph();
+  installFakeWorker();
+  t.after(() => { delete global.Worker; });
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  const layout = graph.animator._layout;
+  layout._worker._deferResponses = true;
+  graph.loadData(makePayload(40, 39));
+  const oldPending = layout._pending;
+  graph.loadData(makePayload(20, 19));
+  const newPending = layout._pending;
+  assert.notEqual(oldPending, newPending);
+  layout._worker._flush(1);
+  assert.equal(layout._pending, newPending, "Old replies must not resolve the new step");
+  assert.deepEqual(layout._lastSimPositions, {});
+  layout._worker._deferResponses = false;
+  layout._worker._flush();
+  await settle(queue);
+  assert.equal(Object.keys(layout.positions).length, 20);
+  assert.equal(layout._done, true);
+});
+
+test("an in-flight worker cannot overwrite a restored cached layout", async t => {
+  const queue = loadGraph();
+  installFakeWorker();
+  t.after(() => { delete global.Worker; });
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  const small = makePayload(10, 9);
+  graph.loadData(small);
+  await settle(queue);
+  const layout = graph.animator._layout;
+  const positions = layout.positions;
+  graph.animator._instantLayout = false;
+  layout._worker._deferResponses = true;
+  graph.loadData(makePayload(100, 99));
+  graph.loadData(small);
+  layout._worker._flush();
+  await settle(queue);
+  assert.equal(layout.positions, positions);
+  assert.equal(layout._done, true);
+  for (const node of graph._nodes) {
+    assert.equal(node.x, positions[node.id].tx);
+    assert.equal(node.y, positions[node.id].ty);
+  }
+});
+
+test("worker script errors fall back to sliced inline layout and finish loading", async t => {
+  const queue = loadGraph();
+  installFakeWorker();
+  t.after(() => { delete global.Worker; });
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  const worker = graph.animator._layout._worker;
+  worker._deferResponses = true;
+  let completions = 0, terminated = 0;
+  worker.terminate = () => { terminated++; };
+  graph.loadData(makePayload(120, 119), { onLayoutDone: () => { completions++; } });
+  worker.onerror({ preventDefault() {} });
+  await settle(queue);
+  assert.notEqual(graph.animator._layout.isWorker, true);
+  assert.equal(graph.animator._layout._done, true);
+  assert.equal(Object.keys(graph.animator._layout.positions).length, 120);
+  assert.equal(completions, 1);
+  assert.ok(terminated > 0);
+});
+
+test("waiting for a worker response does not spin a rendering RAF loop", t => {
+  const queue = loadGraph();
+  installFakeWorker();
+  t.after(() => { delete global.Worker; });
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  graph.animator._layout._worker._deferResponses = true;
+  graph.loadData(makePayload(120, 119));
+  for (let i = 0; i < 5 && queue.length; i++) queue.shift()();
+  assert.equal(queue.length, 0);
+  assert.equal(graph.animator._running, false);
+  graph.animator._layout.invalidate();
+});
+
+test("browser visibility and SPA activity jointly control graph rendering", async () => {
+  const queue = loadGraph();
+  const events = {};
+  document.addEventListener = (name, callback) => { events[name] = callback; };
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  graph.loadData(makePayload(2, 1));
+  await settle(queue);
+  document.hidden = true;
+  events.visibilitychange();
+  graph.animator.wake();
+  assert.equal(graph.animator._running, false);
+  graph.setActive(false);
+  document.hidden = false;
+  events.visibilitychange();
+  assert.equal(graph.animator._running, false, "Visible browser must not wake an inactive SPA page");
+  graph.setActive(true);
+  assert.equal(graph.animator._running, true);
+  await settle(queue);
+});
+
+test("overlapping node and edge ids highlight only the hovered object type", async () => {
+  const queue = loadGraph();
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  graph.loadData(makePayload(2, 1));
+  await settle(queue);
+  graph.interaction._hoverId = 1;
+  graph.interaction._hoverType = "edge";
+  graph.animator.wake(); await settle(queue);
+  assert.equal(graph.renderer._drawnEdges[0].isHovered, true);
+  assert.equal(graph.renderer._drawnNodes.find(node => node.id === 1).isHovered, false);
+  graph.interaction._hoverType = "node";
+  graph.animator.wake(); await settle(queue);
+  assert.equal(graph.renderer._drawnEdges[0].isHovered, false);
+  assert.equal(graph.renderer._drawnNodes.find(node => node.id === 1).isHovered, true);
+});
+
+test("destroy disconnects observers, listeners and a pending layout worker", async t => {
+  const queue = loadGraph();
+  installFakeWorker();
+  t.after(() => { delete global.Worker; });
+  let disconnected = 0, removed = 0, terminated = 0;
+  global.ResizeObserver = global.MutationObserver = class {
+    observe() {} disconnect() { disconnected++; }
+  };
+  window.removeEventListener = document.removeEventListener = () => { removed++; };
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  const worker = graph.animator._layout._worker;
+  worker._deferResponses = true;
+  worker.terminate = () => { terminated++; };
+  graph.loadData(makePayload(40, 39));
+  graph.destroy();
+  await settle(queue);
+  assert.equal(graph._initialized, false);
+  assert.equal(graph.animator._running, false);
+  assert.equal(disconnected, 2);
+  assert.ok(removed >= 3);
+  assert.equal(terminated, 1);
+});
+
+test("a synchronous small graph invalidates an earlier inline progressive layout", async () => {
+  const queue = loadGraph();
+  const graph = window.Graph2D;
+  graph.init(makeContainer());
+  graph.loadData(makePayload(120, 119));
+  const previousGeneration = graph.animator._layoutGeneration;
+  let completions = 0;
+  graph.loadData(makePayload(2, 1), { onLayoutDone: () => { completions++; } });
+  assert.ok(graph.animator._layoutGeneration > previousGeneration);
+  await settle(queue);
+  assert.equal(completions, 1);
+  assert.equal(Object.keys(graph.animator._layout.positions).length, 2);
+});

@@ -1,0 +1,2310 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import io
+import json
+import math
+import os
+import random
+import re
+import shutil
+import tempfile
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from PIL import Image as PILImage
+
+from astrbot.api import logger
+from astrbot.api.message_components import Image
+
+from ..config import PACKS_DIR, PLUGIN_DATA_DIR, TEMP_DIR
+from ..utils import probability_hit
+from .auto_collect_index import AutoCollectImageIndex
+from .collection_analysis import (
+    COLLECTION_ANALYSIS_VERSION,
+    UNDERSTANDING_PROMPT_VERSION,
+    UNDERSTANDING_SYSTEM_PROMPT,
+    build_decision_request,
+    collection_decision_failure,
+    normalize_decision_answers,
+    parse_understanding,
+)
+from .decision import DecisionError
+from .packs.categories import is_safe_category_name
+from .packs.protocol import validate_pack_id
+from .packs.resolver import get_pack_paths, load_pack_category_mapping
+from .semantic.caption import (
+    CAPTION_ANALYSIS_PROMPT,
+    _structured_output_is_unsupported,
+    prepare_visual_inputs,
+)
+from .semantic.models import PROMPT_VERSION, REVIEW_CATEGORY
+from .semantic.storage import save_collected_image_semantic
+
+AUTO_COLLECT_INBOX_DIR = PLUGIN_DATA_DIR / "auto_collect_inbox"
+AUTO_COLLECT_INBOX_IMAGES_DIR = AUTO_COLLECT_INBOX_DIR / "images"
+AUTO_COLLECT_INBOX_METADATA_PATH = AUTO_COLLECT_INBOX_DIR / "metadata.json"
+AUTO_COLLECT_STATE_PATH = PLUGIN_DATA_DIR / "auto_collect_state.json"
+AUTO_COLLECT_TEMP_DIR = TEMP_DIR / "auto_collect"
+AUTO_COLLECT_SCHEMA_VERSION = 1
+AUTO_COLLECT_PROMPT_VERSION = "auto-collect-v2-review"
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_DECISION_CACHE_ITEMS = 2000
+MAX_OBSERVATIONS = 2000
+MAX_OBSERVATION_MESSAGE_IDS = 16
+OBSERVATION_TTL_SECONDS = 7 * 24 * 3600
+QUEUE_SIZE = 20
+_IMAGE_INDEX = AutoCollectImageIndex()
+
+FORMAT_EXTENSIONS = {
+    "JPEG": ".jpg",
+    "PNG": ".png",
+    "GIF": ".gif",
+    "WEBP": ".webp",
+}
+
+AUTO_COLLECT_SYSTEM_PROMPT = (
+    """你是聊天表情包审核与分类器。请判断图片是否适合保存为聊天表情包，并从给定分类中选择最合适的一项。
+普通照片、文档截图、聊天记录截图、商品图、二维码、收付款码、广告和没有明确聊天反应用途的图片默认不是表情包。
+表情包可以是静态图或动图，也可以包含文字。不得创造分类名，只能逐字返回给定分类之一；无法可靠分类时 category 留空。
+只返回 JSON，不要输出分析过程。"""
+    + CAPTION_ANALYSIS_PROMPT
+    + """
+请根据图片实际内容选择分类，而非将已有分类当作前提。caption 必须描述核心含义及聊天使用场景；tags 返回 6-10 个细粒度标签；visible_text 必须忠实记录图片文字。仍然仅返回上述审核 JSON 格式。"""
+)
+DEFAULT_CONTENT_REVIEW_PROMPT = (
+    "拒绝收录包含色情、血腥暴力、明显脏话辱骂或其他令人强烈不适内容的图片；"
+    "结合画面和可见文字判断。"
+)
+
+
+@dataclass(slots=True)
+class AutoCollectJob:
+    """保存单张图片自动收集请求的快照。
+
+    Args:
+        snapshot_path: 在消息事件结束前创建的插件自有图片快照路径。
+        target_pack_id: 最终接收图片的表情包 ID。
+        categories: 用于识别分类的运行时分类描述。
+        source_kind: 来源类型，值为 ``group`` 或 ``user``。
+        source_id: 原始群聊或个人用户 ID。
+        completion: 可选的最终处理结果 Future。
+    """
+
+    snapshot_path: Path
+    target_pack_id: str
+    categories: dict[str, str]
+    source_kind: str
+    source_id: str
+    digest: str = ""
+    completion: asyncio.Future[str] | None = None
+
+
+class AutoCollectManager:
+    """执行有界的后台视觉分类，并安全地收集图片。"""
+
+    def __init__(self, plugin: Any, config: dict[str, Any]):
+        """初始化运行时状态，但不启动后台任务。
+
+        Args:
+            plugin: MemeSender 插件实例。
+            config: 已规范化的自动收集配置。
+        """
+        self.plugin = plugin
+        self.enabled = bool(config.get("enabled", False))
+        self.judgment_backend = (
+            "decision"
+            if str(config.get("judgment_backend") or "vision").strip().casefold()
+            == "decision"
+            else "vision"
+        )
+        self.manual_review = bool(config.get("manual_review", True))
+        self.content_review_enabled = bool(config.get("content_review_enabled", False))
+        self.content_review_prompt = (
+            str(config.get("content_review_prompt") or "").strip()
+            or DEFAULT_CONTENT_REVIEW_PROMPT
+        )
+        self.auto_embedding = bool(config.get("auto_embedding", True))
+        self._embedding_tasks: dict[str, asyncio.Task] = {}
+        self._auto_accept_tasks: dict[str, asyncio.Task] = {}
+        self._pending_auto_accept: dict[str, set[str]] = {}
+        self._closing = False
+        self.pending_limit = max(1, int(config.get("pending_limit", 200) or 200))
+        self.counters: dict[str, int] = {}
+        self._inflight: set[str] = set()
+        self.vision_provider_id = str(config.get("vision_provider_id") or "").strip()
+        self.scope = {
+            str(value).strip()
+            for value in config.get("scope", [])
+            if str(value).strip()
+        }
+        self.target_pack_id = str(config.get("target_pack_id") or "").strip()
+        self.sampling_probability = max(
+            0, min(100, int(config.get("sampling_probability", 100) or 0))
+        )
+        self.cooldown_seconds = max(
+            0, min(3600, int(config.get("cooldown_seconds", 20) or 0))
+        )
+        self.daily_recognition_limit = max(
+            0, int(config.get("daily_recognition_limit", 100) or 0)
+        )
+        self.max_images_per_message = max(
+            1, min(10, int(config.get("max_images_per_message", 1) or 1))
+        )
+        self.min_meme_confidence = max(
+            0.0, min(1.0, float(config.get("min_meme_confidence", 0.85) or 0))
+        )
+        self.min_category_confidence = max(
+            0.0,
+            min(1.0, float(config.get("min_category_confidence", 0.65) or 0)),
+        )
+        self.queue: asyncio.Queue[AutoCollectJob] = asyncio.Queue(maxsize=QUEUE_SIZE)
+        self._worker_task: asyncio.Task | None = None
+        self._snapshot_tasks: set[asyncio.Task] = set()
+        self._ready = False
+        self._unavailable_reason = "disabled" if not self.enabled else "not_started"
+        self._cooldowns: dict[str, float] = {}
+        self._inbox_lock = asyncio.Lock()
+        self._state = self._load_json(
+            AUTO_COLLECT_STATE_PATH,
+            {"schema_version": AUTO_COLLECT_SCHEMA_VERSION, "decisions": {}},
+        )
+
+    @staticmethod
+    def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+        """加载 JSON 对象，失败时返回独立的默认值副本。
+
+        Args:
+            path: JSON 文件路径。
+            default: 加载失败时使用的默认映射。
+
+        Returns:
+            解析后的映射，或默认映射的副本。
+        """
+        try:
+            with path.open(encoding="utf-8") as file_obj:
+                value = json.load(file_obj)
+            return value if isinstance(value, dict) else dict(default)
+        except Exception:
+            return dict(default)
+
+    @staticmethod
+    def _save_json(path: Path, value: dict[str, Any]) -> None:
+        """以原子方式保存 JSON 对象。
+
+        Args:
+            path: 目标 JSON 文件路径。
+            value: 可序列化的映射。
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f"{path.suffix}.tmp")
+        with temporary.open("w", encoding="utf-8") as file_obj:
+            json.dump(value, file_obj, ensure_ascii=False, indent=2)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.replace(temporary, path)
+
+    def _decision_service_status(self) -> dict[str, Any]:
+        """返回当前使用方的本地决策服务就绪状态，并隐藏敏感信息。
+
+        Returns:
+            配置状态，不发起网络请求。
+        """
+        if self.judgment_backend != "decision":
+            return {"ready": False, "reason": "not_used", "model": ""}
+        client = getattr(self.plugin, "decision_client", None)
+        if client is None:
+            return {
+                "ready": False,
+                "reason": "decision_not_configured",
+                "model": "",
+            }
+        status = getattr(client, "status", None)
+        if callable(status):
+            try:
+                value = status()
+                if isinstance(value, dict):
+                    return value
+            except Exception:
+                pass
+        return {
+            "ready": bool(getattr(client, "ready", False)),
+            "reason": (
+                "ready"
+                if bool(getattr(client, "ready", False))
+                else "decision_not_ready"
+            ),
+            "model": str(getattr(client, "model", "") or ""),
+        }
+
+    async def start(
+        self, *, defer_missing_provider: bool = False, manual: bool = False
+    ) -> None:
+        """校验两个必需后端，并启动一个后台工作任务。
+
+        Args:
+            defer_missing_provider: 在插件初始化期间跳过尚未注册的提供方，
+                核心加载完成后的钩子会再次尝试。
+            manual: 即使禁用被动收集，也允许按需启动。
+        """
+        if (not self.enabled and not manual) or self._worker_task is not None:
+            return
+        if not self.vision_provider_id:
+            self._unavailable_reason = "missing_vision_provider"
+            logger.warning("[meme_manager] 已启用自动收集，但尚未选择视觉模型")
+            return
+        if (
+            defer_missing_provider
+            and self.vision_provider_id
+            not in self.plugin.context.provider_manager.inst_map
+        ):
+            self._unavailable_reason = "vision_provider_pending"
+            logger.info(
+                "[meme_manager] 等待 AstrBot 加载视觉提供方：%s",
+                self.vision_provider_id,
+            )
+            return
+        provider = self.plugin.context.get_provider_by_id(self.vision_provider_id)
+        if provider is None:
+            self._unavailable_reason = "vision_provider_unavailable"
+            logger.info(
+                "[meme_manager] 自动收集未启动，视觉提供方不可用：%s",
+                self.vision_provider_id,
+            )
+            return
+        provider_config = getattr(provider, "provider_config", {})
+        modalities = (
+            provider_config.get("modalities")
+            if isinstance(provider_config, dict)
+            else None
+        )
+        if (
+            isinstance(modalities, list)
+            and modalities
+            and "image" not in {str(item).strip().lower() for item in modalities}
+        ):
+            self._unavailable_reason = "vision_provider_not_visual"
+            logger.warning(
+                "[meme_manager] 自动收集视觉模型不支持图片输入：%s",
+                self.vision_provider_id,
+            )
+            return
+        if self.judgment_backend == "decision":
+            decision_status = self._decision_service_status()
+            if not bool(decision_status.get("ready")):
+                self._unavailable_reason = str(
+                    decision_status.get("reason") or "decision_not_ready"
+                )
+                logger.warning(
+                    "[meme_manager] 收集决策服务尚未就绪：%s",
+                    self._unavailable_reason,
+                )
+                return
+        self._closing = False
+        self._ready = True
+        self._unavailable_reason = "ready"
+        self._worker_task = asyncio.create_task(
+            self._worker(), name="meme_manager_auto_collect"
+        )
+        logger.info(
+            "[meme_manager] 收集已启动：视觉模型=%s 判断后端=%s",
+            self.vision_provider_id,
+            self.judgment_backend,
+        )
+
+    async def close(self) -> None:
+        """停止后台任务，并等待取消清理完成。"""
+        self._ready = False
+        self._closing = True
+        self._unavailable_reason = "closed"
+        snapshot_tasks = tuple(self._snapshot_tasks)
+        for snapshot_task in snapshot_tasks:
+            snapshot_task.cancel()
+        if snapshot_tasks:
+            await asyncio.gather(*snapshot_tasks, return_exceptions=True)
+        self._snapshot_tasks.clear()
+        task = self._worker_task
+        self._worker_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        background_tasks = (
+            *self._embedding_tasks.values(),
+            *self._auto_accept_tasks.values(),
+        )
+        for background_task in background_tasks:
+            background_task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        self._embedding_tasks.clear()
+        self._auto_accept_tasks.clear()
+        self._pending_auto_accept.clear()
+        while True:
+            try:
+                job = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._inflight.discard(f"{job.target_pack_id}:{job.digest}")
+            if job.completion is not None and not job.completion.done():
+                job.completion.cancel()
+            job.snapshot_path.unlink(missing_ok=True)
+            self.queue.task_done()
+
+    def _source_allowed(self, event: Any) -> tuple[bool, str, str]:
+        """检查消息是否匹配配置的群聊或个人来源范围。
+
+        Args:
+            event: 当前 AstrBot 消息事件。
+
+        Returns:
+            是否允许该来源、来源类型和来源 ID 组成的元组。
+        """
+        private = bool(event.is_private_chat())
+        source_kind = "user" if private else "group"
+        source_id = str(
+            event.get_sender_id() if private else event.get_group_id()
+        ).strip()
+        if not source_id:
+            source_id = str(event.get_session_id() or "").strip()
+        if not self.scope:
+            return True, source_kind, source_id
+        candidates = {
+            source_id,
+            f"{source_kind}:{source_id}",
+            str(getattr(event, "unified_msg_origin", "") or "").strip(),
+        }
+        return bool(self.scope.intersection(candidates)), source_kind, source_id
+
+    async def prepare_manual(self, event: Any) -> tuple[str, dict[str, str]]:
+        """校验收集后端，并解析一个可写入的目标表情包。
+
+        Args:
+            event: 用于解析主表情包的命令事件。
+
+        Returns:
+            目标表情包 ID 及其自身的分类映射。
+
+        Raises:
+            ValueError: 后端或目标表情包不可用。
+        """
+        await self.start(manual=True)
+        if not self._ready:
+            raise ValueError(
+                "收集服务尚未就绪，请在设置中心 → 自动收集配置支持图片输入的模型"
+                f"及所选判断后端（{self._unavailable_reason}）。"
+            )
+        context = (
+            {}
+            if self.target_pack_id
+            else self.plugin._resolve_runtime_pack_context(event=event)
+        )
+        pack_id = validate_pack_id(
+            self.target_pack_id or str(context.get("pack_id") or ""), "收集目标表情包"
+        )
+        if not (PACKS_DIR / pack_id).is_dir():
+            raise ValueError("收集目标表情包不存在，请检查使用规则或收集目标设置。")
+        categories = await asyncio.to_thread(load_pack_category_mapping, pack_id)
+        if not categories:
+            raise ValueError("收集目标表情包没有分类，请先添加分类。")
+        return pack_id, categories
+
+    async def submit_manual(
+        self, event: Any, images: list[Image], pack_id: str, categories: dict[str, str]
+    ) -> list[asyncio.Future[str]]:
+        """在事件所属文件被释放前，为显式提交的图片创建快照。
+
+        Args:
+            event: 来源命令或上传事件。
+            images: 直接附带的图片组件，不递归查找引用消息。
+            pack_id: 收集开始时固定的目标表情包。
+            categories: 目标表情包的分类。
+
+        Returns:
+            分别报告每张图片实际处理结果的 Future。
+        """
+        _, source_kind, source_id = self._source_allowed(event)
+        completions = []
+        seen: set[str] = set()
+        for image in images:
+            completion = asyncio.get_running_loop().create_future()
+            completions.append(completion)
+            await self._snapshot_and_enqueue(
+                image,
+                pack_id,
+                categories,
+                source_kind,
+                source_id,
+                manual=True,
+                completion=completion,
+                message_seen=seen,
+            )
+        return completions
+
+    async def submit(self, event: Any) -> bool:
+        """过滤消息，并将符合条件的直接图片按单条消息上限加入队列。
+
+        Args:
+            event: 当前 AstrBot 消息事件。
+
+        Returns:
+            成功加入任务队列时返回 True。
+        """
+        if not self.enabled:
+            return False
+        images = [
+            component
+            for component in event.message_obj.message
+            if isinstance(component, Image)
+        ]
+        if not images:
+            return False
+        allowed, source_kind, source_id = self._source_allowed(event)
+        if not self._ready:
+            self.counters["not_ready"] = self.counters.get("not_ready", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：后台任务尚未就绪，来源：%s:%s",
+                source_kind,
+                source_id,
+            )
+            return False
+        if not allowed:
+            self.counters["scope"] = self.counters.get("scope", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：消息来源不在收集范围内，来源：%s:%s",
+                source_kind,
+                source_id,
+            )
+            return False
+        candidates = [(image, False) for image in images]
+        raw_message = getattr(event.message_obj, "raw_message", None)
+        if isinstance(raw_message, Mapping):
+            raw_segments = raw_message.get("message")
+            if isinstance(raw_segments, list):
+                raw_image_data = [
+                    segment.get("data")
+                    for segment in raw_segments
+                    if isinstance(segment, Mapping)
+                    and segment.get("type") == "image"
+                    and isinstance(segment.get("data"), Mapping)
+                ]
+                if len(raw_image_data) == len(images):
+                    # NapCat 仅在原始 OneBot 消息段中提供图片分类。
+                    # AstrBot 的 Image 组件会丢弃这些扩展字段，因此按位置对应图片。
+                    marked_images = []
+                    uncertain_images = []
+                    for image, data in zip(images, raw_image_data, strict=True):
+                        summary = str(data.get("summary") or "").strip()
+                        explicit_summary = summary in {
+                            "动画表情",
+                            "[动画表情]",
+                            "[表情]",
+                        }
+                        try:
+                            image_sub_type = int(data.get("sub_type"))
+                        except (TypeError, ValueError):
+                            image_sub_type = None
+                        if (
+                            image_sub_type == 1
+                            or bool(data.get("emoji_id"))
+                            or bool(data.get("emoji_package_id"))
+                            or explicit_summary
+                        ):
+                            marked_images.append((image, True))
+                        else:
+                            uncertain_images.append((image, False))
+                    candidates = marked_images + uncertain_images
+        if self.queue.qsize() + len(self._snapshot_tasks) >= QUEUE_SIZE:
+            self.counters["queue_full"] = self.counters.get("queue_full", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：待处理队列已满，来源：%s:%s",
+                source_kind,
+                source_id,
+            )
+            return False
+
+        try:
+            if self.target_pack_id:
+                target_pack_id = validate_pack_id(
+                    self.target_pack_id, "自动收集目标表情包"
+                )
+                if not (PACKS_DIR / target_pack_id).is_dir():
+                    logger.warning(
+                        "[meme_manager] 自动收集目标表情包不存在：%s",
+                        target_pack_id,
+                    )
+                    return False
+                categories = load_pack_category_mapping(target_pack_id)
+            else:
+                context = self.plugin._resolve_runtime_pack_context(event=event)
+                target_pack_id = str(context.get("pack_id") or "").strip()
+                categories = dict(context.get("category_mapping") or {})
+        except Exception as exc:
+            logger.warning("[meme_manager] 解析自动收集目标失败：%s", exc)
+            return False
+        if not target_pack_id or not categories:
+            self.counters["no_categories"] = self.counters.get("no_categories", 0) + 1
+            logger.warning(
+                "[meme_manager] 自动收集跳过图片：目标表情包没有可用分类，表情包：%s",
+                target_pack_id,
+            )
+            return False
+
+        if len(candidates) > self.max_images_per_message:
+            self.counters["message_limit"] = self.counters.get("message_limit", 0) + (
+                len(candidates) - self.max_images_per_message
+            )
+            logger.info(
+                "[meme_manager] 自动收集单条消息图片上限为 %s 张，跳过其余 %s 张，来源：%s:%s",
+                self.max_images_per_message,
+                len(candidates) - self.max_images_per_message,
+                source_kind,
+                source_id,
+            )
+        selected_images = candidates[: self.max_images_per_message]
+        message_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
+        if not message_id and isinstance(raw_message, Mapping):
+            message_id = str(raw_message.get("message_id") or "").strip()
+        origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        origin = origin or f"{source_kind}:{source_id}"
+        message_key = f"{origin}:{message_id}" if message_id else ""
+        snapshot = self._snapshot_message_images(
+            selected_images,
+            target_pack_id,
+            categories,
+            source_kind,
+            source_id,
+            message_key,
+        )
+        if any(
+            str(image.url or image.file or "").startswith(("https://", "http://"))
+            for image, _ in selected_images
+        ):
+            task = asyncio.create_task(
+                snapshot, name="meme_manager_auto_collect_snapshot"
+            )
+            self._snapshot_tasks.add(task)
+            task.add_done_callback(self._snapshot_tasks.discard)
+            return True
+        return await snapshot
+
+    async def _snapshot_message_images(
+        self,
+        images: list[tuple[Image, bool]],
+        target_pack_id: str,
+        categories: dict[str, str],
+        source_kind: str,
+        source_id: str,
+        message_key: str,
+    ) -> bool:
+        """依次提交同一消息的候选图片，让来源冷却只拦截后续消息。
+
+        Args:
+            images: 平台标记的图片优先，其余按消息顺序排列的候选图片。
+            target_pack_id: 接收候选图片的表情包 ID。
+            categories: 目标表情包的分类描述。
+            source_kind: 群聊或个人消息来源类型。
+            source_id: 用于冷却检查的来源 ID。
+            message_key: 用于排除平台重复投递的消息标识。
+
+        Returns:
+            至少有一张图片进入识别队列时返回 True。
+        """
+        queued = False
+        message_seen: set[str] = set()
+        for image, marked in images:
+            accepted = await self._snapshot_and_enqueue(
+                image,
+                target_pack_id,
+                categories,
+                source_kind,
+                source_id,
+                same_message=queued,
+                marked=marked,
+                message_key=message_key,
+                message_seen=message_seen,
+            )
+            queued = queued or accepted
+        return queued
+
+    def _sample_observation(self, record_id: str, message_key: str) -> bool:
+        """记录图片在不同消息中的出现次数，并逐次提高识别概率。
+
+        Args:
+            record_id: 目标表情包与图片摘要组成的键。
+            message_key: 有值时用于排除同一平台消息的重复投递。
+
+        Returns:
+            图片已命中采样或此前已经达到处理门槛时返回 True。
+        """
+        now = time.time()
+        observations = self._state.setdefault("observations", {})
+        if not isinstance(observations, dict):
+            observations = {}
+            self._state["observations"] = observations
+        for key, item in list(observations.items()):
+            last_seen = item.get("last_seen") if isinstance(item, dict) else None
+            if (
+                not isinstance(last_seen, (int, float))
+                or now - last_seen > OBSERVATION_TTL_SECONDS
+            ):
+                del observations[key]
+        item = observations.get(record_id)
+        if not isinstance(item, dict):
+            item = {"count": 0, "last_seen": now, "message_ids": [], "triggered": False}
+            observations[record_id] = item
+        message_ids = item.get("message_ids")
+        if not isinstance(message_ids, list):
+            message_ids = []
+        if message_key and message_key in message_ids:
+            self.counters["redelivered"] = self.counters.get("redelivered", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：平台重复投递同一消息，图片摘要：%s",
+                record_id.rsplit(":", 1)[-1][:12],
+            )
+            return False
+        if message_key:
+            message_ids.append(message_key)
+        item["message_ids"] = message_ids[-MAX_OBSERVATION_MESSAGE_IDS:]
+        count = item.get("count")
+        item["count"] = min(8, max(0, count if isinstance(count, int) else 0) + 1)
+        item["last_seen"] = now
+        digest = record_id.rsplit(":", 1)[-1]
+        if item.get("triggered"):
+            logger.info(
+                "[meme_manager] 自动收集图片此前已命中采样，继续尝试处理；第 %s 次，图片摘要：%s",
+                item["count"],
+                digest[:12],
+            )
+        elif item["count"] == 1:
+            self.counters["first_observation"] = (
+                self.counters.get("first_observation", 0) + 1
+            )
+            logger.info(
+                "[meme_manager] 自动收集首次见到图片：已记录，等待再次出现；图片摘要：%s",
+                digest[:12],
+            )
+        else:
+            probability = (
+                1.0 if item["count"] >= 8 else 1.0 - 0.55 * 0.9 ** (item["count"] - 2)
+            )
+            if item["count"] >= 8 or random.random() < probability:
+                item["triggered"] = True
+                self.counters["progressive_hit"] = (
+                    self.counters.get("progressive_hit", 0) + 1
+                )
+                logger.info(
+                    "[meme_manager] 自动收集重复图片命中采样：第 %s 次，本次概率 %.1f%%，图片摘要：%s",
+                    item["count"],
+                    probability * 100,
+                    digest[:12],
+                )
+            else:
+                self.counters["progressive_miss"] = (
+                    self.counters.get("progressive_miss", 0) + 1
+                )
+                logger.info(
+                    "[meme_manager] 自动收集重复图片未命中采样：第 %s 次，本次概率 %.1f%%，图片摘要：%s",
+                    item["count"],
+                    probability * 100,
+                    digest[:12],
+                )
+        if len(observations) > MAX_OBSERVATIONS:
+            oldest = sorted(
+                observations, key=lambda key: observations[key]["last_seen"]
+            )
+            for key in oldest[: len(observations) - MAX_OBSERVATIONS]:
+                del observations[key]
+        self._save_json(AUTO_COLLECT_STATE_PATH, self._state)
+        return bool(item.get("triggered"))
+
+    async def _snapshot_and_enqueue(
+        self,
+        image: Image,
+        target_pack_id: str,
+        categories: dict[str, str],
+        source_kind: str,
+        source_id: str,
+        *,
+        same_message: bool = False,
+        marked: bool = True,
+        message_key: str = "",
+        message_seen: set[str] | None = None,
+        manual: bool = False,
+        completion: asyncio.Future[str] | None = None,
+    ) -> bool:
+        """先为候选图片创建快照并预留摘要，再检查冷却时间。
+
+        Args:
+            image: 与消息事件独立的候选图片组件。
+            target_pack_id: 接收候选图片的表情包 ID。
+            categories: 目标表情包的分类描述。
+            source_kind: 群聊或个人消息来源类型。
+            source_id: 用于冷却检查的来源 ID。
+            same_message: 同一消息已有图片入队时跳过来源冷却。
+            marked: 平台是否明确将图片标为表情。
+            message_key: 用于排除平台重复投递的消息标识。
+            message_seen: 同一消息已经处理过的图片摘要。
+            manual: 显式提交时跳过被动采样与冷却限制。
+            completion: 可选的接收实际处理结果的 Future。
+
+        Returns:
+            快照是否成功进入识别队列。
+        """
+        snapshot_path: Path | None = None
+        copy_task: asyncio.Task | None = None
+        record_id: str | None = None
+        reserved = False
+        queued = False
+        outcome = "failed"
+        try:
+            local_path = Path(
+                await asyncio.wait_for(image.convert_to_file_path(), timeout=30)
+            )
+            file_size = (await asyncio.to_thread(local_path.stat)).st_size
+            if file_size > MAX_IMAGE_BYTES:
+                self.counters["snapshot_failed"] = (
+                    self.counters.get("snapshot_failed", 0) + 1
+                )
+                logger.warning("[meme_manager] 自动收集跳过图片：文件超过 20 MiB 限制")
+                return False
+            AUTO_COLLECT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            snapshot_file = tempfile.NamedTemporaryFile(
+                prefix="queued_",
+                suffix=local_path.suffix,
+                dir=AUTO_COLLECT_TEMP_DIR,
+                delete=False,
+            )
+            snapshot_path = Path(snapshot_file.name)
+            snapshot_file.close()
+            copy_task = asyncio.create_task(
+                asyncio.to_thread(shutil.copyfile, local_path, snapshot_path)
+            )
+            # 取消线程任务不会停止复制，删除快照前必须等待复制结束。
+            await asyncio.shield(copy_task)
+            if (await asyncio.to_thread(snapshot_path.stat)).st_size > MAX_IMAGE_BYTES:
+                self.counters["snapshot_failed"] = (
+                    self.counters.get("snapshot_failed", 0) + 1
+                )
+                logger.warning("[meme_manager] 自动收集跳过图片：快照超过 20 MiB 限制")
+                return False
+            copy_task = asyncio.create_task(asyncio.to_thread(snapshot_path.read_bytes))
+            digest = hashlib.sha256(await asyncio.shield(copy_task)).hexdigest()
+            record_id = f"{target_pack_id}:{digest}"
+            if message_seen is not None:
+                if record_id in message_seen:
+                    outcome = "duplicate"
+                    self.counters["same_message_duplicate"] = (
+                        self.counters.get("same_message_duplicate", 0) + 1
+                    )
+                    logger.info(
+                        "[meme_manager] 自动收集跳过图片：同一消息已有相同图片，表情包：%s，图片摘要：%s",
+                        target_pack_id,
+                        digest[:12],
+                    )
+                    return False
+                message_seen.add(record_id)
+            pack_duplicate = await asyncio.to_thread(
+                self._pack_contains_digest, target_pack_id, digest
+            )
+            metadata = self._load_json(AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}})
+            if (
+                pack_duplicate
+                or record_id in self._inflight
+                or record_id in metadata.get("items", {})
+                or digest in self._state.get("rejected", {}).get(target_pack_id, [])
+            ):
+                outcome = (
+                    "rejected"
+                    if digest in self._state.get("rejected", {}).get(target_pack_id, [])
+                    else "duplicate"
+                )
+                self.counters["duplicate_or_rejected"] = (
+                    self.counters.get("duplicate_or_rejected", 0) + 1
+                )
+                if pack_duplicate:
+                    reason = "表情包中已有相同图片"
+                elif record_id in self._inflight:
+                    reason = "相同图片正在处理"
+                elif record_id in metadata.get("items", {}):
+                    reason = "相同图片已在待审箱"
+                else:
+                    reason = "图片已在拒绝名单"
+                logger.info(
+                    "[meme_manager] 自动收集跳过图片：%s，表情包：%s，图片摘要：%s",
+                    reason,
+                    target_pack_id,
+                    digest[:12],
+                )
+                return False
+            if not manual and marked:
+                if not probability_hit(self.sampling_probability):
+                    self.counters["sampling"] = self.counters.get("sampling", 0) + 1
+                    logger.info(
+                        "[meme_manager] 自动收集跳过图片：平台标记的表情未命中抽样概率，来源：%s:%s，图片摘要：%s",
+                        source_kind,
+                        source_id,
+                        digest[:12],
+                    )
+                    return False
+            elif not manual:
+                if self._cached_model_rejection(digest, target_pack_id, categories):
+                    self.counters["model_rejected_cached"] = (
+                        self.counters.get("model_rejected_cached", 0) + 1
+                    )
+                    logger.info(
+                        "[meme_manager] 命中缓存的拒收记录：表情包=%s 摘要=%s",
+                        target_pack_id,
+                        digest[:12],
+                    )
+                    return False
+                if not self._sample_observation(record_id, message_key):
+                    return False
+            if not self._ready:
+                self.counters["not_ready"] = self.counters.get("not_ready", 0) + 1
+                logger.info(
+                    "[meme_manager] 自动收集跳过图片：快照完成后后台任务已停止，表情包：%s，图片摘要：%s",
+                    target_pack_id,
+                    digest[:12],
+                )
+                return False
+            cooldown_key = f"{source_kind}:{source_id}"
+            now = time.monotonic()
+            if (
+                not manual
+                and not same_message
+                and now - self._cooldowns.get(cooldown_key, 0.0) < self.cooldown_seconds
+            ):
+                self.counters["cooldown"] = self.counters.get("cooldown", 0) + 1
+                logger.info(
+                    "[meme_manager] 自动收集跳过图片：来源仍在冷却时间内，来源：%s:%s，表情包：%s",
+                    source_kind,
+                    source_id,
+                    target_pack_id,
+                )
+                return False
+            self._inflight.add(record_id)
+            reserved = True
+            self.queue.put_nowait(
+                AutoCollectJob(
+                    snapshot_path=snapshot_path,
+                    target_pack_id=target_pack_id,
+                    categories=categories,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    digest=digest,
+                    completion=completion,
+                )
+            )
+            queued = True
+            if not manual:
+                self._cooldowns[cooldown_key] = now
+            return True
+        except asyncio.CancelledError:
+            if copy_task is not None and not copy_task.done():
+                await asyncio.gather(copy_task, return_exceptions=True)
+            raise
+        except asyncio.QueueFull:
+            outcome = "queue_full"
+            self.counters["queue_full"] = self.counters.get("queue_full", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：入队时队列已满，表情包：%s",
+                target_pack_id,
+            )
+            return False
+        except Exception as exc:
+            self.counters["snapshot_failed"] = (
+                self.counters.get("snapshot_failed", 0) + 1
+            )
+            logger.warning("[meme_manager] 自动收集图片快照失败：%s", exc)
+            return False
+        finally:
+            if not queued:
+                if completion is not None and not completion.done():
+                    completion.set_result(outcome)
+                if reserved and record_id is not None:
+                    self._inflight.discard(record_id)
+                if snapshot_path is not None:
+                    snapshot_path.unlink(missing_ok=True)
+
+    async def _worker(self) -> None:
+        """串行处理队列中的图片，以限制视觉模型负载。"""
+        while True:
+            job = await self.queue.get()
+            outcome = "failed"
+            try:
+                outcome = await self._process_job(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.counters["failed"] = self.counters.get("failed", 0) + 1
+                logger.error(
+                    "[meme_manager] 自动收集处理图片失败：%s",
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                if job.completion is not None and not job.completion.done():
+                    if self._closing:
+                        job.completion.cancel()
+                    else:
+                        job.completion.set_result(outcome)
+                self._inflight.discard(f"{job.target_pack_id}:{job.digest}")
+                job.snapshot_path.unlink(missing_ok=True)
+                self.queue.task_done()
+
+    @staticmethod
+    def _validate_image(content: bytes) -> str:
+        """校验图片的实际内容，并返回可信的扩展名。
+
+        Args:
+            content: 原始图片字节。
+
+        Returns:
+            可信的小写文件扩展名。
+
+        Raises:
+            ValueError: 图片为空、过大、格式不受支持或内容不安全。
+        """
+        if not content:
+            raise ValueError("图片内容为空")
+        if len(content) > MAX_IMAGE_BYTES:
+            raise ValueError("图片超过 20 MiB 限制")
+        try:
+            with PILImage.open(io.BytesIO(content)) as image:
+                image_format = str(image.format or "").upper()
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                    raise ValueError("图片尺寸无效或过大")
+                image.verify()
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"图片格式不受支持或文件已损坏：{exc}") from exc
+        extension = FORMAT_EXTENSIONS.get(image_format)
+        if not extension:
+            raise ValueError(f"不支持的图片格式：{image_format or '未知'}")
+        return extension
+
+    def _daily_call_available(self) -> bool:
+        """在配额可用时占用一次当天的识图次数。
+
+        Returns:
+            视觉识别请求可以继续时返回 True。
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        if str(self._state.get("recognition_date") or "") != today:
+            self._state["recognition_date"] = today
+            self._state["recognition_count"] = 0
+        count = max(0, int(self._state.get("recognition_count", 0) or 0))
+        if self.daily_recognition_limit and count >= self.daily_recognition_limit:
+            return False
+        self._state["recognition_count"] = count + 1
+        self._save_json(AUTO_COLLECT_STATE_PATH, self._state)
+        return True
+
+    def _decision_call_started(self) -> None:
+        self.counters["decision_attempts"] = (
+            self.counters.get("decision_attempts", 0) + 1
+        )
+        self._state["decision_count"] = (
+            max(0, int(self._state.get("decision_count", 0) or 0)) + 1
+        )
+        self._save_json(AUTO_COLLECT_STATE_PATH, self._state)
+
+    def _vision_config_signature(self) -> str:
+        provider = (
+            self.plugin.context.get_provider_by_id(self.vision_provider_id)
+            if hasattr(self.plugin, "context")
+            else None
+        )
+        provider_config = getattr(provider, "provider_config", {})
+        return hashlib.sha256(
+            json.dumps(provider_config, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+
+    def _understanding_cache_key(self, digest: str) -> str:
+        return (
+            f"{UNDERSTANDING_PROMPT_VERSION}:{self.vision_provider_id}:"
+            f"{self._vision_config_signature()}:{digest}"
+        )
+
+    def _decision_service_signature(self) -> str:
+        client = getattr(self.plugin, "decision_client", None)
+        public_config = {
+            key: getattr(client, key, "")
+            for key in ("base_url", "model", "timeout", "max_concurrency")
+        }
+        return hashlib.sha256(
+            json.dumps(public_config, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+
+    def _decision_cache_key(
+        self,
+        target_pack_id: str,
+        categories: dict[str, str],
+        understanding: dict[str, Any],
+    ) -> str:
+        """为稳定证据、目标分类和路由规则生成指纹。
+
+        Args:
+            target_pack_id: 候选图片所属的表情包。
+            categories: 当前分类目录。
+            understanding: 视觉证据，忽略观测时间戳。
+
+        Returns:
+            分析或接收规则变化时随之改变的稳定键。
+        """
+        understanding_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in understanding.items()
+                    if key != "checked_at"
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        rules = {
+            "manual_review": self.manual_review,
+            "min_meme_confidence": self.min_meme_confidence,
+            "min_category_confidence": self.min_category_confidence,
+            "content_review_enabled": self.content_review_enabled,
+            "content_review_prompt": (
+                self.content_review_prompt if self.content_review_enabled else ""
+            ),
+        }
+        task_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "categories": categories,
+                    "rules": rules,
+                    "service": self._decision_service_signature(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return (
+            f"{COLLECTION_ANALYSIS_VERSION}:{target_pack_id}:{task_fingerprint}:"
+            f"{understanding_hash}"
+        )
+
+    def _cache_key(
+        self, digest: str, target_pack_id: str, categories: dict[str, str]
+    ) -> str:
+        """生成会随目标分类变化的缓存键。
+
+        Args:
+            digest: 图片的 SHA-256 摘要。
+            target_pack_id: 分类目标表情包 ID。
+            categories: 当前分类描述。
+
+        Returns:
+            稳定的识别结果缓存键。
+        """
+        catalog = json.dumps(categories, ensure_ascii=False, sort_keys=True)
+        catalog_hash = hashlib.sha256(catalog.encode("utf-8")).hexdigest()[:16]
+        if self.content_review_enabled:
+            review_hash = hashlib.sha256(
+                self.content_review_prompt.encode("utf-8")
+            ).hexdigest()[:16]
+            catalog_hash += f":content-review:{review_hash}"
+        signature = self._vision_config_signature()
+        return f"{AUTO_COLLECT_PROMPT_VERSION}:{PROMPT_VERSION}:{self.vision_provider_id}:{signature}:{target_pack_id}:{catalog_hash}:{digest}"
+
+    def _remember_decision(self, key: str, decision: dict[str, Any]) -> None:
+        """保存一次成功的分类结果，并限制历史记录数量。
+
+        Args:
+            key: 识别结果缓存键。
+            decision: 已规范化的分类结果。
+        """
+        decisions = self._state.setdefault("decisions", {})
+        if not isinstance(decisions, dict):
+            decisions = {}
+            self._state["decisions"] = decisions
+        decisions[key] = {
+            **decision,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        while len(decisions) > MAX_DECISION_CACHE_ITEMS:
+            decisions.pop(next(iter(decisions)))
+        self._save_json(AUTO_COLLECT_STATE_PATH, self._state)
+
+    def _remember_understanding(self, key: str, understanding: dict[str, Any]) -> None:
+        understandings = self._state.setdefault("understandings", {})
+        if not isinstance(understandings, dict):
+            understandings = {}
+            self._state["understandings"] = understandings
+        understandings[key] = {
+            **understanding,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        while len(understandings) > MAX_DECISION_CACHE_ITEMS:
+            understandings.pop(next(iter(understandings)))
+        self._save_json(AUTO_COLLECT_STATE_PATH, self._state)
+
+    @staticmethod
+    def _explicit_decision_rejection(decision: Any) -> bool:
+        return bool(
+            isinstance(decision, dict)
+            and decision.get("decision_status") == "completed"
+            and not decision.get("review_required")
+            and decision.get("rejection_reason")
+            in {"not_meme", "content_rule_rejected"}
+        )
+
+    def _cached_model_rejection(
+        self, digest: str, target_pack_id: str, categories: dict[str, str]
+    ) -> bool:
+        decisions = self._state.get("decisions", {})
+        if not isinstance(decisions, dict):
+            return False
+        if self.judgment_backend == "vision":
+            decision = decisions.get(
+                self._cache_key(digest, target_pack_id, categories)
+            )
+            return bool(
+                isinstance(decision, dict)
+                and (
+                    not bool(decision.get("is_meme"))
+                    or float(decision.get("meme_confidence", 0) or 0)
+                    < self.min_meme_confidence
+                )
+            )
+        understandings = self._state.get("understandings", {})
+        understanding = (
+            understandings.get(self._understanding_cache_key(digest))
+            if isinstance(understandings, dict)
+            else None
+        )
+        if not isinstance(understanding, dict):
+            return False
+        decision = decisions.get(
+            self._decision_cache_key(target_pack_id, categories, understanding)
+        )
+        return self._explicit_decision_rejection(decision)
+
+    async def _classify(
+        self,
+        content: bytes,
+        extension: str,
+        categories: dict[str, str],
+    ) -> dict[str, Any]:
+        """调用已配置的视觉模型，并规范化其 JSON 结果。
+
+        Args:
+            content: 已通过校验的图片字节。
+            extension: 可信的图片扩展名。
+            categories: 允许使用的分类及其描述。
+
+        Returns:
+            已规范化的分类结果。
+        """
+        AUTO_COLLECT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        source_file = tempfile.NamedTemporaryFile(
+            prefix="incoming_",
+            suffix=extension,
+            dir=AUTO_COLLECT_TEMP_DIR,
+            delete=False,
+        )
+        try:
+            source_file.write(content)
+            source_file.close()
+            visual_paths, frame_paths = prepare_visual_inputs(source_file.name)
+            prompt = (
+                "可选分类及用途如下：\n"
+                + json.dumps(categories, ensure_ascii=False, indent=2)
+                + "\n请返回："
+                + '{"is_meme":true,"meme_confidence":0.0,"category":"",'
+                + '"category_confidence":0.0,"reason":"",'
+                + '"caption":"","tags":[],"visible_text":""}'
+            )
+            request_data = {
+                "chat_provider_id": self.vision_provider_id,
+                "prompt": prompt,
+                "image_urls": visual_paths,
+                "system_prompt": AUTO_COLLECT_SYSTEM_PROMPT,
+                "temperature": 0,
+                "max_tokens": 1400,
+                "response_format": {"type": "json_object"},
+            }
+            if self.content_review_enabled:
+                request_data["system_prompt"] += (
+                    "\n\n额外的自动收集内容审核要求：\n"
+                    + self.content_review_prompt
+                    + "\n不符合要求时，返回 is_meme=false、meme_confidence=0，并在 reason 中简述拒绝原因；"
+                    "符合要求时继续原有识别、分类和描述。保持原有 JSON 字段及格式。"
+                )
+            try:
+                self.counters["vision_requests"] = (
+                    self.counters.get("vision_requests", 0) + 1
+                )
+                response = await self.plugin.context.llm_generate(**request_data)
+            except Exception as exc:
+                if not _structured_output_is_unsupported(exc):
+                    raise
+                request_data.pop("response_format", None)
+                self.counters["vision_requests"] = (
+                    self.counters.get("vision_requests", 0) + 1
+                )
+                response = await self.plugin.context.llm_generate(**request_data)
+            finally:
+                for frame_path in frame_paths:
+                    Path(frame_path).unlink(missing_ok=True)
+        finally:
+            source_file.close()
+            Path(source_file.name).unlink(missing_ok=True)
+
+        raw_text = str(getattr(response, "completion_text", "") or "").strip()
+        try:
+            payload = json.loads(raw_text)
+        except (TypeError, ValueError):
+            match = re.search(r"\{[\s\S]*\}", raw_text)
+            if not match:
+                raise ValueError("视觉模型未返回 JSON 对象")
+            payload = json.loads(match.group(0))
+        if not isinstance(payload, dict):
+            raise ValueError("视觉模型结果必须是 JSON 对象")
+
+        raw_is_meme = payload.get("is_meme", False)
+        is_meme = (
+            raw_is_meme
+            if isinstance(raw_is_meme, bool)
+            else str(raw_is_meme).strip().lower() in {"true", "1", "yes"}
+        )
+        confidences = {}
+        for key in ("meme_confidence", "category_confidence"):
+            try:
+                value = float(payload.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            confidences[key] = (
+                max(0.0, min(1.0, value)) if math.isfinite(value) else 0.0
+            )
+        meme_confidence = confidences["meme_confidence"]
+        category_confidence = confidences["category_confidence"]
+        requested_category = str(payload.get("category") or "").strip()
+        folded_categories = {name.casefold(): name for name in categories}
+        category = (
+            requested_category
+            if requested_category in categories
+            else folded_categories.get(requested_category.casefold(), "")
+        )
+        tags = payload.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        return {
+            "semantic_prompt_version": PROMPT_VERSION,
+            "semantic_category": category,
+            "vision_model": self.vision_provider_id,
+            "is_meme": bool(is_meme),
+            "meme_confidence": meme_confidence,
+            "category": category,
+            "category_confidence": category_confidence,
+            "reason": str(payload.get("reason") or "").strip()[:500],
+            "caption": str(payload.get("caption") or "").strip()[:1000],
+            "tags": [str(tag).strip()[:100] for tag in tags[:12] if str(tag).strip()],
+            "visible_text": str(payload.get("visible_text") or "").strip()[:1000],
+        }
+
+    async def _understand(self, content: bytes, extension: str) -> dict[str, Any]:
+        """生成独立于分类的证据，并清理临时视觉输入。
+
+        Args:
+            content: 已校验的来源图片字节。
+            extension: 可信的图片扩展名。
+
+        Returns:
+            已解析的视觉证据，可用于独立的决策评估。
+        """
+        AUTO_COLLECT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        source_file = tempfile.NamedTemporaryFile(
+            prefix="understanding_",
+            suffix=extension,
+            dir=AUTO_COLLECT_TEMP_DIR,
+            delete=False,
+        )
+        try:
+            source_file.write(content)
+            source_file.close()
+            visual_paths, frame_paths = prepare_visual_inputs(source_file.name)
+            request_data = {
+                "chat_provider_id": self.vision_provider_id,
+                "prompt": (
+                    "请返回："
+                    '{"caption":"","tags":[],"visible_text":"",'
+                    '"chat_use_evidence":""}'
+                ),
+                "image_urls": visual_paths,
+                "system_prompt": UNDERSTANDING_SYSTEM_PROMPT,
+                "temperature": 0,
+                "max_tokens": 1200,
+                "response_format": {"type": "json_object"},
+            }
+            try:
+                self.counters["vision_requests"] = (
+                    self.counters.get("vision_requests", 0) + 1
+                )
+                response = await self.plugin.context.llm_generate(**request_data)
+            except Exception as exc:
+                if not _structured_output_is_unsupported(exc):
+                    raise
+                request_data.pop("response_format", None)
+                self.counters["vision_requests"] = (
+                    self.counters.get("vision_requests", 0) + 1
+                )
+                response = await self.plugin.context.llm_generate(**request_data)
+            finally:
+                for frame_path in frame_paths:
+                    Path(frame_path).unlink(missing_ok=True)
+        finally:
+            source_file.close()
+            Path(source_file.name).unlink(missing_ok=True)
+        return parse_understanding(
+            str(getattr(response, "completion_text", "") or ""),
+            vision_model=self.vision_provider_id,
+        )
+
+    async def _judge_understanding(
+        self, understanding: dict[str, Any], categories: dict[str, str]
+    ) -> dict[str, Any]:
+        """评估一条证据记录，不重试付费判断请求。
+
+        Args:
+            understanding: 先前生成的图片描述与证据。
+            categories: 目标表情包当前的分类目录。
+
+        Returns:
+            规范化的决策，或需要人工复核的记录。
+        """
+        client = getattr(self.plugin, "decision_client", None)
+        status = self._decision_service_status()
+        decision_model = str(status.get("model") or "")
+        state, questions, option_to_category = build_decision_request(
+            understanding,
+            categories,
+            content_review_enabled=self.content_review_enabled,
+            content_review_prompt=self.content_review_prompt,
+        )
+        if client is None or not bool(status.get("ready")):
+            return collection_decision_failure(
+                understanding,
+                decision_model=decision_model,
+                code=str(status.get("reason") or "decision_not_ready"),
+            )
+        self._decision_call_started()
+        try:
+            answers = await client.evaluate(state, questions)
+        except asyncio.CancelledError:
+            raise
+        except DecisionError as exc:
+            self.counters["decision_failed"] = (
+                self.counters.get("decision_failed", 0) + 1
+            )
+            return collection_decision_failure(
+                understanding, decision_model=decision_model, code=exc.code
+            )
+        except Exception:
+            self.counters["decision_failed"] = (
+                self.counters.get("decision_failed", 0) + 1
+            )
+            return collection_decision_failure(
+                understanding,
+                decision_model=decision_model,
+                code="decision_failed",
+            )
+        result = normalize_decision_answers(
+            answers,
+            questions,
+            option_to_category,
+            understanding,
+            decision_model=str(getattr(answers, "model", "") or decision_model),
+            min_meme_confidence=self.min_meme_confidence,
+            min_category_confidence=self.min_category_confidence,
+        )
+        result["decision_usage"] = getattr(answers, "usage", None)
+        result["decision_credits"] = getattr(answers, "credits", None)
+        if result.get("decision_status") == "failed":
+            self.counters["decision_failed"] = (
+                self.counters.get("decision_failed", 0) + 1
+            )
+        return result
+
+    async def _analyze_with_decision(
+        self,
+        content: bytes,
+        extension: str,
+        job: AutoCollectJob,
+        digest: str,
+    ) -> dict[str, Any] | None:
+        """使用各自的键独立复用视觉证据与决策。
+
+        Args:
+            content: 已校验的图片字节。
+            extension: 可信的图片扩展名。
+            job: 已固定的目标表情包与分类快照。
+            digest: 来源图片内容的哈希值。
+
+        Returns:
+            决策结果；视觉识别额度耗尽时返回 None。
+        """
+        understandings = self._state.get("understandings", {})
+        understanding_key = self._understanding_cache_key(digest)
+        understanding = (
+            understandings.get(understanding_key)
+            if isinstance(understandings, dict)
+            else None
+        )
+        if not isinstance(understanding, dict):
+            if not self._daily_call_available():
+                self.counters["quota"] = self.counters.get("quota", 0) + 1
+                logger.info(
+                    "[meme_manager] 视觉识别额度已耗尽：表情包=%s 摘要=%s",
+                    job.target_pack_id,
+                    digest[:12],
+                )
+                return None
+            understanding = await self._understand(content, extension)
+            self._remember_understanding(understanding_key, understanding)
+        else:
+            self.counters["understanding_cache_hits"] = (
+                self.counters.get("understanding_cache_hits", 0) + 1
+            )
+
+        decision_key = self._decision_cache_key(
+            job.target_pack_id, job.categories, understanding
+        )
+        decisions = self._state.get("decisions", {})
+        cached = decisions.get(decision_key) if isinstance(decisions, dict) else None
+        if isinstance(cached, dict):
+            self.counters["decision_cache_hits"] = (
+                self.counters.get("decision_cache_hits", 0) + 1
+            )
+            return cached
+        decision = await self._judge_understanding(understanding, job.categories)
+        if decision.get("decision_status") == "completed":
+            self._remember_decision(decision_key, decision)
+        return decision
+
+    @staticmethod
+    def _pack_contains_digest(pack_id: str, digest: str) -> bool:
+        """检查表情包内是否已有内容完全相同的受支持图片。
+
+        Args:
+            pack_id: 目标表情包 ID。
+            digest: 要查找的 SHA-256 摘要。
+
+        Returns:
+            表情包内已存在相同字节内容时返回 True。
+        """
+        return (
+            _IMAGE_INDEX.lookup(get_pack_paths(pack_id)["memes_dir"], digest).exact_path
+            is not None
+        )
+
+    @staticmethod
+    def _write_pack_image(
+        pack_id: str,
+        category: str,
+        content: bytes,
+        digest: str,
+        extension: str,
+    ) -> Path | None:
+        """通过原子重命名将图片写入指定表情包。
+
+        Args:
+            pack_id: 有效的目标表情包 ID。
+            category: 安全的分类名。
+            content: 已通过校验的图片字节。
+            digest: SHA-256 摘要。
+            extension: 可信的文件扩展名。
+
+        Returns:
+            保存后的路径；图片已存在时返回 ``None``。
+
+        Raises:
+            ValueError: 目标表情包或分类路径不安全。
+        """
+        pack_id = validate_pack_id(pack_id, "自动收集目标表情包")
+        if not is_safe_category_name(category):
+            raise ValueError("自动收集分类名不安全")
+        pack_dir = (PACKS_DIR / pack_id).resolve()
+        packs_root = PACKS_DIR.resolve()
+        try:
+            pack_dir.relative_to(packs_root)
+        except ValueError as exc:
+            raise ValueError("自动收集表情包路径超出了表情包根目录") from exc
+        if not pack_dir.is_dir() or (PACKS_DIR / pack_id).is_symlink():
+            raise ValueError("自动收集目标表情包不可用")
+        if AutoCollectManager._pack_contains_digest(pack_id, digest):
+            return None
+        category_dir = (pack_dir / "memes" / category).resolve()
+        try:
+            category_dir.relative_to(pack_dir / "memes")
+        except ValueError as exc:
+            raise ValueError("自动收集分类路径超出了目标表情包") from exc
+        if category_dir.exists() and category_dir.is_symlink():
+            raise ValueError("自动收集分类目录不能是符号链接")
+        category_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(time.time() * 1000)}_{digest[:12]}{extension}"
+        target = category_dir / filename
+        temporary = category_dir / f".{filename}.tmp"
+        temporary.write_bytes(content)
+        os.replace(temporary, target)
+        return target
+
+    async def _save_to_inbox(
+        self,
+        job: AutoCollectJob,
+        content: bytes,
+        digest: str,
+        extension: str,
+        category: str,
+        decision: dict[str, Any],
+    ) -> str:
+        """将已收集图片保存到所属表情包的独立待审箱。
+
+        Args:
+            job: 自动收集任务快照。
+            content: 已通过校验的图片字节。
+            digest: SHA-256 摘要。
+            extension: 可信的扩展名。
+            category: 建议的目标分类。
+            decision: 已规范化的视觉识别结果。
+
+        Returns:
+            已保存、重复或容量受限的处理结果。
+        """
+        async with self._inbox_lock:
+            metadata = self._load_json(
+                AUTO_COLLECT_INBOX_METADATA_PATH,
+                {"schema_version": AUTO_COLLECT_SCHEMA_VERSION, "items": {}},
+            )
+            items = metadata.setdefault("items", {})
+            if not isinstance(items, dict):
+                items = {}
+                metadata["items"] = items
+            record_id = f"{job.target_pack_id}:{digest}"
+            if record_id in items:
+                logger.info(
+                    "[meme_manager] 自动收集跳过图片：保存时发现图片已在待审箱，表情包：%s，图片摘要：%s",
+                    job.target_pack_id,
+                    digest[:12],
+                )
+                return "duplicate"
+            if (
+                sum(
+                    isinstance(item, dict)
+                    and item.get("target_pack_id") == job.target_pack_id
+                    for item in items.values()
+                )
+                >= self.pending_limit
+            ):
+                self.counters["inbox_full"] = self.counters.get("inbox_full", 0) + 1
+                logger.info(
+                    "[meme_manager] 自动收集跳过图片：待审箱已满，表情包：%s，图片摘要：%s",
+                    job.target_pack_id,
+                    digest[:12],
+                )
+                return "inbox_full"
+            AUTO_COLLECT_INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            filename = f"{job.target_pack_id}__{digest}{extension}"
+            target = AUTO_COLLECT_INBOX_IMAGES_DIR / filename
+            temporary = AUTO_COLLECT_INBOX_IMAGES_DIR / f".{filename}.tmp"
+            temporary.write_bytes(content)
+            os.replace(temporary, target)
+            items[record_id] = {
+                "id": record_id,
+                "target_pack_id": job.target_pack_id,
+                "content_sha256": digest,
+                "filename": filename,
+                "suggested_category": category,
+                "source_kind": job.source_kind,
+                "source_id": job.source_id,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "judgment_backend": str(
+                    decision.get("judgment_backend") or self.judgment_backend
+                ),
+                "analysis_version": str(
+                    decision.get("analysis_version") or AUTO_COLLECT_PROMPT_VERSION
+                ),
+                "decision_status": str(
+                    decision.get("decision_status")
+                    or ("not_used" if self.judgment_backend == "vision" else "unknown")
+                ),
+                "review_required": bool(decision.get("review_required", False)),
+                "review_reason": str(decision.get("review_reason") or ""),
+                "classification": decision,
+            }
+            self._save_json(AUTO_COLLECT_INBOX_METADATA_PATH, metadata)
+        self.counters["collected"] = self.counters.get("collected", 0) + 1
+        logger.info(
+            "[meme_manager] 已收集图片，等待审核；表情包：%s，分类：%s",
+            job.target_pack_id,
+            category,
+        )
+        return "pending"
+
+    async def _process_job(self, job: AutoCollectJob) -> str:
+        """下载、去重、分类并路由一张队列中的图片。
+
+        Args:
+            job: 自动收集任务快照。
+
+        Returns:
+            用于手动收集汇总的处理结果。
+        """
+        content = await asyncio.to_thread(job.snapshot_path.read_bytes)
+        extension = await asyncio.to_thread(self._validate_image, content)
+        digest = hashlib.sha256(content).hexdigest()
+        metadata = self._load_json(AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}})
+        if f"{job.target_pack_id}:{digest}" in metadata.get(
+            "items", {}
+        ) or digest in self._state.get("rejected", {}).get(job.target_pack_id, []):
+            self.counters["duplicate_or_rejected"] = (
+                self.counters.get("duplicate_or_rejected", 0) + 1
+            )
+            reason = (
+                "图片已在待审箱"
+                if f"{job.target_pack_id}:{digest}" in metadata.get("items", {})
+                else "图片已在拒绝名单"
+            )
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：%s，表情包：%s，图片摘要：%s",
+                reason,
+                job.target_pack_id,
+                digest[:12],
+            )
+            return (
+                "duplicate"
+                if f"{job.target_pack_id}:{digest}" in metadata.get("items", {})
+                else "rejected"
+            )
+        if (
+            sum(
+                isinstance(item, dict)
+                and item.get("target_pack_id") == job.target_pack_id
+                for item in metadata.get("items", {}).values()
+            )
+            >= self.pending_limit
+        ):
+            self.counters["inbox_full"] = self.counters.get("inbox_full", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：待审箱已满，表情包：%s，图片摘要：%s",
+                job.target_pack_id,
+                digest[:12],
+            )
+            return "inbox_full"
+        if await asyncio.to_thread(
+            self._pack_contains_digest, job.target_pack_id, digest
+        ):
+            self.counters["duplicate_or_rejected"] = (
+                self.counters.get("duplicate_or_rejected", 0) + 1
+            )
+            logger.info(
+                "[meme_manager] 自动收集跳过图片：表情包中已有相同图片，表情包：%s，图片摘要：%s",
+                job.target_pack_id,
+                digest[:12],
+            )
+            return "duplicate"
+
+        if self.judgment_backend == "decision":
+            decision = await self._analyze_with_decision(
+                content, extension, job, digest
+            )
+            if decision is None:
+                return "quota"
+            if self._explicit_decision_rejection(decision):
+                self.counters["model_rejected"] = (
+                    self.counters.get("model_rejected", 0) + 1
+                )
+                logger.info(
+                    "[meme_manager] 已拒收图片：表情包=%s 原因=%s 摘要=%s",
+                    job.target_pack_id,
+                    decision.get("rejection_reason"),
+                    digest[:12],
+                )
+                return "rejected"
+            category = str(decision.get("category") or "").strip()
+            if category not in job.categories:
+                category = REVIEW_CATEGORY
+        else:
+            cache_key = self._cache_key(digest, job.target_pack_id, job.categories)
+            decisions = self._state.get("decisions", {})
+            decision = decisions.get(cache_key) if isinstance(decisions, dict) else None
+            if not isinstance(decision, dict):
+                if not self._daily_call_available():
+                    self.counters["quota"] = self.counters.get("quota", 0) + 1
+                    logger.info(
+                        "[meme_manager] 自动收集跳过图片：已达到每日识别上限，表情包：%s，图片摘要：%s",
+                        job.target_pack_id,
+                        digest[:12],
+                    )
+                    return "quota"
+                decision = await self._classify(content, extension, job.categories)
+                self._remember_decision(cache_key, decision)
+            if (
+                not bool(decision.get("is_meme"))
+                or float(decision.get("meme_confidence", 0) or 0)
+                < self.min_meme_confidence
+            ):
+                self.counters["model_rejected"] = (
+                    self.counters.get("model_rejected", 0) + 1
+                )
+                reason = (
+                    "视觉模型判定不是表情包"
+                    if not bool(decision.get("is_meme"))
+                    else "视觉模型的表情包置信度不足"
+                )
+                logger.info(
+                    "[meme_manager] 自动收集跳过图片：%s，表情包：%s，图片摘要：%s",
+                    reason,
+                    job.target_pack_id,
+                    digest[:12],
+                )
+                return "rejected"
+            category = str(decision.get("category") or "").strip()
+            if category not in job.categories or (
+                not self.manual_review
+                and float(decision.get("category_confidence", 0) or 0)
+                < self.min_category_confidence
+            ):
+                category = REVIEW_CATEGORY
+        match = await asyncio.to_thread(
+            _IMAGE_INDEX.lookup,
+            get_pack_paths(job.target_pack_id)["memes_dir"],
+            digest,
+            job.snapshot_path,
+        )
+        if match.similar_path is not None:
+            decision = {
+                **decision,
+                "near_duplicate": str(
+                    match.similar_path.relative_to(
+                        get_pack_paths(job.target_pack_id)["memes_dir"]
+                    )
+                ).replace("\\", "/"),
+            }
+        saved = await self._save_to_inbox(
+            job, content, digest, extension, category, decision
+        )
+        if saved != "pending":
+            return saved
+        if not self.manual_review and not bool(decision.get("review_required", False)):
+            try:
+                accepted = await self.accept_pending(
+                    job.target_pack_id,
+                    [{"id": f"{job.target_pack_id}:{digest}"}],
+                    manual_confirmed=False,
+                )
+                if accepted["imported"]:
+                    return "imported"
+                if accepted["duplicates"]:
+                    return "duplicate"
+                if accepted["failed"]:
+                    return "pending_failed"
+            except RuntimeError:
+                self.counters["pack_busy"] = self.counters.get("pack_busy", 0) + 1
+                logger.info("[meme_manager] 表情包正在处理，已收集图片保留在待审箱")
+                self._pending_auto_accept.setdefault(job.target_pack_id, set()).add(
+                    f"{job.target_pack_id}:{digest}"
+                )
+                task = self._auto_accept_tasks.get(job.target_pack_id)
+                if task is None or task.done():
+                    self._auto_accept_tasks[job.target_pack_id] = asyncio.create_task(
+                        self._retry_auto_accept(job.target_pack_id),
+                        name=f"meme_manager_auto_accept_{job.target_pack_id}",
+                    )
+                return "waiting_import"
+        return "pending"
+
+    async def pending_status(self, pack_id: str) -> dict[str, Any]:
+        """列出候选图片，包含可为空的概率和复核来源。
+
+        Args:
+            pack_id: 需要查询待处理图片的目标表情包。
+
+        Returns:
+            候选图片、必须复核的数量及使用方就绪状态元信息。
+        """
+        pack_id = validate_pack_id(pack_id, "表情包")
+        async with self._inbox_lock:
+            metadata = self._load_json(AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}})
+            records = []
+            raw_items = metadata.get("items", {})
+            for item in raw_items.values() if isinstance(raw_items, dict) else []:
+                if not isinstance(item, dict) or item.get("target_pack_id") != pack_id:
+                    continue
+                decision = item.get("classification", {})
+                if not isinstance(decision, dict):
+                    decision = {}
+                confidence_values: dict[str, float | None] = {}
+                for key in ("meme_confidence", "category_confidence"):
+                    raw_value = decision.get(key)
+                    if raw_value is None or raw_value == "":
+                        confidence_values[key] = None
+                        continue
+                    try:
+                        value = float(raw_value)
+                    except (TypeError, ValueError):
+                        confidence_values[key] = None
+                        continue
+                    confidence_values[key] = (
+                        max(0.0, min(1.0, value)) if math.isfinite(value) else None
+                    )
+                judgment_backend = str(
+                    item.get("judgment_backend")
+                    or decision.get("judgment_backend")
+                    or "unknown"
+                )
+                decision_status = str(
+                    item.get("decision_status")
+                    or decision.get("decision_status")
+                    or "unknown"
+                )
+                review_required = bool(
+                    item.get("review_required")
+                    or decision.get("review_required", False)
+                )
+                records.append(
+                    {
+                        **{
+                            key: item.get(key, "")
+                            for key in (
+                                "id",
+                                "suggested_category",
+                                "source_kind",
+                                "source_id",
+                                "received_at",
+                            )
+                        },
+                        **{
+                            key: decision.get(key, "")
+                            for key in (
+                                "reason",
+                                "caption",
+                                "visible_text",
+                                "near_duplicate",
+                                "chat_use_evidence",
+                                "decision_model",
+                                "analysis_version",
+                            )
+                        },
+                        "analysis_version": str(
+                            item.get("analysis_version")
+                            or decision.get("analysis_version")
+                            or ""
+                        ),
+                        "judgment_backend": judgment_backend,
+                        "decision_status": decision_status,
+                        "review_required": review_required,
+                        "review_reason": str(
+                            item.get("review_reason")
+                            or decision.get("review_reason")
+                            or ""
+                        ),
+                        "review_reasons": decision.get("review_reasons", []),
+                        "stage_status": decision.get("stage_status", {}),
+                        "content_rule_result": decision.get("content_rule_result"),
+                        "tags": decision.get("tags", []),
+                        **confidence_values,
+                    }
+                )
+        records.sort(
+            key=lambda item: (
+                item["category_confidence"]
+                if item["category_confidence"] is not None
+                else -1.0,
+                item["meme_confidence"]
+                if item["meme_confidence"] is not None
+                else -1.0,
+                item["received_at"],
+            ),
+            reverse=True,
+        )
+        return {
+            "visible": True,
+            "count": len(records),
+            "items": records,
+            "categories": load_pack_category_mapping(pack_id),
+            "manual_review": self.manual_review,
+            "judgment_backend": self.judgment_backend,
+            "decision_status": self._decision_service_status(),
+            "ready": self._ready,
+            "reason": "ready" if self._ready else self._unavailable_reason,
+            "review_required_count": sum(
+                bool(item["review_required"]) for item in records
+            ),
+            "pending_limit": self.pending_limit,
+            "counters": {
+                **self.counters,
+                "decision_requests": self._decision_service_status()
+                .get("requests_started", {})
+                .get("auto_collect_judgment", 0),
+            },
+        }
+
+    def pending_image_path(
+        self, pack_id: str, record_id: str, *, _record: dict[str, Any] | None = None
+    ) -> Path:
+        """解析候选图片，并校验表情包归属与文件路径边界。
+
+        Args:
+            pack_id: 目标表情包标识符。
+            record_id: 候选记录标识符。
+            _record: 持有待审箱锁时读取的内部批量记录。
+
+        Returns:
+            安全且存在的图片路径。
+
+        Raises:
+            ValueError: 记录属于其他表情包，或路径不安全。
+            FileNotFoundError: 候选记录或图片已不存在。
+        """
+        pack_id = validate_pack_id(pack_id, "表情包")
+        item = _record
+        if item is None:
+            metadata = self._load_json(AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}})
+            items = metadata.get("items", {})
+            item = items.get(record_id) if isinstance(items, dict) else None
+        if not isinstance(item, dict):
+            raise FileNotFoundError("待审核图片不存在")
+        digest = str(item.get("content_sha256") or "")
+        if (
+            item.get("target_pack_id") != pack_id
+            or record_id != f"{pack_id}:{digest}"
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError("待审核图片不属于当前表情包")
+        source = AUTO_COLLECT_INBOX_IMAGES_DIR / str(item.get("filename") or "")
+        if (
+            source.is_symlink()
+            or source.resolve().parent != AUTO_COLLECT_INBOX_IMAGES_DIR.resolve()
+        ):
+            raise ValueError("待审核图片路径无效")
+        if not source.is_file():
+            raise FileNotFoundError("待审核图片文件不存在")
+        return source
+
+    async def accept_pending(
+        self,
+        pack_id: str,
+        selections: list[dict[str, Any]],
+        *,
+        manual_confirmed: bool = True,
+    ) -> dict[str, int]:
+        """接收选中的候选图片，保留失败项以便重试。
+
+        Args:
+            pack_id: 目标表情包标识符。
+            selections: 候选 ID 及可选的分类覆盖值。
+            manual_confirmed: 是否由人工明确接收这些图片。
+
+        Returns:
+            导入、重复及失败项的数量。
+
+        Raises:
+            ValueError: 选择内容、归属或分类无效。
+            RuntimeError: 其他操作正持有表情包写锁。
+        """
+        pack_id = validate_pack_id(pack_id, "表情包")
+        if not (PACKS_DIR / pack_id).is_dir():
+            raise FileNotFoundError("表情包不存在")
+        if not isinstance(selections, list) or not selections or len(selections) > 2000:
+            raise ValueError("请选择要接收的图片")
+        categories = load_pack_category_mapping(pack_id)
+        result = {"imported": 0, "duplicates": 0, "failed": 0, "skipped_review": 0}
+        async with self._inbox_lock:
+            metadata = self._load_json(AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}})
+            items = metadata.get("items", {})
+            validated = {}
+            skipped_review_ids = set()
+            for selection in selections:
+                if not isinstance(selection, dict):
+                    raise ValueError("图片选择格式无效")
+                record_id = str(selection.get("id") or "")
+                source = self.pending_image_path(
+                    pack_id, record_id, _record=items.get(record_id, {})
+                )
+                item = items[record_id]
+                if not manual_confirmed:
+                    classification = item.get("classification", {})
+                    review_required = bool(
+                        item.get("review_required")
+                        or (
+                            classification.get("review_required", False)
+                            if isinstance(classification, dict)
+                            else False
+                        )
+                    )
+                    if review_required:
+                        skipped_review_ids.add(record_id)
+                        continue
+                category = str(
+                    selection.get("category")
+                    or item.get("suggested_category")
+                    or REVIEW_CATEGORY
+                )
+                if category not in categories and category != REVIEW_CATEGORY:
+                    raise ValueError("请选择当前表情包中的分类")
+                validated[record_id] = (source, category)
+            result["skipped_review"] = len(skipped_review_ids)
+            if not validated:
+                return result
+            self.plugin.semantic_task_manager.begin_external_pack_operation(
+                pack_id, "审核自动收集图片"
+            )
+            try:
+                for record_id, (source, category) in validated.items():
+                    item = items[record_id]
+                    try:
+                        content = await asyncio.to_thread(source.read_bytes)
+                        digest = hashlib.sha256(content).hexdigest()
+                        if digest != item.get("content_sha256"):
+                            raise ValueError("待审核图片内容已改变")
+                        extension = await asyncio.to_thread(
+                            self._validate_image, content
+                        )
+                        saved = await asyncio.to_thread(
+                            self._write_pack_image,
+                            pack_id,
+                            category,
+                            content,
+                            digest,
+                            extension,
+                        )
+                        if saved is not None:
+                            try:
+                                await asyncio.to_thread(
+                                    save_collected_image_semantic,
+                                    PACKS_DIR / pack_id,
+                                    saved,
+                                    item.get("classification", {}),
+                                    manual_confirmed=manual_confirmed,
+                                )
+                            except Exception:
+                                saved.unlink(missing_ok=True)
+                                raise
+                            result["imported"] += 1
+                        else:
+                            result["duplicates"] += 1
+                        del items[record_id]
+                        self._save_json(AUTO_COLLECT_INBOX_METADATA_PATH, metadata)
+                        source.unlink(missing_ok=True)
+                    except Exception as exc:
+                        result["failed"] += 1
+                        logger.error(
+                            "[meme_manager] 接收候选图片 %s 失败：%s",
+                            record_id,
+                            exc,
+                        )
+            finally:
+                self.plugin.semantic_task_manager.end_external_pack_operation(pack_id)
+        if result["imported"]:
+            await self.plugin.reload_emotions()
+            if (
+                not self._closing
+                and self.auto_embedding
+                and getattr(self.plugin, "semantic_enabled", False)
+            ):
+                task = self._embedding_tasks.get(pack_id)
+                if task is None or task.done():
+                    self._embedding_tasks[pack_id] = asyncio.create_task(
+                        self._generate_collected_vectors(pack_id),
+                        name=f"meme_manager_collected_vectors_{pack_id}",
+                    )
+        return result
+
+    async def _generate_collected_vectors(self, pack_id: str) -> None:
+        """合并已接收图片，并增量更新所属表情包的索引。
+
+        Args:
+            pack_id: 包含新接收图片的表情包。
+        """
+        try:
+            # 允许连续的收集任务共用一批向量生成请求。
+            await asyncio.sleep(1)
+            while self.auto_embedding and getattr(
+                self.plugin, "semantic_enabled", False
+            ):
+                try:
+                    self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                        pack_id, "update collected image vectors"
+                    )
+                except RuntimeError:
+                    # 其他任务或暂停队列占用表情包时，保留触发状态。
+                    await asyncio.sleep(2)
+                    continue
+                try:
+                    await self.plugin.semantic_task_manager.rebuild_index(
+                        pack_id, force=False
+                    )
+                except RuntimeError:
+                    # 检查结束后，其他语义任务可能已经获得锁。
+                    try:
+                        self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                            pack_id, "update collected image vectors"
+                        )
+                    except RuntimeError:
+                        await asyncio.sleep(2)
+                        continue
+                    raise
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "表情包 %s 的自动增量向量生成失败，可在管理页面重试待处理图片",
+                pack_id,
+                exc_info=True,
+            )
+        finally:
+            self._embedding_tasks.pop(pack_id, None)
+
+    async def _retry_auto_accept(self, pack_id: str) -> None:
+        """仅重试因表情包忙碌而延后的新收集候选图片。
+
+        Args:
+            pack_id: 包含关闭复核时收集的候选图片的表情包。
+        """
+        try:
+            while not self.manual_review and self._pending_auto_accept.get(pack_id):
+                try:
+                    self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                        pack_id, "accept collected images"
+                    )
+                except RuntimeError:
+                    await asyncio.sleep(2)
+                    continue
+                async with self._inbox_lock:
+                    metadata = self._load_json(
+                        AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}}
+                    )
+                    items = metadata.get("items", {})
+                    pending = self._pending_auto_accept[pack_id]
+                    pending.intersection_update(
+                        record_id
+                        for record_id, item in items.items()
+                        if isinstance(item, dict)
+                        and item.get("target_pack_id") == pack_id
+                    )
+                    selections = sorted(pending)[:2000]
+                if not selections:
+                    break
+                acceptance = asyncio.create_task(
+                    self.accept_pending(
+                        pack_id,
+                        [{"id": record_id} for record_id in selections],
+                        manual_confirmed=False,
+                    )
+                )
+                try:
+                    await asyncio.shield(acceptance)
+                except asyncio.CancelledError:
+                    # 在释放任务前完成正在进行的磁盘变更。
+                    await asyncio.gather(acceptance, return_exceptions=True)
+                    raise
+                except RuntimeError:
+                    # 等待待审箱锁期间，表情包可能已经变为忙碌状态。
+                    try:
+                        self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                            pack_id, "accept collected images"
+                        )
+                    except RuntimeError:
+                        await asyncio.sleep(2)
+                        continue
+                    raise
+                self._pending_auto_accept[pack_id].difference_update(selections)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "表情包 %s 的延后自动接收失败，候选图片仍保留，可手动重试",
+                pack_id,
+                exc_info=True,
+            )
+        finally:
+            self._auto_accept_tasks.pop(pack_id, None)
+            self._pending_auto_accept.pop(pack_id, None)
+
+    async def discard_pending(
+        self, pack_id: str, ids: list[str], remember_rejection: bool = False
+    ) -> dict[str, int]:
+        """丢弃选中的候选图片，并可阻止再次收集。
+
+        Args:
+            pack_id: 目标表情包标识符。
+            ids: 选中的候选记录标识符。
+            remember_rejection: 将精确哈希持久保存为该表情包的拒收记录。
+
+        Returns:
+            丢弃的候选记录数量。
+
+        Raises:
+            ValueError: 选择内容或表情包归属无效。
+        """
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or len(ids) > 2000
+            or any(not isinstance(record_id, str) for record_id in ids)
+        ):
+            raise ValueError("请选择要丢弃的图片")
+        async with self._inbox_lock:
+            metadata = self._load_json(AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}})
+            items = metadata.get("items", {})
+            paths = {
+                record_id: self.pending_image_path(
+                    pack_id, record_id, _record=items.get(record_id, {})
+                )
+                for record_id in ids
+            }
+            if remember_rejection:
+                rejected = self._state.setdefault("rejected", {}).setdefault(
+                    pack_id, []
+                )
+                rejected.extend(
+                    items[record_id]["content_sha256"]
+                    for record_id in paths
+                    if items[record_id]["content_sha256"] not in rejected
+                )
+                self._save_json(AUTO_COLLECT_STATE_PATH, self._state)
+            for record_id in paths:
+                del items[record_id]
+            self._save_json(AUTO_COLLECT_INBOX_METADATA_PATH, metadata)
+            for source in paths.values():
+                source.unlink(missing_ok=True)
+        return {"discarded": len(paths)}
+
+    async def import_pending(self, pack_id: str) -> dict[str, int]:
+        """仅在关闭人工复核时导入旧版待审箱候选图片。
+
+        Args:
+            pack_id: 目标表情包标识符。
+
+        Returns:
+            导入结果的数量统计。
+
+        Raises:
+            RuntimeError: 启用人工复核时必须明确选择候选图片。
+        """
+        if self.manual_review:
+            raise RuntimeError("请在表情包管理页面预览并选择要接收的图片")
+        status = await self.pending_status(pack_id)
+        if not status["items"]:
+            return {"imported": 0, "duplicates": 0, "failed": 0, "skipped_review": 0}
+        return await self.accept_pending(
+            pack_id,
+            [{"id": item["id"]} for item in status["items"]],
+            manual_confirmed=False,
+        )

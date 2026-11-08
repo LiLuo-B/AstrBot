@@ -1,0 +1,246 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const uiSource = readFileSync(join(here, "../../pages/dashboard/graph-ui.js"), "utf-8");
+
+/* 轻量 DOM 桩：仅覆盖 graph-ui.js init 用到的元素与事件监听。 */
+class FakeElement {
+  constructor() {
+    this._listeners = {};
+    this._attrs = {};
+    this.value = "";
+    this.textContent = "";
+    this.style = {};
+    this.disabled = false;
+    this.innerHTML = "";
+  }
+  addEventListener(type, cb) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(cb);
+  }
+  trigger(type) {
+    (this._listeners[type] || []).forEach((cb) => cb({ preventDefault() {} }));
+  }
+  setAttribute(name, value) {
+    this._attrs[name] = value;
+  }
+  getAttribute(name) {
+    return this._attrs[name];
+  }
+  querySelector() {
+    if (!this._span) this._span = new FakeElement();
+    return this._span;
+  }
+}
+
+function loadGraphUi(withGraph2D) {
+  const calls = [];
+  const posts = [];
+  const elements = {};
+  const docListeners = {};
+  const g2dCalls = [];
+  let graphHandlers;
+  const viewCalls = [];
+  let lastHandler = null;
+
+  global.window = {
+    t: (key, ...args) => [key, ...args].join(" "),
+    AstrBotPluginPage: {
+      async apiPost(path, body) {
+        posts.push({ path, body: body || {} });
+        return {
+          status: "ok",
+          data: { enabled: true, mode: "focus", summary: {}, snapshot: { nodes: [], edges: [] } },
+        };
+      },
+      async apiGet(path, params) {
+        calls.push({ path, params: params || {} });
+        return {
+          status: "ok",
+          data: {
+            enabled: true,
+            mode: "overview",
+            summary: {},
+            snapshot: { nodes: [], edges: [] },
+          },
+        };
+      },
+    },
+    addEventListener() {},
+  };
+  if (withGraph2D) {
+    global.window.Graph2D = {
+      init(container, handlers) { graphHandlers = handlers; },
+      loadData(payload, options) { g2dCalls.push({ payload, options }); },
+      selection: null,
+      renderer: { _selection: null },
+      resetView() { viewCalls.push("reset"); },
+      selectNode(id) { this.selection = { type: "node", id }; },
+    };
+  }
+  global.document = {
+    getElementById(id) {
+      if (!elements[id]) elements[id] = new FakeElement();
+      return elements[id];
+    },
+    addEventListener(type, cb) {
+      if (type === "DOMContentLoaded") lastHandler = cb;
+      if (!docListeners[type]) docListeners[type] = [];
+      docListeners[type].push(cb);
+    },
+    documentElement: { getAttribute: () => "light" },
+    createElement: () => new FakeElement(),
+  };
+
+  (0, eval)(uiSource);
+
+  /* 手动触发 DOMContentLoaded，让 graph-ui init() 挂载事件监听。 */
+  if (lastHandler) lastHandler();
+  return { calls, posts, elements, g2dCalls, viewCalls, graphHandlers };
+}
+
+async function flushMicrotasks() {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+}
+
+for (const association of ["entries", "memories"]) {
+  test(`node details retain memories linked through ${association} without edges`, async () => {
+    const { graphHandlers } = loadGraphUi(true);
+    const memory = { memory_id: 4, summary: "A standalone fact" };
+    const snapshot = {
+      nodes: [{ id: 7, type: "fact", label: "Standalone", weight: 1 }],
+      edges: [],
+      memories: [memory],
+    };
+    if (association === "entries") snapshot.entries = [{ memory_id: 4, node_ids: [7] }];
+    else memory.node_ids = [7];
+    window.AstrBotPluginPage.apiGet = async () => ({
+      status: "ok", data: { enabled: true, mode: "overview", summary: {}, snapshot },
+    });
+    let selected;
+    window.lmOpenPeekNode = node => { selected = node; };
+    window.ensureGraphScene();
+    await flushMicrotasks();
+    graphHandlers.onNodeClick(7);
+    assert.deepEqual(selected.memories, [memory]);
+  });
+}
+
+test("ensureGraphScene loads the constrained overview without full_graph", async () => {
+  const { calls } = loadGraphUi();
+  window.ensureGraphScene();
+  await flushMicrotasks();
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, "page/graph/overview");
+  assert.equal(calls[0].params.full_graph, undefined, "默认概览不应传 full_graph");
+});
+
+test("resetting the view does not request graph data", () => {
+  const { calls, elements, viewCalls } = loadGraphUi(true);
+  elements["graph-reset-view"].trigger("click");
+  assert.deepEqual(viewCalls, ["reset"]);
+  assert.equal(calls.length, 0);
+});
+
+test("overview button toggles between full graph and limited view", async () => {
+  const { calls, elements } = loadGraphUi();
+  const btn = elements["graph-overview-btn"];
+
+  btn.trigger("click");
+  await flushMicrotasks();
+  assert.equal(calls[0].params.full_graph, "true", "第一次点击应显式请求全量图");
+  assert.equal(btn.getAttribute("data-i18n-aria"), "graph.limitedBtn", "全量模式下按钮应显示「受限概览」");
+
+  btn.trigger("click");
+  await flushMicrotasks();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].params.full_graph, undefined, "再点一次应切回受限概览（不传 full_graph）");
+  assert.equal(btn.getAttribute("data-i18n-aria"), "graph.overviewBtn", "受限模式下按钮应显示「全量图谱」");
+});
+
+test("layout in progress shows localized loading message until layout done", async () => {
+  const { elements, g2dCalls } = loadGraphUi(true);
+  /* 注入一个有数据的 payload（直接走 renderPayload 路径：先加载受限概览） */
+  const bridge = global.window.AstrBotPluginPage;
+  bridge.apiGet = async (path, params) => ({
+    status: "ok",
+    data: {
+      enabled: true,
+      mode: "overview",
+      summary: {},
+      snapshot: {
+        nodes: [{ id: 1, type: "fact", label: "测试事实", weight: 1 }],
+        edges: [],
+      },
+    },
+  });
+  window.ensureGraphScene();
+  await flushMicrotasks();
+
+  const stateEl = elements["graph-canvas-state"];
+  assert.equal(stateEl.textContent, "graph.layouting", "布局期间应显示本地化布局提示");
+  assert.equal(stateEl.style.display, "block");
+  assert.equal(g2dCalls.length, 1, "Graph2D.loadData 应被调用");
+  assert.equal(typeof g2dCalls[0].options.onLayoutDone, "function", "应注册布局完成回调");
+
+  /* 布局完成 → 回调清除提示 */
+  g2dCalls[0].options.onLayoutDone();
+  assert.equal(stateEl.textContent, "", "布局完成后应清除提示");
+  assert.equal(stateEl.style.display, "none");
+});
+
+test("empty snapshot shows empty message instead of layout message", async () => {
+  const { elements, g2dCalls } = loadGraphUi(true);
+  window.ensureGraphScene();
+  await flushMicrotasks();
+
+  const stateEl = elements["graph-canvas-state"];
+  assert.equal(stateEl.textContent, "graph.canvasEmpty", "空图应显示空白提示而非布局提示");
+  /* 空图布局完成也不应清掉空提示 */
+  g2dCalls[0].options.onLayoutDone();
+  assert.equal(stateEl.textContent, "graph.canvasEmpty");
+});
+
+test("legend explains node colours and reports a truncated graph", async () => {
+  const { elements } = loadGraphUi(true);
+  window.AstrBotPluginPage.apiGet = async () => ({
+    status: "ok",
+    data: {
+      enabled: true,
+      mode: "overview",
+      summary: {
+        node_type_breakdown: { person: 3 },
+        relation_breakdown: { co_occurs_with: 5 },
+        visible_node_count: 5000,
+        graph_node_count: 9000,
+      },
+      snapshot: { nodes: [{ id: 1, type: "person", label: "Alice", weight: 1 }], edges: [] },
+    },
+  });
+
+  window.ensureGraphScene();
+  await flushMicrotasks();
+
+  const html = elements["graph-legend"].innerHTML;
+  assert.match(html, /graph\.nodePerson/, "图例解释节点颜色");
+  assert.match(html, /graph\.visibleNodes 5000 9000/, "被截断时给出可见/总数");
+  assert.doesNotMatch(html, /co_occurs_with/, "关系 chip 已移除：它无法对应画布颜色");
+});
+
+test("focusing a memory from another page switches pages and queries by id", async () => {
+  const { posts } = loadGraphUi();
+  const switched = [];
+  window.lmSwitchPage = async name => { switched.push(name); };
+
+  await window.lmFocusMemoryOnGraph("77");
+
+  assert.deepEqual(switched, ["graph"], "应先切到图谱页再定位");
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].path, "page/graph/query");
+  assert.equal(posts[0].body.memory_id, 77, "记忆 ID 由调用方传入，不需要手输");
+});

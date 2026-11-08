@@ -1,0 +1,333 @@
+"""
+BM25检索器 - 基于SQLite FTS5的稀疏检索
+实现简洁的BM25检索功能,用于MemoryEngine的混合检索
+"""
+
+import json
+import re
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
+
+import aiosqlite
+
+from astrbot.api import logger
+
+from ..processors.text_processor import TextProcessor
+from ..memory_scope import adapter_sql
+
+
+_CJK_RUN = re.compile(r"[一-鿿]+")
+
+
+def with_cjk_bigrams(tokens: list[str], text: str) -> list[str]:
+    """在分词结果后追加中文连续段的字符二元组。
+
+    短查询与专有名词（店名/人名/型号）经常被 jieba 切得与索引侧不一致，
+    字符二元组能补上这种细粒度匹配；英文与数字段不加，避免引入噪声。
+
+    Args:
+        tokens: jieba 分词结果
+        text: 原始文本
+
+    Returns:
+        追加二元组后的词元列表（去重保序）
+    """
+    merged = list(tokens)
+    for match in _CJK_RUN.finditer(str(text or "")):
+        run = match.group(0)
+        merged.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return list(dict.fromkeys(merged))
+
+
+@dataclass
+class BM25Result:
+    """BM25检索结果"""
+
+    doc_id: int
+    score: float
+    content: str
+    metadata: dict[str, Any]
+
+
+class BM25Retriever:
+    """
+    文档路 BM25 关键词检索器
+
+    使用SQLite FTS5实现BM25算法的全文检索。
+    主要特性:
+    1. 使用TextProcessor进行中文分词和停用词过滤
+    2. 支持通过metadata过滤session_id和persona_id
+    3. BM25分数自动归一化到[0,1]区间
+    """
+
+    def __init__(
+        self,
+        db_path: str,
+        text_processor: TextProcessor,
+        config: dict[str, Any] | None = None,
+    ):
+        """
+        初始化BM25检索器
+
+        Args:
+            db_path: SQLite数据库路径
+            text_processor: 文本处理器实例
+            config: 配置字典(可选)
+        """
+        self.db_path = db_path
+        self.text_processor = text_processor
+        self.config = config or {}
+        self.fts_table = "livingmemory_memories_fts"
+        self.doc_table = "documents"
+
+    @asynccontextmanager
+    async def _connect(self):
+        """创建新的SQLite连接并启用WAL模式和busy_timeout。"""
+        db = await aiosqlite.connect(self.db_path)
+        try:
+            await db.execute("PRAGMA journal_mode = WAL")
+            await db.execute("PRAGMA busy_timeout = 10000")
+            yield db
+        finally:
+            await db.close()
+
+    async def initialize(self):
+        """
+        初始化FTS5索引
+
+        创建 livingmemory_memories_fts 虚拟表用于全文检索。
+        使用unicode61分词器处理已预处理的文本。
+        """
+        async with self._connect() as db:
+            await self._warn_if_legacy_documents_fts_exists(db)
+            # 创建FTS5虚拟表
+            await db.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {self.fts_table}
+                USING fts5(
+                    content,
+                    doc_id UNINDEXED,
+                    tokenize='unicode61'
+                )
+            """)
+            await db.commit()
+
+    async def _warn_if_legacy_documents_fts_exists(self, db: aiosqlite.Connection):
+        cursor = await db.execute("""
+            SELECT sql FROM sqlite_master
+            WHERE type='table' AND name='documents_fts'
+        """)
+        row = await cursor.fetchone()
+        if not row:
+            return
+
+        if await self._is_legacy_livingmemory_documents_fts(db, row[0] or ""):
+            logger.warning(
+                "检测到插件废弃 documents_fts 表；当前版本改用 livingmemory_memories_fts，"
+                "请确认数据库迁移已执行到 v6"
+            )
+
+    async def _is_legacy_livingmemory_documents_fts(
+        self,
+        db: aiosqlite.Connection,
+        create_sql: str,
+    ) -> bool:
+        normalized_sql = " ".join(create_sql.lower().replace("\n", " ").split())
+        expected_sql = "create virtual table documents_fts using fts5(content, doc_id, tokenize='unicode61')"
+        if normalized_sql != expected_sql:
+            return False
+
+        cursor = await db.execute("PRAGMA table_xinfo(documents_fts)")
+        rows = await cursor.fetchall()
+        visible_columns = [row[1] for row in rows if int(row[6]) == 0]
+        return visible_columns == ["content", "doc_id"]
+
+    async def add_document(
+        self, doc_id: int, content: str, metadata: dict[str, Any] | None = None
+    ):
+        """
+        添加文档到BM25索引
+
+        Args:
+            doc_id: 文档ID
+            content: 文档内容(原始文本)
+            metadata: 文档元数据(可选,用于过滤但不索引)
+        """
+        # 使用TextProcessor预处理文本（异步卸载 jieba 分词到线程池）
+        tokens = await self.text_processor.tokenize_async(
+            content, remove_stopwords=True
+        )
+        processed_content = " ".join(with_cjk_bigrams(tokens, content))
+
+        async with self._connect() as db:
+            # 插入到FTS表
+            await db.execute(
+                f"INSERT INTO {self.fts_table}(doc_id, content) VALUES (?, ?)",
+                (doc_id, processed_content),
+            )
+            await db.commit()
+
+    async def search(
+        self,
+        query: str,
+        limit: int = 50,
+        session_id: str | None = None,
+        persona_id: str | None = None,
+    ) -> list[BM25Result]:
+        """
+        执行BM25搜索
+
+        Args:
+            query: 查询字符串
+            limit: 返回结果数量
+            session_id: 会话ID过滤(可选)
+            persona_id: 人格ID过滤(可选)
+
+        Returns:
+            BM25Result列表,按归一化分数降序排列
+        """
+        if not query or not query.strip():
+            return []
+
+        # 预处理查询（异步卸载 jieba 分词到线程池）
+        tokens = await self.text_processor.tokenize_async(query, remove_stopwords=True)
+        tokens = with_cjk_bigrams(tokens, query)
+        if not tokens:
+            return []
+
+        # 构建FTS5查询: 使用OR连接多个token,提高召回率
+        # 转义特殊字符
+        escaped_tokens = []
+        for token in tokens:
+            # 转义FTS5特殊字符
+            escaped = token.replace('"', '""')
+            escaped_tokens.append(f'"{escaped}"')
+
+        # 使用OR连接所有token
+        fts_query = " OR ".join(escaped_tokens)
+
+        # Apply scope and status before LIMIT so other sessions cannot crowd out hits.
+        metadata_sql = "CASE WHEN json_valid(d.metadata) THEN d.metadata ELSE '{}' END"
+        filters = [
+            f"COALESCE(json_extract({metadata_sql}, '$.status'), 'active') = 'active'"
+        ]
+        params = [fts_query]
+        adapter_filter, adapter_params = adapter_sql(metadata_sql)
+        filters.append(adapter_filter)
+        params.extend(adapter_params)
+        if session_id is not None:
+            filters.append(f"json_extract({metadata_sql}, '$.session_id') = ?")
+            params.append(session_id)
+        if persona_id is not None:
+            filters.append(f"json_extract({metadata_sql}, '$.persona_id') = ?")
+            params.append(persona_id)
+        params.append(max(0, limit))
+
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"""
+                SELECT d.id, d.text, {metadata_sql}, bm25({self.fts_table}) AS score
+                FROM {self.fts_table}
+                JOIN {self.doc_table} d ON d.id = {self.fts_table}.doc_id
+                WHERE {self.fts_table} MATCH ? AND {" AND ".join(filters)}
+                ORDER BY score ASC
+                LIMIT ?
+                """,
+                params,
+            )
+            results = []
+            for doc_id, content, metadata_json, score in await cursor.fetchall():
+                metadata = json.loads(metadata_json)
+                results.append(
+                    BM25Result(
+                        doc_id=doc_id,
+                        score=score,
+                        content=content,
+                        metadata=metadata if isinstance(metadata, dict) else {},
+                    )
+                )
+
+            # 归一化分数到[0, 1]
+            if results:
+                # FTS5 bm25 分数越小越相关，归一化后分数越大越相关
+                scores = [r.score for r in results]
+                max_score = max(scores)
+                min_score = min(scores)
+
+                if max_score == min_score:
+                    for result in results:
+                        result.score = 1.0
+                else:
+                    score_range = max_score - min_score
+                    for result in results:
+                        # 归一化: (max - score) / range
+                        result.score = (max_score - result.score) / score_range
+
+            return results
+
+    async def delete_document(self, doc_id: int) -> bool:
+        """
+        从BM25索引删除文档
+
+        Args:
+            doc_id: 文档ID
+
+        Returns:
+            bool: 是否成功删除
+        """
+        from astrbot.api import logger
+
+        try:
+            async with self._connect() as db:
+                await db.execute(
+                    f"DELETE FROM {self.fts_table} WHERE doc_id = ?", (doc_id,)
+                )
+                await db.commit()
+                return True
+
+        except Exception as e:
+            logger.error(f"BM25删除失败 (doc_id={doc_id}): {e}")
+            return False
+
+    async def update_document(
+        self, doc_id: int, content: str, metadata: dict[str, Any] | None = None
+    ) -> bool:
+        """
+        更新BM25索引中的文档（重新索引）
+
+        Args:
+            doc_id: 文档ID
+            content: 新内容
+            metadata: 新元数据（当前仅用于日志）
+
+        Returns:
+            bool: 是否成功更新
+        """
+        from astrbot.api import logger
+
+        try:
+            # 重新处理内容（异步卸载 jieba 分词到线程池）
+            tokens = await self.text_processor.tokenize_async(
+                content, remove_stopwords=True
+            )
+            processed_content = " ".join(tokens)
+
+            async with self._connect() as db:
+                # 先删除旧索引
+                await db.execute(
+                    f"DELETE FROM {self.fts_table} WHERE doc_id = ?", (doc_id,)
+                )
+
+                # 插入新索引
+                await db.execute(
+                    f"INSERT INTO {self.fts_table}(doc_id, content) VALUES (?, ?)",
+                    (doc_id, processed_content),
+                )
+
+                await db.commit()
+                logger.debug(f"[BM25] 成功更新文档索引 doc_id={doc_id}")
+                return True
+
+        except Exception as e:
+            logger.error(f"[BM25] 更新文档失败 (doc_id={doc_id}): {e}")
+            return False

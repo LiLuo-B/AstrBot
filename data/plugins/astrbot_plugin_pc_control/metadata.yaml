@@ -1,0 +1,5 @@
+name: astrbot_plugin_pc_control
+display_name: PC Control
+author: LiLuo-B
+version: v0.1.0
+desc: 用于控制局域网内的PC

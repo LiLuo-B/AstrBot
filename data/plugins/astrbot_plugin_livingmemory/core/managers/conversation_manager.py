@@ -1,0 +1,1184 @@
+"""
+会话管理器 - ConversationManager
+提供高级的会话和消息管理功能
+
+功能:
+- 会话生命周期管理
+- LRU缓存热点会话
+- 上下文窗口管理
+- 群聊场景支持
+- AstrBot事件集成
+"""
+
+import asyncio
+import copy
+import math
+import time
+from collections import OrderedDict
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.api.platform import MessageType
+
+from ...storage.conversation_store import ConversationStore
+from ..memory_scope import resolve_sender_alias
+from ..models.conversation_models import Message, Session
+from ..utils.history_alignment import compute_revert_cutoff
+
+
+class ConversationManager:
+    """
+    会话管理器 - 提供高级的会话和消息管理功能
+
+    功能:
+    - 会话生命周期管理
+    - LRU缓存热点会话
+    - 上下文窗口管理
+    - 群聊场景支持
+    - AstrBot事件集成
+    """
+
+    _UNKNOWN_SENDER_NAMES = {
+        "",
+        "unknown",
+        "Unknown",
+        "none",
+        "null",
+        "n/a",
+        "na",
+        "user",
+        "user_",
+        "tg",
+        "未知",
+    }
+
+    def __init__(
+        self,
+        store: ConversationStore,
+        max_cache_size: int = 100,
+        context_window_size: int = 50,
+        session_ttl: int = 3600,
+        identity_aliases: str = "",
+    ):
+        """
+        初始化会话管理器
+
+        Args:
+            store: ConversationStore实例
+            max_cache_size: LRU缓存大小
+            context_window_size: 上下文窗口大小(保留最近N条消息)
+            session_ttl: 会话过期时间(秒)
+        """
+        self.store = store
+        self.max_cache_size = max_cache_size
+        self.context_window_size = context_window_size
+        self.session_ttl = session_ttl
+        self.identity_aliases = identity_aliases
+
+        # LRU缓存: {session_id: (messages, last_access_time)}
+        self._cache: OrderedDict = OrderedDict()
+        # 缓存锁，保护并发访问
+        self._cache_lock = asyncio.Lock()
+
+        # 会话修订号: {session_id: revision}
+        # 任何会使"基于旧消息范围"的后台记忆总结任务失效的破坏性操作
+        # （WebUI 编辑/重试回滚、清空会话/重置元数据）都会推进该编号。
+        # 后台任务在写入记忆与推进总结游标前必须校验修订号未变化，
+        # 否则回滚期间正在执行的总结会把已撤销内容写入长期记忆。
+        self._session_revisions: dict[str, int] = {}
+        # 每会话锁：使"修订号推进"与"带修订校验的游标更新"彼此原子
+        self._session_locks: dict[str, asyncio.Lock] = {}
+
+        logger.info(
+            f"[ConversationManager] 初始化完成: "
+            f"缓存大小={max_cache_size}, 上下文窗口={context_window_size}"
+        )
+
+    async def add_message_from_event(
+        self,
+        event: Any,  # AstrBot MessageEvent
+        role: str,
+        content: str,
+    ) -> Message | None:
+        """
+        从AstrBot事件添加消息(自动提取发送者信息)
+
+        Args:
+            event: AstrBot的MessageEvent对象
+            role: 消息角色 ("user" 或 "assistant")
+            content: 消息内容
+
+        Returns:
+            创建的Message对象；框架合成的唤醒事件返回 None（不写入）
+        """
+        # 使用 unified_msg_origin 作为会话ID，确保多Bot场景下的唯一性
+        session_id = event.unified_msg_origin
+        platform = (
+            event.get_platform_name()
+            if hasattr(event, "get_platform_name")
+            else "unknown"
+        )
+
+        # 定时任务、后台任务与插件唤醒不是用户对话轮次。新版 AstrBot 用
+        # agent_wakeup 事件承载这类唤醒（platform 为目标会话平台），4.29.4 及
+        # 更早的定时任务事件平台为 cron。写入会让反思窗口混入机器人的自主行动
+        # 内容，并改变真实对话的总结节奏（#389）。
+        if getattr(event, "event_kind", "") == "agent_wakeup" or platform == "cron":
+            logger.debug(
+                f"[add_message_from_event] 跳过合成唤醒事件消息: "
+                f"session={session_id}, platform={platform}"
+            )
+            return None
+
+        # 提取发送者信息
+        sender_id = None
+        sender_name = None
+        group_id = None
+
+        # 尝试获取发送者ID
+        if hasattr(event, "get_sender_id"):
+            sender_id = event.get_sender_id()
+        elif hasattr(event, "sender_id"):
+            sender_id = event.sender_id
+
+        # 如果还是没有sender_id,使用session_id作为后备
+        if not sender_id:
+            sender_id = session_id
+
+        sender_name = self._resolve_sender_name(event, sender_id)
+
+        # Debug: 记录原始 message_obj.sender 信息
+        if hasattr(event, "message_obj") and hasattr(event.message_obj, "sender"):
+            raw_sender = event.message_obj.sender
+            logger.debug(
+                f"[add_message_from_event] [{session_id}] 原始sender对象: "
+                f"user_id={getattr(raw_sender, 'user_id', 'N/A')}, "
+                f"nickname={getattr(raw_sender, 'nickname', 'N/A')}"
+            )
+
+        # 判断是否群聊（使用 get_message_type 而非 is_group，更可靠）
+        is_group = False
+        if hasattr(event, "get_message_type"):
+            is_group = event.get_message_type() == MessageType.GROUP_MESSAGE
+            if is_group:
+                group_id = session_id  # 群聊时session_id即为group_id
+
+        # 助手消息必须使用 Bot 自身身份，不能继承触发事件中的用户身份。
+        is_bot_message = role == "assistant"
+        if is_bot_message:
+            sender_id, sender_name = self._resolve_bot_identity(event, str(platform))
+
+        # 调试日志：记录最终获取到的发送者信息
+        logger.debug(
+            f"[add_message_from_event] [{session_id}] 最终发送者信息: "
+            f"sender_id={sender_id}, sender_name='{sender_name}', "
+            f"role={role}, is_group={is_group}, group_id={group_id}"
+        )
+
+        if role == "user":
+            sender_name = resolve_sender_alias(
+                self.identity_aliases,
+                str(platform),
+                str(sender_id),
+                sender_name,
+            )
+
+        # 记录 LLM 轮次标识（webchat 事件 extra 携带），用于 WebUI
+        # 编辑/重试后的对话历史对账（见 core/utils/history_alignment.py）
+        metadata: dict[str, Any] = {}
+        checkpoint_id = None
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            try:
+                checkpoint_id = get_extra("llm_checkpoint_id")
+            except Exception:
+                checkpoint_id = None
+        if isinstance(checkpoint_id, str) and checkpoint_id:
+            metadata["llm_checkpoint_id"] = checkpoint_id
+
+        return await self.add_message(
+            session_id=session_id,
+            role=role,
+            content=content,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            group_id=group_id,
+            platform=platform,
+            is_bot_message=(role == "assistant"),
+            metadata=metadata,
+            timestamp=self._resolve_event_timestamp(event),
+        )
+
+    @staticmethod
+    def _resolve_event_timestamp(event: Any) -> float | None:
+        """读取平台消息时间戳；缺失/非法/明显超前时返回 None 表示回退接收时间。
+
+        用户消息与其助手回复共用同一事件时间戳，避免按天切分总结窗口时把同一轮
+        对话切到两个窗口里；Android/iOS 等适配器给出的毫秒时间戳会被超前判断拒绝。
+        """
+        message_obj = getattr(event, "message_obj", None)
+        raw_timestamp = getattr(message_obj, "timestamp", None)
+        if isinstance(raw_timestamp, bool):
+            return None
+        try:
+            timestamp = float(raw_timestamp)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        # 明显超前（如毫秒时间戳或平台时钟异常）不可信，回退到接收时间
+        if timestamp > time.time() + 300:
+            return None
+        return timestamp
+
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        sender_id: str | None = None,
+        sender_name: str | None = None,
+        group_id: str | None = None,
+        platform: str = "unknown",
+        is_bot_message: bool = False,
+        metadata: dict[str, Any] | None = None,
+        timestamp: float | None = None,
+    ) -> Message:
+        """
+        添加消息到会话
+
+        Args:
+            session_id: 会话ID
+            role: 角色 ("user" 或 "assistant")
+            content: 消息内容
+            sender_id: 发送者ID
+            sender_name: 发送者昵称
+            group_id: 群组ID(群聊场景)
+            platform: 平台标识
+            metadata: 额外元数据（如 llm_checkpoint_id）
+            timestamp: 平台消息时间戳（秒）；缺失或非正数时使用当前时间
+
+        Returns:
+            创建的Message对象
+        """
+        # 如果没有sender_id,使用session_id
+        if not sender_id:
+            sender_id = session_id
+
+        # 平台时间戳优先，非法/缺失时回退到接收时间
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                provided_timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                provided_timestamp = 0.0
+            if math.isfinite(provided_timestamp) and provided_timestamp > 0:
+                message_timestamp = provided_timestamp
+
+        # 创建消息对象
+        message = Message(
+            id=0,  # 将由数据库分配
+            session_id=session_id,
+            role=role,
+            content=content,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            group_id=group_id,
+            platform=platform,
+            timestamp=message_timestamp,
+            metadata=dict(metadata or {}),
+        )
+        if is_bot_message:
+            message.metadata["is_bot_message"] = True
+
+        # 存储到数据库
+        message_id = await self.store.add_message(message)
+        message.id = message_id
+
+        # 使缓存失效(下次获取时重新加载)
+        async with self._cache_lock:
+            if session_id in self._cache:
+                del self._cache[session_id]
+
+        logger.debug(
+            f"[ConversationManager] 添加消息: session={session_id}, "
+            f"role={role}, sender={sender_id}"
+        )
+
+        # 添加后获取最新的消息统计
+        session_info = await self.store.get_session(session_id)
+        if session_info:
+            logger.debug(
+                f"[DEBUG-AddMessage] [{session_id}] 添加消息后，当前总消息数: {session_info.message_count}"
+            )
+
+        return message
+
+    @classmethod
+    def _normalize_sender_name(cls, value) -> str | None:
+        """过滤平台占位昵称，保留可读名称。"""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text.lower() in cls._UNKNOWN_SENDER_NAMES:
+            return None
+        return text
+
+    @staticmethod
+    def _raw_get(obj, key: str):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    @classmethod
+    def _call_event_getter(cls, event, method_name: str):
+        getter = getattr(event, method_name, None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception as exc:
+            logger.debug(f"读取事件方法 {method_name} 失败: {exc}")
+            return None
+
+    @classmethod
+    def _resolve_bot_identity(cls, event, platform: str) -> tuple[str, str]:
+        """Resolve a Bot identity without falling back to the triggering user."""
+        message_obj = getattr(event, "message_obj", None)
+        raw_message = getattr(message_obj, "raw_message", None)
+
+        bot_id = None
+        for candidate in (
+            cls._call_event_getter(event, "get_self_id"),
+            cls._raw_get(message_obj, "self_id"),
+            cls._raw_get(raw_message, "self_id"),
+        ):
+            bot_id = cls._normalize_sender_name(candidate)
+            if bot_id:
+                break
+
+        bot_name = None
+        for source in (event, message_obj, raw_message):
+            for key in ("bot_name", "bot_nickname", "self_name"):
+                bot_name = cls._normalize_sender_name(cls._raw_get(source, key))
+                if bot_name:
+                    break
+            if bot_name:
+                break
+
+        if bot_id:
+            return bot_id, bot_name or bot_id
+
+        platform_id = cls._normalize_sender_name(
+            cls._call_event_getter(event, "get_platform_id")
+        )
+        fallback_scope = (
+            platform_id or cls._normalize_sender_name(platform) or "unknown"
+        )
+        return f"bot:{fallback_scope}", bot_name or "Bot"
+
+    @classmethod
+    def _format_raw_user_name(cls, raw_user, sender_id: str | None) -> str | None:
+        username = cls._normalize_sender_name(cls._raw_get(raw_user, "username"))
+        if username:
+            return username
+
+        first_name = cls._normalize_sender_name(cls._raw_get(raw_user, "first_name"))
+        last_name = cls._normalize_sender_name(cls._raw_get(raw_user, "last_name"))
+        full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+        if full_name:
+            return full_name
+
+        display_name = cls._normalize_sender_name(cls._raw_get(raw_user, "full_name"))
+        if display_name:
+            return display_name
+
+        raw_id = cls._normalize_sender_name(cls._raw_get(raw_user, "id"))
+        if raw_id:
+            return raw_id
+
+        return cls._normalize_sender_name(sender_id)
+
+    @classmethod
+    def _iter_raw_sender_candidates(cls, event):
+        message_obj = getattr(event, "message_obj", None)
+        raw_message = getattr(message_obj, "raw_message", None)
+        for source in (
+            raw_message,
+            cls._raw_get(raw_message, "message"),
+            cls._raw_get(raw_message, "effective_message"),
+            cls._raw_get(raw_message, "callback_query"),
+        ):
+            raw_user = cls._raw_get(source, "from_user")
+            if raw_user is not None:
+                yield raw_user
+        effective_user = cls._raw_get(raw_message, "effective_user")
+        if effective_user is not None:
+            yield effective_user
+
+    @classmethod
+    def _resolve_sender_name(cls, event, sender_id: str | None) -> str | None:
+        sender_name = None
+        if hasattr(event, "get_sender_name"):
+            sender_name = event.get_sender_name()
+        elif hasattr(event, "sender_name"):
+            sender_name = event.sender_name
+
+        normalized = cls._normalize_sender_name(sender_name)
+
+        # Fallback for platforms like Telegram: if sender_name is a placeholder
+        # (e.g. "Unknown"), try to extract first_name + last_name from raw sender
+        if not normalized:
+            message_obj = getattr(event, "message_obj", None)
+            raw_sender = getattr(message_obj, "sender", None)
+            first_name = cls._normalize_sender_name(
+                cls._raw_get(raw_sender, "first_name")
+            )
+            last_name = cls._normalize_sender_name(
+                cls._raw_get(raw_sender, "last_name")
+            )
+            full_name = " ".join(
+                part for part in (first_name, last_name) if part
+            ).strip()
+            if full_name:
+                return full_name
+
+        if normalized:
+            return normalized
+
+        message_obj = getattr(event, "message_obj", None)
+        raw_sender = getattr(message_obj, "sender", None)
+        raw_nickname = cls._normalize_sender_name(cls._raw_get(raw_sender, "nickname"))
+        if raw_nickname:
+            return raw_nickname
+
+        for raw_user in cls._iter_raw_sender_candidates(event):
+            candidate = cls._format_raw_user_name(raw_user, sender_id)
+            if candidate:
+                return candidate
+
+        return cls._normalize_sender_name(sender_id)
+
+    async def get_context(
+        self,
+        session_id: str,
+        max_messages: int | None = None,
+        sender_id: str | None = None,
+        format_for_llm: bool = True,
+    ) -> list[dict[str, str]]:
+        """
+        获取会话上下文(用于LLM)
+
+        Args:
+            session_id: 会话ID
+            max_messages: 最大消息数(None则使用context_window_size)
+            sender_id: 过滤特定发送者(群聊场景)
+            format_for_llm: 是否格式化为LLM格式
+
+        Returns:
+            消息列表,格式: [{"role": "user", "content": "..."}, ...]
+        """
+        limit = max_messages or self.context_window_size
+
+        # 获取消息
+        messages = await self.get_messages(
+            session_id=session_id, limit=limit, sender_id=sender_id, use_cache=True
+        )
+
+        if format_for_llm:
+            # 格式化为LLM格式
+            # 只在群聊场景(有group_id)时添加发送者名称前缀
+            return [
+                msg.format_for_llm(include_sender_name=bool(msg.group_id))
+                for msg in messages
+            ]
+        else:
+            # 返回原始格式
+            return [msg.to_dict() for msg in messages]
+
+    async def get_messages(
+        self,
+        session_id: str,
+        limit: int = 50,
+        sender_id: str | None = None,
+        use_cache: bool = True,
+    ) -> list[Message]:
+        """
+        获取会话消息
+
+        Args:
+            session_id: 会话ID
+            limit: 限制数量
+            sender_id: 过滤发送者
+            use_cache: 是否使用缓存
+
+        Returns:
+            Message对象列表
+        """
+        # 如果指定了sender_id,不使用缓存(需要过滤)
+        if sender_id:
+            use_cache = False
+
+        # 尝试从缓存获取
+        if use_cache:
+            cached_messages = await self._get_from_cache(session_id)
+            if cached_messages is not None:
+                # 从缓存中截取需要的数量
+                return cached_messages[-limit:] if limit else cached_messages
+
+        # 从数据库获取
+        messages = await self.store.get_messages(
+            session_id=session_id, limit=limit, sender_id=sender_id
+        )
+
+        # 更新缓存(仅当不是过滤查询时)
+        if not sender_id and use_cache:
+            await self._update_cache(session_id, messages)
+
+        return messages
+
+    async def get_session_info(self, session_id: str) -> Session | None:
+        """
+        获取会话信息
+
+        Args:
+            session_id: 会话ID
+
+        Returns:
+            Session对象,不存在则返回None
+        """
+        session = await self.store.get_session(session_id)
+        if session:
+            logger.debug(
+                f"[DEBUG-SessionInfo] [{session_id}] 会话信息: "
+                f"message_count={session.message_count}, "
+                f"created_at={session.created_at}, "
+                f"last_active_at={session.last_active_at}"
+            )
+        else:
+            logger.warning(f"[DEBUG-SessionInfo] [{session_id}] 会话不存在")
+        return session
+
+    async def get_recent_sessions(self, limit: int = 10) -> list[Session]:
+        """
+        获取最近活跃的会话
+
+        Args:
+            limit: 返回数量限制
+
+        Returns:
+            Session对象列表
+        """
+        return await self.store.get_recent_sessions(limit)
+
+    async def clear_session(self, session_id: str):
+        """
+        清空会话历史
+
+        Args:
+            session_id: 会话ID
+        """
+        # 删除消息 + 重置元数据 + 推进修订号必须落在同一临界区：否则"已通过
+        # 修订号校验、正在写旧游标"的后台总结任务会在清空之后复活总结进度
+        # （count=0 但 cursor>0），使清空后的新消息被跳过总结。
+        async with self._session_lock(session_id):
+            await self.store.delete_session_messages(session_id)
+            await self._reset_session_metadata_locked(session_id)
+            revision = await self._bump_session_revision_locked(session_id)
+
+        # 清除缓存（放在锁外，尽量缩短临界区）
+        async with self._cache_lock:
+            self._cache.pop(session_id, None)
+
+        logger.info(
+            f"[ConversationManager] 已清空会话并重置记忆上下文: {session_id}"
+            f"（会话修订号推进至 {revision}，进行中的总结任务已失效）"
+        )
+
+    async def reconcile_session_tail(
+        self,
+        session_id: str,
+        ctx_checkpoints: list[str],
+    ) -> int:
+        """与 AstrBot LLM 历史对账：清理已被 WebUI 编辑/重试撤销的尾部轮次。
+
+        WebUI 的「编辑上一条消息并重新请求」「换模型重试上一条对话」会在
+        LLM 侧截断/删除对应轮次，但对插件不可见。本方法以 req.contexts 中的
+        ``_checkpoint`` 段为锚点，删除插件会话库尾部残留的被撤销消息，并同步
+        修正 message_count 与总结游标。无法安全判定的场景（如遗留数据没有
+        checkpoint）保守跳过。
+
+        说明：
+        1. 位置排序键与滑动窗口/游标语义一致（``timestamp ASC, id ASC``）；
+        2. 与后台记忆总结任务并发时，本方法只做尾部删除；被删消息若已被总结
+           写入记忆，不会自动撤回（由 CHANGELOG 声明为已知局限），游标钳制
+           后会跳过被删范围，避免重复总结；
+        3. 删除成功后，在**同一会话锁临界区**内钳制总结游标
+           （``last_summarized_index`` 与越界的 ``pending_summary``）并推进会话
+           修订号（见 :meth:`bump_session_revision`），使删除前取好消息范围、
+           仍在等待 LLM 的总结任务失效——它不得再写入已撤销内容，也不得把游标
+           写回旧位置（条件写入侧还会按当前消息数兜底钳制，见
+           :meth:`update_session_metadata_if_revision`）；
+        4. 即使无需删除（空会话、库尾一致、无法安全判定、删除数为 0），也会做
+           一次廉价自愈，修正倒挂的游标/越界待处理范围——否则反思逻辑不会自愈，
+           新消息会被永久跳过总结。
+
+        Args:
+            session_id: 会话ID
+            ctx_checkpoints: AstrBot LLM 历史（req.contexts）中 ``_checkpoint``
+                段的 id 有序列表（不含当前请求的消息轮次）
+
+        Returns:
+            int: 删除的消息数量（0 表示无需删除或无法安全判定）
+        """
+        if not session_id:
+            return 0
+        try:
+            # 快速退出：会话为空无需对账
+            total = await self.store.get_message_count(session_id)
+            if total <= 0:
+                # 空会话同样可能残留倒挂游标（清空与旧写入交错），一并自愈
+                await self._repair_cursor_if_out_of_range(session_id, 0)
+                return 0
+
+            # 尾行短路：库尾（最后完整轮次）与 LLM 历史末位 checkpoint 一致时，
+            # 不存在被回滚的尾部（AstrBot 只允许编辑/重试最新轮），可直接返回，
+            # 避免每个请求都做全量遍历
+            ctx_checkpoints = list(ctx_checkpoints or [])
+            if ctx_checkpoints:
+                last_message = await self.store.get_last_message(session_id)
+                if last_message is not None:
+                    last_checkpoint = (last_message.metadata or {}).get(
+                        "llm_checkpoint_id"
+                    )
+                    if (
+                        isinstance(last_checkpoint, str)
+                        and last_checkpoint == ctx_checkpoints[-1]
+                    ):
+                        # 短路返回前做一次廉价自愈：游标倒挂（cursor > count，
+                        # 例如回滚后旧写入落地、或异常中断遗留）不会被反思逻辑
+                        # 自行修复，会导致新消息永远跳过总结。
+                        await self._repair_cursor_if_out_of_range(session_id, total)
+                        return 0
+
+            rows = await self.store.get_session_message_refs_asc(session_id)
+            if not rows:
+                await self._repair_cursor_if_out_of_range(session_id, total)
+                return 0
+
+            cutoff = compute_revert_cutoff(rows, ctx_checkpoints)
+            if cutoff is None:
+                # 保守放弃删除，但不放任倒挂游标
+                await self._repair_cursor_if_out_of_range(session_id, total)
+                return 0
+
+            # 只删除快照中确认失效的那些 id：按位置/时间边界删除会连带删掉
+            # 快照之后并发新增的合法消息，并在库中留下永久缺口（对账再也认不出它）
+            doomed = [
+                int(row["id"]) for row in rows[cutoff:] if row.get("id") is not None
+            ]
+            if not doomed:
+                await self._repair_cursor_if_out_of_range(session_id, total)
+                return 0
+
+            deleted = await self.store.delete_messages_from_position(
+                session_id, cutoff, message_ids=doomed
+            )
+            if deleted > 0:
+                # 删除本身在锁外完成（放进锁内会与"正在写元数据"的后台任务
+                # 互相阻塞，且回滚必须能在旧写入等待期间完成清理）；但
+                # **游标钳制与修订号推进必须在同一临界区内**，这样无论旧写入
+                # 落在删除之前还是之后，最终状态都满足 cursor <= message_count。
+                async with self._session_lock(session_id):
+                    repaired = await self._repair_summary_state_locked(session_id)
+                    await self._bump_session_revision_locked(session_id)
+                await self.invalidate_cache(session_id)
+                logger.info(
+                    f"[{session_id}] 检测到 WebUI 对话回滚（编辑/重试），"
+                    f"已清理 {deleted} 条被撤销消息"
+                    + (f"，已钳制 {repaired}" if repaired else "")
+                )
+            else:
+                await self._repair_cursor_if_out_of_range(session_id, total)
+            return deleted
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[{session_id}] 对话历史对账失败（已跳过）: {exc}")
+            return 0
+
+    def _session_lock(self, session_id: str) -> asyncio.Lock:
+        """获取（惰性创建）会话级锁，用于协调修订号与总结游标更新。"""
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
+
+    def _prune_session_state(self, session_ids: list[str]) -> None:
+        """回收已删除会话的锁与修订号条目（#289）。
+
+        只回收当前未上锁且无等待者的锁：若仍有在途操作持有或等待该会话锁，
+        直接删除会让后续 ``_session_lock()`` 创建出第二把锁，同一会话出现两个
+        临界区；这类残留留到下次清理再回收（修订号随锁一并保留，避免旧修订号
+        校验意外通过）。
+        """
+        for session_id in session_ids:
+            lock = self._session_locks.get(session_id)
+            if lock is not None:
+                # asyncio.Lock 的 _waiters 是等待队列，空队列为 None/空
+                if lock.locked() or getattr(lock, "_waiters", None):
+                    continue
+                self._session_locks.pop(session_id, None)
+            self._session_revisions.pop(session_id, None)
+
+    async def get_summary_window(
+        self, session_id: str, limit: int
+    ) -> tuple[int, list[Message]]:
+        """Read a cursor and its bounded snapshot without an intervening head trim."""
+        async with self._session_lock(session_id):
+            session = await self.store.get_session(session_id)
+            metadata = session.metadata
+            start = int(metadata.get("last_summarized_index", 0) or 0)
+            pending = metadata.get("pending_summary")
+            if pending:
+                start = min(start, int(pending.get("start_index", start)))
+            messages = await self.store.get_messages_range(
+                session_id, offset=start, limit=limit
+            )
+            return start, messages
+
+    async def commit_summary_cursor(
+        self, session_id: str, last_message: Message, expected_revision: int | None
+    ) -> bool:
+        """Atomically locate a completed snapshot in the retained history."""
+        async with self._session_lock(session_id):
+            if (
+                expected_revision is not None
+                and self._session_revisions.get(session_id, 0) != expected_revision
+            ):
+                return False
+            await self.store.commit_summary_cursor(
+                session_id, last_message.timestamp, last_message.id
+            )
+            await self.invalidate_cache(session_id)
+            return True
+
+    async def trim_session_messages(
+        self, session_id: str, delete_count: int, *, delete_unsummarized: bool = False
+    ) -> int:
+        """Trim buffered history; completed snapshots commit using stable message anchors."""
+        if delete_count <= 0:
+            return 0
+        async with self._session_lock(session_id):
+            deleted = await self.store.trim_session_messages(
+                session_id, delete_count, delete_unsummarized=delete_unsummarized
+            )
+        if deleted > 0:
+            await self.invalidate_cache(session_id)
+            logger.info(
+                f"[ConversationManager] Trimmed {deleted} oldest messages: {session_id}"
+            )
+        return deleted
+
+    async def get_session_revision(self, session_id: str) -> int:
+        """获取会话修订号（0 表示尚无使后台总结任务失效的变更）。"""
+        return self._session_revisions.get(session_id, 0)
+
+    async def bump_session_revision(self, session_id: str) -> int:
+        """推进会话修订号，使基于旧消息范围的后台总结任务失效。
+
+        用于 WebUI 编辑/重试回滚、清空会话等破坏性操作。后台任务必须通过
+        :meth:`update_session_metadata_if_revision` 或自行比对修订号后放弃写入。
+        """
+        async with self._session_lock(session_id):
+            revision = await self._bump_session_revision_locked(session_id)
+        logger.info(
+            f"[{session_id}] 会话修订号推进至 {revision}（进行中的总结任务已失效）"
+        )
+        return revision
+
+    async def _bump_session_revision_locked(self, session_id: str) -> int:
+        """推进修订号（调用方必须已持有该会话的 ``_session_lock``）。"""
+        revision = self._session_revisions.get(session_id, 0) + 1
+        self._session_revisions[session_id] = revision
+        return revision
+
+    async def _persist_session_metadata(
+        self, session_id: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        """整体写回会话元数据，并原子钳制总结游标（返回被修正的键）。
+
+        钳制在 store 的 ``_write_lock`` 内完成，与滑动窗口清理、对账删除互斥：
+        "读消息数 -> 钳制 -> 写入"不会被 trim/delete 穿插，因此不会把越界游标写回。
+        """
+        if self.store.connection is None:
+            return {}
+        try:
+            repaired = await self.store.update_session_metadata_atomic(
+                session_id, metadata
+            )
+        except Exception as e:
+            logger.error(f"更新会话元数据失败: {e}", exc_info=True)
+            return {}
+        if repaired:
+            logger.warning(
+                f"[{session_id}] 会话元数据写入时钳制了越界总结游标: {repaired}"
+            )
+        return repaired
+
+    def _summary_state_out_of_range(self, metadata: dict[str, Any], count: int) -> bool:
+        """游标倒挂或待处理范围越界？（判定与 store 的钳制规则严格一致）
+
+        直接在副本上跑 store 的 ``_clamp_summary_metadata`` 并看是否有改动，
+        避免"两套规则"漂移（例如不足一轮的 pending、非整数游标）。
+        """
+        return bool(self.store._clamp_summary_metadata(copy.deepcopy(metadata), count))
+
+    async def _repair_summary_state_locked(self, session_id: str) -> dict[str, Any]:
+        """把总结游标/待处理范围钳制回当前消息数量内（调用方须持会话锁）。
+
+        处理两类失效状态（都会导致"新消息被跳过总结"）：
+        - ``last_summarized_index > message_count``：回滚/清空后旧游标倒挂；
+        - ``pending_summary`` 越界：起点已越过末尾则整条清除，终点越界则收敛，
+          收敛后不足一轮（< 2 条）则清除。
+
+        钳制规则与滑动窗口、按 id 删除共用 store 的 ``_clamp_summary_metadata``。
+
+        Returns:
+            dict: 实际被修正的键（空字典表示无需修正）。
+        """
+        session = await self.store.get_session(session_id)
+        if not session:
+            return {}
+        metadata = session.metadata or {}
+        count = await self.store.get_message_count(session_id)
+        if not self._summary_state_out_of_range(metadata, count):
+            return {}
+        return await self._persist_session_metadata(session_id, metadata)
+
+    async def _repair_cursor_if_out_of_range(self, session_id: str, total: int) -> None:
+        """廉价自愈入口：仅在游标倒挂或待处理范围越界时才进入临界区修正。"""
+        session = await self.store.get_session(session_id)
+        if not session:
+            return
+        metadata = session.metadata or {}
+        if not self._summary_state_out_of_range(metadata, total):
+            return
+        cursor = metadata.get("last_summarized_index")
+        async with self._session_lock(session_id):
+            repaired = await self._repair_summary_state_locked(session_id)
+            await self._bump_session_revision_locked(session_id)
+        logger.warning(
+            f"[{session_id}] 总结游标/待处理范围越界"
+            f"（cursor={cursor}, count={total}），已钳制并推进修订号: {repaired}"
+        )
+
+    async def update_session_metadata_if_revision(
+        self,
+        session_id: str,
+        key: str,
+        value: Any,
+        expected_revision: int,
+    ) -> bool:
+        """仅在会话修订号未变化时更新元数据（校验与写入原子）。
+
+        与 :meth:`bump_session_revision` 争用同一会话锁，因此在回滚面前是原子的：
+        回滚要么发生在本方法写入之前（校验失败、返回 ``False``，调用方必须放弃
+        推进游标），要么发生在其后（回滚会重新钳制游标与待处理范围）。
+
+        Returns:
+            bool: True 表示已写入；False 表示会话已被回滚/清空，写入被拒绝。
+        """
+        async with self._session_lock(session_id):
+            if self._session_revisions.get(session_id, 0) != expected_revision:
+                return False
+            # 已持会话锁：调用无锁变体，避免 asyncio.Lock 不可重入导致死锁（#289）；
+            # 钳制仍在 store 的写锁内完成，语义与公共写入一致。
+            await self._update_session_metadata_locked(session_id, key, value)
+            return True
+
+    async def get_last_message(self, session_id: str) -> Message | None:
+        """获取会话最后一条消息（按会话顺序）。
+
+        Args:
+            session_id: 会话ID
+
+        Returns:
+            Message 或 None
+        """
+        return await self.store.get_last_message(session_id)
+
+    async def cleanup_expired_sessions(self) -> int:
+        """
+        清理过期会话，并回收对应的会话锁与修订号条目。
+
+        Returns:
+            清理的会话数量
+        """
+        ttl_seconds = max(60, int(self.session_ttl))
+        deleted_sessions = await self.store.delete_old_sessions(ttl_seconds=ttl_seconds)
+        deleted_count = len(deleted_sessions)
+
+        # 会话已从库中删除，回收其内存状态，避免长期运行后字典无限增长（#289）
+        self._prune_session_state(deleted_sessions)
+
+        # 清空缓存(可能包含已删除的会话)
+        async with self._cache_lock:
+            self._cache.clear()
+
+        if deleted_count > 0:
+            logger.info(
+                f"[ConversationManager] 清理过期会话: {deleted_count}个 "
+                f"(TTL={ttl_seconds}秒)"
+            )
+
+        return deleted_count
+
+    async def _update_cache(self, session_id: str, messages: list[Message]):
+        """
+        更新LRU缓存
+
+        Args:
+            session_id: 会话ID
+            messages: 消息列表
+        """
+        async with self._cache_lock:
+            # 如果已存在,先删除(会被添加到末尾)
+            if session_id in self._cache:
+                del self._cache[session_id]
+
+            # 添加到末尾(最新)
+            self._cache[session_id] = (messages, time.time())
+
+            # 如果超过容量,删除最旧的
+            if len(self._cache) > self.max_cache_size:
+                self._cache.popitem(last=False)  # 删除最前面的(最旧)
+
+    async def _get_from_cache(self, session_id: str) -> list[Message] | None:
+        """
+        从缓存获取消息
+
+        Args:
+            session_id: 会话ID
+
+        Returns:
+            消息列表,不存在则返回None
+        """
+        async with self._cache_lock:
+            if session_id in self._cache:
+                messages, _ = self._cache[session_id]
+                # 移到末尾(标记为最新访问)
+                self._cache.move_to_end(session_id)
+                # 更新访问时间
+                self._cache[session_id] = (messages, time.time())
+                return messages
+        return None
+
+    async def invalidate_cache(self, session_id: str):
+        """
+        使指定会话的缓存失效（公共接口）
+
+        Args:
+            session_id: 会话ID
+        """
+        async with self._cache_lock:
+            if session_id in self._cache:
+                del self._cache[session_id]
+
+    async def get_messages_range(
+        self, session_id: str, start_index: int = 0, end_index: int | None = None
+    ) -> list[Message]:
+        """
+        获取指定范围的消息（用于滑动窗口总结）
+
+        Args:
+            session_id: 会话ID
+            start_index: 起始消息索引（从0开始，包含）
+            end_index: 结束消息索引（不包含），None表示到最后
+
+        Returns:
+            Message对象列表
+        """
+        # 先获取会话信息以确定消息总数
+        session_info = await self.get_session_info(session_id)
+        if not session_info:
+            logger.warning(f"[get_messages_range] 会话 {session_id} 不存在")
+            return []
+
+        recorded_count = session_info.message_count
+
+        # 获取实际消息数量（用于一致性检查）
+        actual_count = await self.store.get_message_count(session_id)
+
+        # 数据一致性检查：如果 sessions 表记录的 message_count 与实际不符
+        if recorded_count != actual_count:
+            logger.warning(
+                f"[get_messages_range] [{session_id}] 数据不一致! "
+                f"sessions表记录={recorded_count}, 实际消息数={actual_count}，正在同步..."
+            )
+            # 使用实际消息数量，并触发同步修复
+            await self.store.sync_message_counts()
+
+        total_messages = actual_count  # 使用实际消息数量
+
+        # 确定实际需要获取的范围
+        actual_end = end_index if end_index is not None else total_messages
+
+        # 验证索引范围
+        if start_index < 0:
+            logger.warning(
+                f"[get_messages_range] [{session_id}] 起始索引 {start_index} < 0，调整为 0"
+            )
+            start_index = 0
+
+        if start_index >= total_messages:
+            logger.warning(
+                f"[get_messages_range] [{session_id}] 起始索引 {start_index} >= 实际消息总数 {total_messages}，返回空列表"
+            )
+            return []
+
+        if actual_end > total_messages:
+            logger.warning(
+                f"[get_messages_range] [{session_id}] 结束索引 {actual_end} 超出范围，调整为 {total_messages}"
+            )
+            actual_end = total_messages
+
+        if start_index >= actual_end:
+            logger.warning(
+                f"[get_messages_range] [{session_id}] 起始索引 {start_index} >= 结束索引 {actual_end}，返回空列表"
+            )
+            return []
+
+        # 计算需要获取的消息数量
+        needed_count = actual_end - start_index
+
+        logger.debug(
+            f"[get_messages_range] [{session_id}] 准备获取消息: "
+            f"实际总数={total_messages}, 范围=[{start_index}:{actual_end}], "
+            f"需要={needed_count}条"
+        )
+
+        # 使用 store 的 get_messages_range 方法（基于 OFFSET/LIMIT）
+        result = await self.store.get_messages_range(
+            session_id=session_id,
+            offset=start_index,
+            limit=needed_count,
+        )
+
+        logger.info(
+            f"[get_messages_range] [{session_id}] 返回 {len(result)} 条消息 (索引 {start_index} 到 {actual_end})"
+        )
+
+        return result
+
+    async def update_session_metadata(
+        self, session_id: str, key: str, value: Any
+    ) -> None:
+        """更新会话元数据（整字典读-改-写在会话锁内完成）。
+
+        ``last_summarized_index`` 与 ``pending_summary`` 会在 store 的写锁内按当前
+        消息数原子钳制：无条件写入（手动总结、反思自愈等）也必须满足
+        ``cursor <= message_count``，否则旧游标会被写回，反思自愈再把它钳到消息数，
+        导致重发的那一轮被静默吞掉（不触发总结）。
+
+        整个"读会话 → 改键 → 写回"持会话锁，与 :meth:`bump_session_revision`、
+        对账回滚等临界区互斥，避免并发写入基于同一旧快照互相覆盖无关键（#289）。
+
+        Args:
+            session_id: 会话ID
+            key: 元数据键
+            value: 元数据值
+        """
+        async with self._session_lock(session_id):
+            await self._update_session_metadata_locked(session_id, key, value)
+
+    async def _update_session_metadata_locked(
+        self, session_id: str, key: str, value: Any
+    ) -> None:
+        """更新会话元数据（调用方必须已持有该会话的 ``_session_lock``）。
+
+        ``asyncio.Lock`` 不可重入，锁内调用方（如
+        :meth:`update_session_metadata_if_revision`）必须使用本方法，而不是公共包装。
+        """
+        session = await self.store.get_session(session_id)
+        if not session:
+            logger.warning(
+                f"[ConversationManager] 会话 {session_id} 不存在，无法更新元数据"
+            )
+            return
+
+        # 更新元数据
+        session.metadata[key] = value
+
+        # 保存到数据库
+        await self._persist_session_metadata(session_id, session.metadata)
+
+        logger.debug(
+            f"[ConversationManager] 更新会话元数据: {session_id}, {key}={value}"
+        )
+
+    async def get_session_metadata(
+        self, session_id: str, key: str, default: Any = None
+    ) -> Any:
+        """
+        获取会话元数据
+
+        Args:
+            session_id: 会话ID
+            key: 元数据键
+            default: 默认值
+
+        Returns:
+            元数据值，不存在则返回default
+        """
+        session = await self.store.get_session(session_id)
+        if not session:
+            return default
+
+        return session.metadata.get(key, default)
+
+    async def _reset_session_metadata_locked(self, session_id: str) -> None:
+        """清空会话元数据（调用方必须已持有该会话的 ``_session_lock``）。"""
+        session = await self.store.get_session(session_id)
+        if not session:
+            logger.warning(
+                f"[ConversationManager] 尝试重置元数据失败，会话 {session_id} 不存在"
+            )
+            return
+        # 将元数据重置为空字典
+        session.metadata = {}
+        # 保存回数据库
+        await self._persist_session_metadata(session_id, {})
+        logger.info(
+            f"[ConversationManager] 已重置会话 {session_id} 的元数据 (记忆总结计数器已清零)"
+        )
+
+
+def create_conversation_manager(
+    db_path: str, config: dict[str, Any] | None = None
+) -> ConversationManager:
+    """
+    便捷创建函数
+
+    Args:
+        db_path: 数据库路径
+        config: 配置字典,可包含:
+            - max_cache_size: LRU缓存大小
+            - context_window_size: 上下文窗口大小
+            - session_ttl: 会话过期时间
+
+    Returns:
+        ConversationManager实例
+    """
+    config = config or {}
+    store = ConversationStore(db_path)
+
+    return ConversationManager(
+        store=store,
+        max_cache_size=config.get("max_cache_size", 100),
+        context_window_size=config.get("context_window_size", 50),
+        session_ttl=config.get("session_ttl", 3600),
+    )

@@ -1,0 +1,327 @@
+{
+  "analyzer_model": {
+    "type": "string",
+    "description": "[核心模型] 秘书模型",
+    "hint": "用于分析对话、决定是否回复的快速、低成本模型提供商。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "image_caption_provider_id": {
+    "type": "string",
+    "description": "[核心模型] 图片理解模型",
+    "hint": "AngelHeart 的 angel_describe_image 工具使用的视觉模型。主模型仅在需要某张历史图片细节时调用它；请禁用 AstrBot 上游的图转文模型（provider_settings.default_image_caption_provider_id 留空），避免重复处理。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "is_reasoning_model": {
+    "type": "bool",
+    "description": "[核心模型] 只输出 JSON",
+    "hint": "默认开启。如果是带思维链的模型，请不要关闭。关闭后会要求模型先输出分析过程，再输出 JSON。",
+    "default": true
+  },
+  "timing": {
+    "type": "object",
+    "description": "[回复节奏] 前台巡检与助理休息设置",
+    "hint": "调整群聊中前台何时巡检，以及助理被调用后如何避免连续插话。",
+    "items": {
+      "waiting_time": {
+        "type": "float",
+        "description": "助理调用后休息时间（秒）",
+        "hint": "助理被调用后，普通群聊消息不会启动巡检；被点名时可以触发一次加速检查。默认值：30。",
+        "default": 30.0
+      },
+      "assistant_debounce_time": {
+        "type": "float",
+        "description": "点名等待时间（秒）",
+        "hint": "有人 @ 助理或叫到助理时，前台会先整理这段时间内的补充消息，再交给秘书根据最后一条消息判断。默认值：1。",
+        "default": 1.0
+      },
+      "secretary_debounce_time": {
+        "type": "float",
+        "description": "前台巡检最长等待时间（秒）",
+        "hint": "助理已经参与群聊时，前台启动巡检后最多等待这段时间就会检查助理忙闲、休息和能量，再决定是否交给秘书判断。默认值：30。",
+        "default": 30.0
+      },
+      "accelerate_debounce_time": {
+        "type": "float",
+        "description": "连续点名加速等待时间（秒）",
+        "hint": "前台正在等待消息补充时又有人叫到助理，会把本轮等待缩短到这里设定的时长，再交给秘书判断。默认值：1。",
+        "default": 1.0
+      },
+      "observation_timeout": {
+        "type": "int",
+        "description": "在场保持时间（秒）",
+        "hint": "助理被叫到后，最多保持参与群聊这么久；超过后，收到下一条消息时会回到不主动参与的状态。默认值：60。",
+        "default": 60
+      }
+    }
+  },
+  "energy": {
+    "type": "object",
+    "description": "[能量设置] 群聊能量与回复消耗",
+    "hint": "能量是助理的精力：话说多了会累，长发言比短发言更消耗。普通巡检前会按经过时间恢复精力；助理实际回复后按基础消耗和回复长度扣能。精力越低，普通巡检越不容易放行；被明确点名的回复不受精力门槛限制。修改参数只影响后续恢复、判断和扣能；已有群的当前精力不会重置。",
+    "items": {
+      "initial_energy": {
+        "type": "float",
+        "description": "初始能量",
+        "hint": "每个群首次创建能量状态时使用的能量值。默认值：100。",
+        "default": 100.0
+      },
+      "max_energy": {
+        "type": "float",
+        "description": "能量上限",
+        "hint": "能量恢复时不会超过这个值。默认值：100。",
+        "default": 100.0
+      },
+      "min_energy": {
+        "type": "float",
+        "description": "能量下限",
+        "hint": "回复扣能时不会低于这个值。默认值：-100。",
+        "default": -100.0
+      },
+      "recovery_per_second": {
+        "type": "float",
+        "description": "每秒恢复能量",
+        "hint": "普通巡检结束前按经过的时间恢复一次能量。默认值：每秒恢复 0.6。",
+        "default": 0.6
+      },
+      "base_reply_cost": {
+        "type": "float",
+        "description": "每次回复基础消耗",
+        "hint": "每次实际形成回复内容时固定扣除的能量。默认值：14。",
+        "default": 14.0
+      },
+      "reply_cost_per_character": {
+        "type": "float",
+        "description": "每字符回复消耗",
+        "hint": "按最终消息链中的有效字符数额外扣除能量。默认值：每字符 0.12。",
+        "default": 0.12
+      }
+    }
+  },
+  "reply_length": {
+    "type": "object",
+    "description": "[回复长度] 常规与焦点字数提醒",
+    "hint": "群聊真正交给助理回复时，会注入一条系统提醒控制回复长度。命中焦点指令后改用更长上限；这是提示词层约束，不强制硬截断。",
+    "items": {
+      "focus_instructions": {
+        "type": "string",
+        "description": "焦点指令（空格分隔）",
+        "hint": "本批群聊消息命中任一短语后，本次回复改用焦点字数提醒。默认值：分析 总结 好好想想 为什么 到底。",
+        "default": "分析 总结 好好想想 为什么 到底"
+      },
+      "normal_reply_max_chars": {
+        "type": "int",
+        "description": "常规回复字数",
+        "hint": "未命中焦点指令时注入的回复上限。默认值：20。",
+        "default": 20
+      },
+      "focus_reply_max_chars": {
+        "type": "int",
+        "description": "焦点回复字数",
+        "hint": "命中焦点指令时注入的回复上限，不能小于常规回复字数。默认值：200。",
+        "default": 200
+      }
+    }
+  },
+  "leave_reply": {
+    "type": "object",
+    "description": "[离场应答] 复读或多人热聊时回复一次",
+    "hint": "开启下列功能后，满足条件时我会回复一次；回复后仍保持不主动参与。",
+    "items": {
+      "leave_echo_reply": {
+        "type": "bool",
+        "description": "复读时回复一次",
+        "hint": "开启后，短时间内同样的文字重复达到设定次数时，我会回复一次。",
+        "default": false
+      },
+      "leave_dense_reply": {
+        "type": "bool",
+        "description": "多人热聊时回复一次",
+        "hint": "开启后，短时间内多人连续发言达到设定条件时，我会回复一次。",
+        "default": false
+      },
+      "echo_detection_threshold": {
+        "type": "int",
+        "description": "同一句话重复几次才回复",
+        "hint": "同样的文字在设定时间内达到这个次数，才会回复一次。",
+        "default": 3
+      },
+      "echo_detection_window": {
+        "type": "int",
+        "description": "统计复读的时间范围（秒）",
+        "hint": "只统计这段时间内重复出现的同样文字。",
+        "default": 30
+      },
+      "dense_conversation_threshold": {
+        "type": "int",
+        "description": "多少条消息算热聊",
+        "hint": "在设定时间内达到这个消息数，才会判定聊天很热闹。",
+        "default": 30
+      },
+      "dense_conversation_window": {
+        "type": "int",
+        "description": "统计热聊的时间范围（秒）",
+        "hint": "只统计这段时间内发出的消息。",
+        "default": 600
+      },
+      "min_participant_count": {
+        "type": "int",
+        "description": "至少几个人同时聊天",
+        "hint": "参与人数达到这个数量，才会判定多人正在热聊。",
+        "default": 5
+      },
+      "familiarity_cooldown_duration": {
+        "type": "int",
+        "description": "两次离场应答的最短间隔（秒）",
+        "hint": "因复读或热聊回复一次后，这段时间内不会再触发下一次离场应答。",
+        "default": 1800
+      }
+    }
+  },
+  "wake_interaction": {
+    "type": "object",
+    "description": "[点名与交互] 点名词与静默控制",
+    "hint": "控制前台如何识别点名、助理昵称如何匹配，以及闭嘴/张嘴静默行为。",
+    "items": {
+      "enter_on_mention_only": {
+        "type": "bool",
+        "description": "仅点名入场",
+        "hint": "启用后，离场时只有点名消息（@或昵称）能入场；关闭后任何消息都会入场处理。",
+        "default": true
+      },
+      "force_reply_when_summoned": {
+        "type": "bool",
+        "description": "被点名时必须回应",
+        "hint": "启用后，只要消息命中人格名称或助理昵称，助理都会直接回复。",
+        "default": true
+      },
+      "reply_even_not_questioned": {
+        "type": "bool",
+        "description": "非提问和感兴趣也回应",
+        "hint": "关闭时，只有群友有求于助理或话题让助理感兴趣才会回复。开启时，即使只是打招呼或闲聊也会回应。",
+        "default": true
+      },
+      "block_unapproved_wake_non_command": {
+        "type": "bool",
+        "description": "拦截未批准的非命令点名",
+        "hint": "启用后，命中上游点名但未通过天使之心批准的非命令消息将被直接拦截。",
+        "default": false
+      },
+      "alias": {
+        "type": "string",
+        "description": "助理昵称",
+        "hint": "用于点名匹配。多个昵称请用 '|' 分隔。",
+        "default": "AI|助手"
+      },
+      "slap_words": {
+        "type": "string",
+        "description": "掌嘴词",
+        "hint": "当消息中包含这些词时，插件将进入静默状态。多个词请用 '|' 分隔。",
+        "default": "闭嘴"
+      },
+      "speak_words": {
+        "type": "string",
+        "description": "张嘴词",
+        "hint": "当消息中包含这些词时，插件将解除闭嘴状态。多个词请用 '|' 分隔。",
+        "default": "张嘴"
+      },
+      "silence_duration": {
+        "type": "int",
+        "description": "闭嘴时长（秒）",
+        "hint": "触发掌嘴后，插件保持静默的时间。",
+        "default": 600
+      }
+    }
+  },
+  "access_control": {
+    "type": "object",
+    "description": "[权限与过滤] 白名单与上下文接管",
+    "hint": "控制插件的作用范围和上下文接管行为。",
+    "items": {
+      "whitelist_enabled": {
+        "type": "bool",
+        "description": "启用群聊白名单",
+        "hint": "启用后只有白名单中的群聊才会触发插件。",
+        "default": false
+      },
+      "chat_ids": {
+        "type": "list",
+        "description": "群聊ID白名单",
+        "hint": "请直接填写需要启用白名单的群聊或好友的QQ号列表。",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "quiet_hours": {
+        "type": "string",
+        "description": "免打扰时段",
+        "hint": "不主动接话的时段，格式与 proactive_chat 的 quiet_hours 一致，如 11-8 表示 23:00~次日 08:00。留空表示不启用。点名不受限制。",
+        "default": ""
+      },
+      "group_chat_enhancement": {
+        "type": "bool",
+        "description": "接管群聊上下文",
+        "hint": "启用后，群聊消息发送给主模型前会由 AngelHeart 重建上下文。请关闭原生的群聊上下文。",
+        "default": true
+      },
+      "takeover_private_chat_context": {
+        "type": "bool",
+        "description": "接管私聊上下文",
+        "hint": "启用后，私聊消息发送给主模型前也会由 AngelHeart 重建上下文。",
+        "default": false
+      }
+    }
+  },
+  "context_compression": {
+    "type": "object",
+    "description": "[上下文压缩] 渐进式压缩参数",
+    "hint": "控制上下文压缩的触发条件和保留策略。",
+    "items": {
+      "max_conversation_tokens": {
+        "type": "int",
+        "description": "插件侧上下文Token上限",
+        "hint": "实际压缩上限会取此值与当前会话绑定模型 max_context_tokens 的较小正数，适合让直连模型保持大上下文、群聊由插件使用较小上下文。设置为0表示不设置插件侧上限，仅使用模型上限；若模型也未配置上限，则禁用Token触发。",
+        "default": 100000
+      },
+      "content_retain_tokens": {
+        "type": "int",
+        "description": "正文保留Token预算",
+        "hint": "压缩时从最新消息往前保留的正文消息Token数量。",
+        "default": 10000
+      },
+      "tool_retain_tokens": {
+        "type": "int",
+        "description": "工具消息保留Token预算",
+        "hint": "压缩时从最新消息往前保留的工具调用+结果消息Token数量。",
+        "default": 10000
+      },
+      "forgetting_timeout": {
+        "type": "int",
+        "description": "遗忘时间上限（秒）",
+        "hint": "超过此时间未进行压缩则强制压缩。设置为0则禁用。默认86400秒（1天）。",
+        "default": 86400
+      }
+    }
+  },
+  "output_rewrite": {
+    "type": "object",
+    "description": "[输出处理] 输出重写",
+    "hint": "发送前对回复内容的输出处理配置。",
+    "items": {
+      "strip_markdown_enabled": {
+        "type": "bool",
+        "description": "启用Markdown清洗",
+        "hint": "启用后，会在发送消息前自动去除Markdown格式，使消息更适合QQ显示。",
+        "default": true
+      },
+      "strip_period_before_newline": {
+        "type": "bool",
+        "description": "清理句末句号",
+        "hint": "启用后，会清理换行符之前的中文句号（。），例如「你好。\\n明天见。」变为「你好\\n明天见」。",
+        "default": false
+      }
+    }
+  }
+}

@@ -1,0 +1,236 @@
+/**
+ * Recall Page - 召回测试页面
+ * 负责测试记忆召回功能
+ */
+
+import { esc, statusPill, typeLabel, normalizeImportance } from "./utils.js";
+
+export class RecallPage {
+  constructor(state, apiClient, peekPanel) {
+    this.state = state;
+    this.api = apiClient;
+    this.peek = peekPanel;
+  }
+
+  /**
+   * 初始化召回页面事件监听
+   */
+  initEventListeners() {
+    const queryInput = document.getElementById("recall-query");
+    const searchBtn = document.getElementById("recall-search-btn");
+    const kSlider = document.getElementById("recall-k");
+    const kValue = document.getElementById("recall-k-value");
+
+    // k 值滑块
+    if (kSlider && kValue) {
+      kSlider.addEventListener("input", () => {
+        kValue.textContent = kSlider.value;
+      });
+    }
+
+    // 搜索按钮
+    if (searchBtn) {
+      searchBtn.addEventListener("click", () => this.runRecall());
+    }
+
+    // 回车搜索（Ctrl+Enter 或 Cmd+Enter）
+    if (queryInput) {
+      queryInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.isComposing && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          this.runRecall();
+        }
+      });
+    }
+  }
+
+  /**
+   * 执行召回测试
+   */
+  async runRecall() {
+    const searchBtn = document.getElementById("recall-search-btn");
+    // 回车触发不经过按钮 disabled 守卫，需显式防并发（慢响应覆盖新结果）
+    if (searchBtn && searchBtn.disabled) return;
+    const query = document.getElementById("recall-query").value.trim();
+    const k = parseInt(document.getElementById("recall-k").value) || 5;
+    const sessionId = document.getElementById("recall-session").value.trim();
+
+    if (!query) {
+      this.showToast(window.t("recall.enterQuery"), true);
+      document.getElementById("recall-query").focus();
+      return;
+    }
+
+    if (searchBtn) searchBtn.disabled = true;
+    const feedback = document.getElementById("recall-feedback");
+    const results = document.getElementById("recall-results");
+    if (feedback) {
+      feedback.hidden = false;
+      feedback.classList.remove("is-error");
+      feedback.textContent = window.t("recall.searching");
+    }
+    results?.setAttribute("aria-busy", "true");
+    if (results) results.replaceChildren();
+    this.state._recallCache = null;
+    document.getElementById("recall-stats")?.classList.add("hidden");
+    document.getElementById("recall-query").readOnly = true;
+    document.getElementById("recall-k").disabled = true;
+    document.getElementById("recall-session").disabled = true;
+
+    const startTime = Date.now();
+
+    try {
+      const params = { query, k };
+      if (sessionId) params.session_id = sessionId;
+
+      const data = await this.api.post("recall/test", params);
+      const elapsed = Date.now() - startTime;
+
+      this.state._recallCache = { data, elapsed };
+      this.renderResults(data, elapsed);
+      if (feedback) feedback.hidden = true;
+    } catch (e) {
+      if (feedback) {
+        feedback.textContent = e.message || window.t("recall.fail");
+        feedback.classList.add("is-error");
+      }
+    } finally {
+      if (searchBtn) searchBtn.disabled = false;
+      results?.setAttribute("aria-busy", "false");
+      document.getElementById("recall-query").readOnly = false;
+      document.getElementById("recall-k").disabled = false;
+      document.getElementById("recall-session").disabled = false;
+    }
+  }
+
+  /**
+   * 渲染召回结果
+   * @param {Object} data - 召回结果数据
+   * @param {number} elapsed - 耗时（毫秒）
+   */
+  renderResults(data, elapsed) {
+    // 后端返回 results，不是 memories
+    const memories = data.results || data.memories || [];
+    const count = memories.length;
+
+    // 更新统计信息
+    const statsEl = document.getElementById("recall-stats");
+    const countText = document.getElementById("recall-count-text");
+    const timeText = document.getElementById("recall-time-text");
+    const contextText = document.getElementById("recall-context-text");
+
+    if (statsEl) statsEl.classList.remove("hidden");
+    if (countText) countText.textContent = window.t("recall.resultsCount", count);
+    if (timeText) {
+      const time = data.elapsed_time_ms ?? elapsed;
+      timeText.textContent = window.t("recall.timeElapsed", (time / 1000).toFixed(2));
+    }
+    // 回显卡片的检索范围：输入框可能已被改写，结果归属只能由响应确认
+    if (contextText) {
+      const scope = ["k=" + (data.k ?? "-")];
+      if (data.session_id_filter) {
+        scope.push(window.t("detail.sessionId") + " " + data.session_id_filter);
+      }
+      contextText.textContent = scope.join(" · ");
+    }
+
+    const resultsEl = document.getElementById("recall-results");
+    if (!resultsEl) return;
+
+    if (count === 0) {
+      resultsEl.innerHTML = '<div class="table-empty">' + window.t("recall.noMatch") + '</div>';
+      return;
+    }
+
+    let html = '<div class="recall-results-list">';
+
+    memories.forEach((mem, idx) => {
+      // 后端返回 memory_id 和 content
+      const memoryId = mem.memory_id || mem.id;
+      const content = mem.content || mem.text || mem.summary || "";
+      // similarity_score 是各检索路线融合后的最终得分，不是单一向量相似度
+      const score = mem.similarity_score != null ? Number(mem.similarity_score).toFixed(3) :
+                    (mem.score != null ? Number(mem.score).toFixed(3) : "--");
+      const importance = normalizeImportance(mem.metadata?.importance ?? 0.5).toFixed(1);
+      const type = mem.metadata?.memory_type || "GENERAL";
+      const status = mem.metadata?.status || "active";
+
+      // 分项得分回答"为什么召回它"：只渲染实际命中的检索路线，无分项时不占位
+      const breakdown = mem.score_breakdown || {};
+      const routes = [];
+      [
+        ["graph.scoreDocKW", "document_keyword_score"],
+        ["graph.scoreDocVec", "document_vector_score"],
+        ["graph.scoreGraphKW", "graph_keyword_score"],
+        ["graph.scoreGraphVec", "graph_vector_score"],
+      ].forEach(([labelKey, field]) => {
+        const value = Number(breakdown[field] || 0);
+        if (value > 0) {
+          routes.push('<span class="recall-route-chip"><span>' + esc(window.t(labelKey)) + '</span><b>' + value.toFixed(3) + '</b></span>');
+        }
+      });
+
+      html += '<div class="result-card recall-result-item" role="button" tabindex="0" aria-label="' + esc(window.t("table.openMemory", memoryId)) + '" data-memory-id="' + memoryId + '">';
+      html += '<div class="result-card-header recall-result-header">';
+      html += '<span class="result-rank recall-result-rank">#' + (idx + 1) + '</span>';
+      html += '<span class="cell-mono recall-result-id">' + esc(window.t("recall.resultId")) + ' ' + esc(String(memoryId)) + '</span>';
+      html += '<span class="result-score-badge recall-result-score">' + esc(window.t("recall.resultScore")) + ' <b>' + score + '</b></span>';
+      html += statusPill(status);
+      html += '<span class="type-tag">' + esc(typeLabel(type)) + '</span>';
+      html += '</div>';
+      html += '<div class="result-content recall-result-content">' + esc(content) + '</div>';
+      if (routes.length) {
+        html += '<div class="recall-result-routes">' + routes.join("") + '</div>';
+      }
+      html += '<div class="recall-result-meta text-secondary">';
+      html += '<span>' + window.t("detail.importance") + ' ' + importance + '/10</span>';
+      if (mem.metadata?.session_id) {
+        html += '<span>' + esc(window.t("detail.sessionId")) + ' ' + esc(String(mem.metadata.session_id)) + '</span>';
+      }
+      html += '</div>';
+      html += '</div>';
+    });
+
+    html += '</div>';
+    resultsEl.innerHTML = html;
+
+    // 绑定点击事件
+    resultsEl.querySelectorAll(".recall-result-item").forEach(item => {
+      item.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          item.click();
+        }
+      });
+      item.addEventListener("click", () => {
+        const memoryId = item.dataset.memoryId;
+        const memory = memories.find(m => String(m.memory_id || m.id) === memoryId);
+        if (memory) {
+          this.peek.renderMemory({
+            memory_id: memory.memory_id || memory.id,
+            summary: memory.content || memory.text || memory.summary,
+            content: memory.content || memory.text,
+            memory_type: memory.metadata?.memory_type,
+            importance: memory.metadata?.importance,
+            status: memory.metadata?.status,
+            created_at: memory.metadata?.create_time
+              ? new Date(memory.metadata.create_time * 1000).toLocaleString()
+              : "--",
+            raw: memory
+          });
+        }
+      });
+    });
+  }
+
+  /**
+   * 显示 Toast 提示
+   * @param {string} message - 提示消息
+   * @param {boolean} isError - 是否为错误
+   */
+  showToast(message, isError = false) {
+    if (window.lmShowToast) {
+      window.lmShowToast(message, isError);
+    }
+  }
+}

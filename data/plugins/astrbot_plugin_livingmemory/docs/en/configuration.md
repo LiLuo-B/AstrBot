@@ -1,0 +1,225 @@
+# Configuration
+
+> [!NOTE]
+> The AstrBot plugin config page keeps only **model providers and reply language**; advanced sections such as recall, reflection, graph, atoms, consolidation, backups, index rebuild and access control now live on the dashboard's **Settings** page, grouped for editing. This page remains the reference for every option.
+
+LivingMemory defaults work for most users. The settings you usually need to touch are model providers, recall size, memory isolation, graph retrieval, backup, and cleanup.
+
+> [!NOTE]
+> Every numeric config item has a hard allowed range, shown on the AstrBot config page as a slider plus number field and in the tables below. Out-of-range values are clamped to the nearest bound on plugin load (invalid values fall back to that item's default), each fix is logged as a warning and written back to the config file — a single bad value no longer resets the whole config to defaults.
+
+## Recommended profiles
+
+| Scenario | Recommendation |
+| --- | --- |
+| First-time setup | Configure only `provider_settings.llm_provider_id` and `provider_settings.embedding_provider_id`; keep the rest at defaults |
+| Private long-term assistant | Keep persona and session filtering enabled; keep `summary_trigger_rounds` around 8-12 |
+| Group companion | Enable `session_manager.enable_full_group_capture` and consider a larger `context_window_size` |
+| Low-resource server | Reduce `index_rebuild_settings.embedding_batch_size`, keep `tasks_limit = 1`, and increase request delays |
+| Higher recall quality | Keep graph memory and atomization enabled; set `recall_engine.top_k` to 5-8 |
+| Cost-sensitive setup | Lower `top_k`, disable recent-context expansion, and increase summary trigger rounds |
+
+## Adapter sharing and existing memories
+
+Select “Adapters sharing memory” (`filtering_settings.shared_adapter_ids`) in the settings access/isolation group. Selected instances share memory candidates; other instances are isolated. Two bots using the same adapter type still have separate instance IDs. An unset field adds no adapter restriction: session and persona settings determine visibility. Saving unrelated settings does not activate the new policy. After configuring the list, newly added instances are isolated until selected.
+
+| Adapter policy | Session isolation | Visibility |
+| --- | --- | --- |
+| Shared | Enabled | Each complete session ID remains isolated |
+| Shared | Disabled | Candidates from the sharing instances |
+| Isolated | Enabled | Current instance and session |
+| Isolated | Disabled | Multiple sessions of the current instance |
+
+Persona filtering continues to follow its existing setting. The `user` mode retains the original platform/user scope and does not identify different platform user IDs as one person. Source conversations and recent-message buffers remain attached to actual sessions.
+
+For existing memories stored under actual sessions, keep `legacy` mode and disable session filtering to share reads within the adapter list without rewriting old scopes. For example:
+
+```json
+{"filtering_settings":{"memory_scope_mode":"legacy","use_session_filtering":false,"use_persona_filtering":true,"shared_adapter_ids":["qq-main","wechat-main"]}}
+```
+
+The first startup recovers ownership from source sessions, retained messages and old scopes, then synchronizes metadata in parent documents, atoms, graph entries and the separate graph-vector document database. Ambiguous, mixed or missing provenance remains unassigned; after enabling the list, these records need explicit ownership before adapter recall can include them. In settings, “Memory ownership” assigns unowned records by their old scope or transfers an old instance's records to another instance.
+
+Affected SQLite databases are backed up under the plugin data directory at `backups/adapter_ownership_*` before ownership changes; a failed update rolls back its transaction. Migration retains text, source sessions, personas and document IDs without regenerating embeddings or rebuilding FAISS/FTS. Consolidation and write-time deduplication preserve adapter ownership rather than mixing records from different sources.
+
+Before manually transferring a batch, pause the affected adapters and wait for running summaries to finish, then resume after the transfer. Configured offline adapters remain selectable. Assignment changes ownership, not `session_id`; with session isolation enabled, an old session does not automatically become the new adapter's session.
+
+Management APIs accept an `adapter_id` query parameter to select the configured range; `page/memories?adapter_id=qq-main` still intersects existing session filters. `POST page/adapters/assign` accepts the target `adapter_id`, old `source_adapter_id` and `session_id`: a null source adapter assigns unowned records for that old scope; a specified source transfers that instance's records. The endpoint uses AstrBot Plugin Views authentication.
+
+## Model providers
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `provider_settings.embedding_provider_id` | empty (not recommended) | Generates memory vectors; fill in an enabled Embedding Provider ID. An empty value only falls back to the first available provider, which may pick the wrong model or break vector/graph index initialization |
+| `provider_settings.llm_provider_id` | empty | Summarizes conversations and evaluates memory importance. Empty means AstrBot's default LLM |
+| `provider_settings.llm_stream_mode` | `auto` | How memory processing calls the LLM: `auto` tries non-streaming first and switches to streaming when the provider reports non-stream requests are unsupported; `always` always streams; `never` always uses non-streaming (previous behavior) |
+
+Try to keep the embedding model stable. If you change it and old memories recall poorly, run `/lmem rebuild-index`.
+
+See [Embedding Models and BGE-M3](/en/guide/embedding-model) for the SiliconFlow free BGE-M3 parameters, locating the Provider ID, and verification steps.
+
+Providers that only accept streaming requests (`stream=true`) are switched to streaming automatically in `auto` mode; set `always` to force streaming. An interrupted stream, timeout, or missing complete response is treated as a failure, so incomplete results are never written to memory.
+
+## Session management
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `session_manager.enable_full_group_capture` | `true` | Captures group messages that do not directly mention the bot |
+| `session_manager.context_window_size` | `50` | Historical message window used for summarization and context analysis |
+| `session_manager.max_messages_per_session` | `1000` | Maximum stored messages for one session |
+| `session_manager.cleanup_batch_size` | `50` | Number of old summarized messages cleaned per batch |
+
+For very busy group chats, lower `context_window_size` or disable full group capture.
+
+History above `max_messages_per_session` first discards summarized messages. If insufficient, the oldest unsummarized buffered messages are also removed with a warning; content not yet stored in memory may be lost. Active snapshots commit their cursor by message ID and timestamp so trimming does not skip retained messages.
+
+## Recall and injection
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `recall_engine.top_k` | `5` | Number of memories automatically recalled each turn |
+| `recall_engine.max_k` | `10` | Maximum results returned by active agent recall |
+| `recall_engine.importance_weight` | `1.0` | Importance weight in final ranking |
+| `recall_engine.min_importance_for_retrieval` | `0.0` | Minimum importance; `0` disables the filter |
+| `recall_engine.min_similarity_for_retrieval` | `0.0` | Minimum vector similarity; keyword-only hits remain eligible |
+| `recall_engine.recent_memory_count` | `2` | Recall slots reserved for recent memories |
+| `recall_engine.recent_memory_max_age_hours` | `72` | Time window for recent-memory slots |
+| `recall_engine.memory_type_filter` | `all` | Use `event_only` to exclude known preference-only or relationship-only memories |
+| `recall_engine.fallback_to_vector` | `true` | Falls back to vector search if hybrid retrieval fails |
+| `recall_engine.rerank_enabled` | `false` | Reranks fused candidates by query relevance with a Rerank model |
+| `recall_engine.rerank_provider_id` | `""` | ID of a Rerank-type provider in AstrBot; leave empty to skip |
+| `recall_engine.rerank_candidates` | `20` | Fused candidates sent to the Rerank model (2-100); top_k kept after reranking |
+| `recall_engine.fusion_mode` | `score` | Fusion strategy: `score` fuses normalized scores, `rrf` keeps the legacy rank fusion |
+| `recall_engine.fusion_bm25_weight` | `0.5` | BM25 route weight for `score` fusion (0-1); the vector route gets `1 - value` |
+| `recall_engine.recall_candidate_multiplier` | `3` | Per-route candidate count as a multiple of `k` before fusion (1-10) |
+| `recall_engine.fusion_agreement_bonus` | `0.25` | Bonus when both routes return a document at similar ranks (0 disables); the Chinese grid preferred 0.4-0.6 but English data is steadier at 0.25 |
+| `recall_engine.injection_method` | `extra_user_content` | Memory injection mode (the only supported add-only temporary-part injection) |
+| `recall_engine.inject_with_recent_context` | `false` | Expands the query with recent conversation |
+| `recall_engine.search_cache_enabled` | `true` | Enables short-term retrieval caching |
+
+`extra_user_content` is the only supported injection mode: memories are appended to the current user message as a `mark_as_temp` temporary part that AstrBot filters out when saving conversation history, so injection never affects the prefix cache and **never touches AstrBot's conversation history**. The plugin no longer rewrites history message formats or writes content into history. The legacy `user_message_before` / `user_message_after` / `fake_tool_call` / `fake_tool_call_deepseek_v4` / `system_prompt` options are all deprecated and automatically fall back to `extra_user_content`.
+
+## Memory isolation
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `filtering_settings.use_persona_filtering` | `true` | Only recall memories for the current persona |
+| `filtering_settings.memory_scope_mode` | `legacy` | Preserve legacy behavior, or scope by session, user, or globally |
+| `filtering_settings.use_session_filtering` | `true` | Controls session filtering only in `legacy` mode |
+| `filtering_settings.isolated_sessions` | Empty | Full session IDs that must always remain isolated, one per line |
+| `access_control.whitelist_enabled` | `false` | Allow only listed identities to use long-term memory |
+| `access_control.allowed_ids` | Empty | User ID, `platform:user ID`, group ID, or full session ID |
+| `access_control.identity_aliases` | Empty | One `source identity=canonical name` mapping per line |
+
+`user` shares memory across private and group chats for the same platform user. `global` shares memory across every non-isolated session. `isolated_sessions` always takes precedence. In `legacy` mode with session filtering disabled, configuring any isolated session moves non-isolated writes into the dedicated global scope so they cannot read isolated data. Enabling the allowlist with an empty list denies automatic capture, summarization, recall, and Agent memory tools.
+
+Aliases are matched in this order: `platform:user ID`, user ID, then current username. The mapped display name is applied before summarization. Scope changes affect newly written memories only; existing memories are not migrated or re-embedded automatically.
+
+## Reflection and lifecycle
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `reflection_engine.summary_trigger_rounds` | `10` | Number of conversation rounds before summarization |
+| `reflection_engine.max_messages_per_segment` | `120` | Maximum messages per summary segment, including uninterrupted same-day chats |
+| `reflection_engine.max_segments_per_run` | `10` | Maximum split segments summarized by one trigger; remaining backlog waits for the next trigger |
+| `reflection_engine.window_split_by_day` | `true` | Summarizes only the oldest day when a window crosses midnight, so multi-day chats are not merged into one memory |
+| `reflection_engine.window_split_gap_minutes` | `180` | Summarizes only the oldest segment when the idle gap between messages exceeds this many minutes; `0` disables gap splitting |
+| `reflection_engine.include_source_time_tags` | `true` | Derives source date tags from original message timestamps |
+| `reflection_engine.source_retention_importance_threshold` | `0.8` | Retains original messages separately at or above the threshold |
+| `importance_decay.decay_rate` | `0.01` | Daily importance decay |
+| `importance_decay.access_decay_window_days` | `30.0` | Time window for access reinforcement |
+| `importance_decay.access_decay_max_count` | `10` | Maximum access reinforcement count |
+| `importance_decay.protected_importance_threshold` | `1.0` | Memories at or above this importance do not decay |
+
+Lower `summary_trigger_rounds` if you want the bot to remember faster. Raise it if you want fewer LLM calls.
+
+Summary windows are still triggered by unsummarized rounds, but they no longer merge across days or long idle gaps: when a boundary exists, coherent segments are summarized oldest-first and the same background task keeps consuming the backlog until it is empty or `max_segments_per_run` is reached. Any remaining backlog is consumed by a later trigger. Stored message time prefers the platform message timestamp and falls back to the receipt time when it is missing or implausible (for example millisecond timestamps or a clock clearly ahead), so window boundaries follow when messages actually happened.
+
+Retained source is written only to the SQLite `memory_sources` table, not to vector, BM25, graph, or atom indexes, so it does not increase vector count. It does increase database disk usage. Re-summarizing from Dashboard calls the LLM once, replaces the old memory, and regenerates its embedding and all derived indexes.
+
+Each input contains at most `max_messages_per_segment` messages; earlier day/idle boundaries still split first. The same task continues up to `max_segments_per_run`. Retries start at the retained unsummarized cursor; abandoning a repeatedly failed segment skips only that segment. Reflection-triggered consolidation is scheduled after backlog processing, and its persistence shares a lock with reflection while LLM inference remains concurrent.
+
+
+## Agent tools
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `agent_tools.enable_recall_tool` | `true` | Registers `recall_long_term_memory` for active recall |
+| `agent_tools.enable_memorize_tool` | `false` | Registers `memorize_long_term_memory` for active writes |
+| `agent_tools.enable_forget_tool` | `false` | Registers `forget_long_term_memory`; admin-only, archives (soft-deletes) memories reversibly, restorable by an admin from the WebUI |
+| `agent_tools.forget_tool_max_memories` | `3` | Maximum memories a single forget call may archive (1-10); larger requests are rejected entirely |
+| `agent_tools.forget_tool_cooldown_seconds` | `60` | Minimum interval between successful archives in one session (0-3600); `0` disables the limit |
+| `agent_tools.enable_agentic_recall_beta` | `false` | Enables multi-turn agentic recall (beta); requires `enable_recall_tool` |
+| `agent_tools.agentic_recall_max_calls` | `4` | Shared recall/evidence tool calls allowed per request (1-20) |
+| `agent_tools.agentic_recall_time_budget_seconds` | `20` | Cumulative memory-tool time per request in seconds (1-300) |
+| `agent_tools.agentic_recall_max_result_chars` | `12000` | Maximum characters returned by one beta memory-tool call (500-100000); longer output continues via cursors |
+
+The write tool is powerful and depends on model discipline. Start with active recall, then enable active writes after observing stable behavior.
+
+The forget tool is off by default and only applies to admins when enabled: the model can only archive memories (removed from retrieval, documents retained) and never physically deletes them. An admin can filter by `archived` on the Dashboard memory page and set the status back to `active` to restore. Per-call count and per-session cooldown are enforced.
+
+Agentic recall is a beta and off by default. When enabled, `recall_long_term_memory` gains people-centric search, event-time ranges, exclusion of seen candidates and cursored paging, and `read_memory_evidence` is registered to read a memory's active facts and, when the whole source is verifiably visible, its retained text. Tool calls, cumulative tool time and per-call output share one per-request budget. The rule prompt is injected add-only as a temporary part. The switch and the three budget fields are always shown on the settings page; they take effect for new requests after saving and reloading the plugin.
+
+## Graph memory and atomization
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `graph_memory.enabled` | `true` | Enables graph-route retrieval |
+| `graph_memory.document_route_weight` | `0.65` | Document-route weight |
+| `graph_memory.graph_route_weight` | `0.35` | Graph-route weight |
+| `graph_memory.cross_route_bonus` | `0.08` | Bonus when both routes hit the same memory |
+| `graph_memory.expansion_hops` | `1` | Graph neighbor expansion hops |
+| `graph_memory.dynamic_route_weighting` | `true` | Adjusts route weights based on query intent |
+| `graph_memory.atom_enabled` | `true` | Enables memory atomization |
+
+For relationship-heavy use, increase graph-route weight or set `expansion_hops` to `2`. If the database is large, second-hop expansion adds query cost, so use the WebUI recall debugger to inspect results first.
+
+## Backup, migration, and cleanup
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `migration_settings.auto_migrate` | `true` | Migrates old databases at startup |
+| `migration_settings.create_backup` | `true` | Creates a backup before migration |
+| `backup_settings.enabled` | `true` | Daily database backup |
+| `backup_settings.keep_days` | `7` | Backup retention days |
+| `forgetting_agent.auto_cleanup_enabled` | `true` | Daily cleanup for old low-importance memories |
+| `forgetting_agent.auto_archived_enabled` | `false` | Archives cleanup candidates outside retrieval indexes instead of deleting them |
+| `forgetting_agent.cleanup_days_threshold` | `30` | Age threshold for cleanup candidates |
+| `forgetting_agent.cleanup_importance_threshold` | `0.3` | Importance threshold for cleanup candidates |
+
+With automatic archiving enabled, source documents remain visible and restorable in the Dashboard. Restoring regenerates the embedding and rebuilds BM25, graph, and memory-atom indexes.
+
+## Memory store consolidation
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `memory_consolidation.enabled` | `false` | Enables periodic memory-store consolidation |
+| `memory_consolidation.trigger` | `daily` | Trigger mode: `daily` = daily schedule, `reflection` = piggyback on each reflection |
+| `memory_consolidation.granularity` | `session` | Aggregation granularity: `session` = same session, `semantic` = cross-session semantic clustering |
+| `memory_consolidation.keep_original` | `archive` | Handling of originals after merge: `archive` = keep archived, `delete` = remove permanently |
+| `memory_consolidation.min_memories_per_group` | `3` | Minimum memories per group to trigger consolidation |
+| `memory_consolidation.min_age_days` | `7` | Only consolidate memories older than this many days |
+| `memory_consolidation.max_importance` | `0.5` | Only consolidate memories below this importance |
+| `memory_consolidation.max_groups_per_run` | `5` | Maximum groups consolidated per run |
+| `memory_consolidation.semantic_similarity_threshold` | `0.7` | Minimum similarity in semantic clustering mode |
+
+Memory consolidation controls the memory-store size at the source: scattered low-value memories are aggregated, organized, and summarized into a single concise memory, avoiding information loss from hard truncation at injection time. The merged result is written as a new memory and the originals are archived or deleted according to `keep_original`. With `trigger=reflection`, a 6-hour cooldown prevents per-message triggering.
+
+## Database open errors
+
+`unable to open database file` is `SQLITE_CANTOPEN`, which must be investigated separately from `database is locked` / `SQLITE_BUSY` ([#345](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/345)). Failed access-statistics writes now log the main database `db_path`, underlying `sqlite_errorcode`, `sqlite_errorname` and full traceback. Extended error codes are retained when the runtime exposes them.
+
+Use that path to check that the database parent directory is available and writable by the account running AstrBot. Include the diagnostic log and full traceback when reporting the error. Version 2.7.3 already fixed transactions retaining locks after exceptions, cancellation or commit failure; remaining open failures need the actual SQLite error code to identify their cause.
+
+## Index rebuild tuning
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `index_rebuild_settings.batch_size` | `50` | Memories read per batch |
+| `index_rebuild_settings.embedding_batch_size` | `8` | Texts per embedding request |
+| `index_rebuild_settings.tasks_limit` | `1` | Embedding concurrency limit |
+| `index_rebuild_settings.max_retries` | `5` | Retry count for a failed batch |
+| `index_rebuild_settings.request_delay` | `5.0` | Delay between embedding requests |
+| `index_rebuild_settings.max_failure_ratio` | `0.02` | Allowed failure ratio |
+
+If you hit API rate limits, increase `request_delay` first, then lower `embedding_batch_size`. Avoid raising concurrency blindly; index rebuilds are more about finishing reliably than finishing aggressively.

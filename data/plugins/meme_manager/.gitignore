@@ -1,0 +1,181 @@
+# 本地项目副本与示例
+AstrBot-master/
+ASTRBOT_MEME_PACK_IMPLEMENTATION_PLAN.md
+example/
+
+# 字节码、优化结果与动态链接库文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C 扩展
+*.so
+
+# 分发与打包产物
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller 构建产物
+# 这些文件通常由 Python 脚本在 PyInstaller 构建可执行文件前
+# 根据模板生成，用于注入日期等信息。
+*.manifest
+*.spec
+
+# 安装器日志
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 单元测试与覆盖率报告
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# 翻译文件
+*.mo
+*.pot
+
+# Django 相关文件
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask 相关文件
+instance/
+.webassets-cache
+
+# Scrapy 相关文件
+.scrapy
+
+# Sphinx 文档产物
+docs/_build/
+
+# PyBuilder 构建产物
+.pybuilder/
+target/
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints
+
+# IPython 配置
+profile_default/
+ipython_config.py
+
+# pyenv 版本配置
+# 库或软件包需要在多个环境中运行时，可以忽略这些文件；
+# 其他情况下可将它们纳入版本控制。
+# .python-version
+
+# pipenv 依赖锁定
+# 根据 pypa/pipenv#598，建议将 Pipfile.lock 纳入版本控制。
+# 但在协作时，若依赖具有平台限制或不支持跨平台，
+# pipenv 可能安装不可用的依赖，或未安装全部所需依赖。
+#Pipfile.lock
+
+# uv 依赖锁定
+# 与 Pipfile.lock 类似，通常建议将 uv.lock 纳入版本控制。
+# 对包含二进制依赖的软件包尤其如此，以保证可复现性；
+# 库项目则更常选择忽略锁文件。
+#uv.lock
+
+# Poetry 依赖锁定
+# 与 Pipfile.lock 类似，通常建议将 poetry.lock 纳入版本控制。
+# 对包含二进制依赖的软件包尤其如此，以保证可复现性；
+# 库项目则更常选择忽略锁文件。
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+#poetry.lock
+
+# PDM 依赖锁定
+# 与 Pipfile.lock 类似，通常建议将 pdm.lock 纳入版本控制。
+#pdm.lock
+# PDM 在 .pdm.toml 中存储项目级配置，建议不要将该文件
+# 纳入版本控制。
+#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# PEP 582 本地包目录，供 github.com/David-OConnor/pyflow 和 github.com/pdm-project/pdm 等使用
+__pypackages__/
+
+# Celery 相关文件
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath 解析产物
+*.sage.py
+
+# 虚拟环境
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder 项目设置
+.spyderproject
+.spyproject
+
+# Rope 项目设置
+.ropeproject
+
+# MkDocs 文档产物
+/site
+
+# mypy 缓存
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre 类型检查缓存
+.pyre/
+
+# pytype 静态类型分析缓存
+.pytype/
+
+# Cython 调试符号
+cython_debug/
+
+# PyCharm 项目设置
+# JetBrains 专用模板单独维护在以下文件中：
+# https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+# 可以加入全局忽略规则，或合并到本文件。也可以取消下面规则的注释，
+# 忽略整个 .idea 目录，但不建议这样做。
+#.idea/
+
+# PyPI 配置文件
+.pypirc
+
+# 本地开发目录，忽略目录中的全部内容
+# 此目录用于本地开发文件、测试脚本及笔记等。
+# 这些文件不应提交到 Git。
+local/
+/data/

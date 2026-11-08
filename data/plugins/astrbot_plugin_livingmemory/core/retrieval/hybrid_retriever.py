@@ -1,0 +1,553 @@
+"""
+混合检索器 - 结合BM25和向量检索的混合检索
+实现并行检索、RRF融合和智能加权策略
+"""
+
+import asyncio
+import json
+import math
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from astrbot.api import logger
+
+from ..utils.number_utils import clamp_float, safe_float
+from .bm25_retriever import BM25Retriever
+from .recall_diagnostics import record_route
+from .route_execution import search_route
+from .rrf_fusion import BM25Result, FusedResult, RRFFusion, VectorResult
+from .vector_retriever import VectorRetriever
+
+
+@dataclass
+class HybridResult:
+    """混合检索结果"""
+
+    doc_id: int
+    final_score: float  # 加权后的最终分数
+    rrf_score: float  # RRF融合分数
+    bm25_score: float | None  # BM25分数
+    vector_score: float | None  # 向量分数
+    content: str
+    metadata: dict[str, Any]
+    score_breakdown: dict[str, float] | None = None  # 各维度分数明细
+
+
+class HybridRetriever:
+    """
+    混合检索器
+
+    结合BM25稀疏检索和向量密集检索,通过RRF融合结果,
+    并应用重要性和时间衰减加权策略。
+
+    主要特性:
+    1. 并行执行BM25和向量检索(使用asyncio.gather)
+    2. 使用RRF算法融合两路结果
+    3. 应用重要性加权和时间衰减
+    4. 支持退化机制(某一路失败时使用另一路)
+    5. 确保两个索引中doc_id的一致性
+    """
+
+    def __init__(
+        self,
+        bm25_retriever: BM25Retriever,
+        vector_retriever: VectorRetriever,
+        rrf_fusion: RRFFusion,
+        config: dict[str, Any] | None = None,
+        rerank_provider_resolver: Callable[[], Any] | None = None,
+    ):
+        """
+        初始化混合检索器
+
+        Args:
+            bm25_retriever: BM25检索器实例
+            vector_retriever: 向量检索器实例
+            rrf_fusion: RRF融合器实例
+            config: 配置字典,支持以下参数:
+                - decay_rate: 时间衰减率,默认0.01
+                - importance_weight: 重要性权重,默认1.0
+                - fallback_enabled: 启用退化机制,默认True
+                - rerank_enabled: 启用Rerank重排序,默认False
+                - rerank_candidates: 送入Rerank的融合候选数量,默认20
+            rerank_provider_resolver: 返回RerankProvider实例的可调用对象(可选)。
+                使用动态解析而非缓存实例: AstrBot会重建Provider实例,旧实例的
+                httpx客户端可能已关闭。传入None时即使rerank_enabled也会跳过重排序。
+        """
+        self.bm25_retriever = bm25_retriever
+        self.vector_retriever = vector_retriever
+        self.rrf_fusion = rrf_fusion
+        self.config = config or {}
+        self.rerank_provider_resolver = rerank_provider_resolver
+
+        # 配置参数
+        self.decay_rate = self.config.get("decay_rate", 0.01)
+        self.importance_weight = self.config.get("importance_weight", 1.0)
+        self.fallback_enabled = self.config.get("fallback_enabled", True)
+
+        # Rerank重排序参数
+        self.rerank_enabled = bool(self.config.get("rerank_enabled", False))
+        self.rerank_candidates = max(
+            2, min(100, int(self.config.get("rerank_candidates", 20) or 20))
+        )
+
+        # 加权求和各维度权重（可通过配置覆盖）
+        self.score_alpha = self.config.get("score_alpha", 0.5)  # 检索相关性
+        self.score_beta = self.config.get("score_beta", 0.25)  # 重要性
+        self.score_gamma = self.config.get("score_gamma", 0.25)  # 时间新鲜度
+
+        # MMR 多样性参数
+        self.mmr_lambda = self.config.get("mmr_lambda", 0.7)  # 相关性 vs 多样性权衡
+
+        # 融合策略：score=分数归一化加权融合（默认），rrf=排名级 RRF
+        self.fusion_mode = str(self.config.get("fusion_mode", "score") or "score").lower()
+        self.fusion_bm25_weight = min(
+            1.0, max(0.0, float(self.config.get("fusion_bm25_weight", 0.5)))
+        )
+        # 每路召回 k 的多少倍候选再融合：只取 k 会让融合在很小的候选池里重排
+        self.candidate_multiplier = max(
+            1, min(10, int(self.config.get("recall_candidate_multiplier", 3) or 1))
+        )
+        # 两路共识奖励：中文改写查询上明显提升首位命中
+        self.fusion_agreement_bonus = min(
+            1.0, max(0.0, float(self.config.get("fusion_agreement_bonus", 0.25)))
+        )
+
+    async def _search_route(
+        self, route_name: str, search_coro
+    ) -> tuple[list, Exception | None]:
+        """Run one retrieval route and convert ordinary failures into route errors."""
+        return await search_route(
+            route_name, search_coro, self.config.get("retrieval_timeout_seconds", 10.0)
+        )
+
+    async def search(
+        self,
+        query: str,
+        k: int = 10,
+        session_id: str | None = None,
+        persona_id: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
+        *,
+        relevance_only: bool = False,
+    ) -> list[HybridResult]:
+        """
+        执行混合检索
+
+        Args:
+            query: 查询字符串
+            k: 返回的结果数量
+            session_id: 会话ID过滤(可选)
+            persona_id: 人格ID过滤(可选)
+            diagnostics: 可选路线故障输出（仅 Beta 主动检索使用，不改变返回契约）
+
+        Returns:
+            List[HybridResult]: 混合检索结果,按最终分数降序排列
+        """
+        if not query or not query.strip():
+            return []
+
+        candidate_k = max(k, k * self.candidate_multiplier)
+        if self.rerank_enabled:
+            candidate_k = max(candidate_k, self.rerank_candidates)
+        # Retrieve enough candidates before reranking, not just before fusion.
+        (
+            (bm25_results, bm25_error),
+            (vector_results, vector_error),
+        ) = await asyncio.gather(
+            self._search_route(
+                "BM25",
+                self.bm25_retriever.search(query, candidate_k, session_id, persona_id),
+            ),
+            self._search_route(
+                "向量",
+                self.vector_retriever.search(
+                    query, candidate_k, session_id, persona_id
+                ),
+            ),
+        )
+        record_route(diagnostics, "bm25", bm25_error)
+        record_route(diagnostics, "vector", vector_error)
+        if diagnostics is not None:
+            diagnostics["candidate_limited"] = (
+                len(bm25_results) >= candidate_k or len(vector_results) >= candidate_k
+            )
+
+        # 2. 处理退化情况
+        if bm25_error and vector_error:
+            return []
+
+        if bm25_error:
+            if self.fallback_enabled and vector_results:
+                if relevance_only:
+                    return self._apply_relevance(
+                        self.rrf_fusion._convert_vector_only(vector_results, k)
+                    )
+                return self._fallback_vector_only(vector_results, k)
+            return []
+
+        if vector_error:
+            if self.fallback_enabled and bm25_results:
+                if relevance_only:
+                    return self._apply_relevance(
+                        self.rrf_fusion._convert_bm25_only(bm25_results, k)
+                    )
+                return self._fallback_bm25_only(bm25_results, k)
+            return []
+
+        # 3. RRF融合
+        # 转换结果类型以匹配RRF融合器期望的类型
+        rrf_bm25_results = [
+            BM25Result(
+                doc_id=r.doc_id, score=r.score, content=r.content, metadata=r.metadata
+            )
+            for r in bm25_results
+        ]
+
+        rrf_vector_results = [
+            VectorResult(
+                doc_id=r.doc_id, score=r.score, content=r.content, metadata=r.metadata
+            )
+            for r in vector_results
+        ]
+
+        # 启用重排序时多保留候选，让 Rerank 模型在更大候选池里挑出真正相关的 top_k
+        rerank_active = (
+            self.rerank_enabled and self.rerank_provider_resolver is not None
+        )
+        fuse_top_k = self.rerank_candidates if rerank_active else k
+        if relevance_only:
+            fuse_top_k = max(k, fuse_top_k)
+        if diagnostics is not None and len(
+            {r.doc_id for r in bm25_results} | {r.doc_id for r in vector_results}
+        ) > min(k, fuse_top_k):
+            diagnostics["candidate_limited"] = True
+
+        if self.fusion_mode == "rrf":
+            fused_results = self.rrf_fusion.fuse(
+                rrf_bm25_results, rrf_vector_results, top_k=fuse_top_k
+            )
+        else:
+            fused_results = self.rrf_fusion.fuse_scores(
+                rrf_bm25_results,
+                rrf_vector_results,
+                top_k=fuse_top_k,
+                bm25_weight=self.fusion_bm25_weight,
+                agreement_bonus=self.fusion_agreement_bonus,
+            )
+
+        if not fused_results:
+            return []
+
+        # 3.5 Rerank 重排序：按查询相关性重打分并截断到 top_k
+        if rerank_active:
+            fused_results = await self._apply_rerank(query, fused_results, k)
+
+        if relevance_only:
+            # Beta 在任何新鲜度截断前使用相关性，成功的 Rerank 优先保留。
+            return self._apply_relevance(fused_results)[:k]
+
+        # 4. 应用加权（通过线程池卸载 CPU 密集型 json.loads + 循环）
+        current_time = time.time()
+        weighted_results = await asyncio.to_thread(
+            self._apply_weighting, fused_results, current_time
+        )
+
+        # 5. MMR 去重（通过线程池卸载 O(k*n) Jaccard 集合运算）
+        if len(weighted_results) > 1:
+            weighted_results = await asyncio.to_thread(
+                self._apply_mmr, weighted_results, k
+            )
+
+        return weighted_results
+
+    def _apply_relevance(self, fused_results: list[FusedResult]) -> list[HybridResult]:
+        converted = {
+            item.doc_id: item
+            for item in self._apply_weighting(fused_results, time.time())
+        }
+        max_rrf = max((item.rrf_score for item in fused_results), default=1.0) or 1.0
+        results = []
+        for item in fused_results:
+            result = converted[item.doc_id]
+            relevance = (
+                item.rerank_score
+                if item.rerank_score is not None else item.rrf_score / max_rrf
+            )
+            result.final_score = relevance
+            result.score_breakdown["agentic_relevance"] = relevance
+            results.append(result)
+        results.sort(key=lambda result: result.final_score, reverse=True)
+        return results
+
+    async def _apply_rerank(
+        self, query: str, fused_results: list[FusedResult], k: int
+    ) -> list[FusedResult]:
+        """
+        调用 Rerank 模型对融合候选按查询相关性重打分。
+
+        成功时为每条结果写入 rerank_score（候选集内 min-max 归一化到 [0,1]），
+        按 rerank 分数降序截断到 top_k；后续加权阶段以 rerank 分数替代
+        RRF 归一化排名作为相关性项。
+
+        Args:
+            query: 用户查询
+            fused_results: RRF 融合后的候选（数量为 rerank_candidates）
+            k: 最终返回数量
+
+        Returns:
+            截断到 top_k 的融合结果。解析不到提供商或调用失败时按
+            原 RRF 排名截断（静默降级）。
+        """
+        try:
+            provider = self.rerank_provider_resolver()
+        except Exception as e:
+            logger.warning(
+                f"[hybrid_retriever] 解析 Rerank 提供商失败，跳过重排序: {e}"
+            )
+            return fused_results[:k]
+
+        if provider is None:
+            return fused_results[:k]
+
+        try:
+            rerank_results = await asyncio.wait_for(
+                provider.rerank(
+                    query=query, documents=[r.content for r in fused_results]
+                ),
+                timeout=self.config.get("retrieval_timeout_seconds", 10.0),
+            )
+        except Exception as e:
+            logger.warning(f"[hybrid_retriever] Rerank 调用失败，跳过重排序: {e}")
+            return fused_results[:k]
+
+        if not rerank_results:
+            return fused_results[:k]
+
+        # 按候选索引归一化 Rerank 分数到 [0,1]（与 BM25 归一化口径一致）
+        scores = [float(r.relevance_score) for r in rerank_results]
+        max_score, min_score = max(scores), min(scores)
+        score_range = max_score - min_score
+        rerank_map = {}
+        for item in rerank_results:
+            if not 0 <= item.index < len(fused_results):
+                continue
+            if score_range <= 0:
+                rerank_map[item.index] = 1.0
+            else:
+                rerank_map[item.index] = (
+                    float(item.relevance_score) - min_score
+                ) / score_range
+
+        # 候选未出现在重排序结果中时给最低分，避免未评分候选混入前列；
+        # 全部分数相同（score_range<=0）时并列，稳定排序保持 RRF 顺序
+        default_score = 0.0 if score_range > 0 else 1.0
+        for i, result in enumerate(fused_results):
+            result.rerank_score = rerank_map.get(i, default_score)
+
+        fused_results.sort(key=lambda r: r.rerank_score, reverse=True)
+        return fused_results[:k]
+
+    def _apply_weighting(
+        self, fused_results: list[FusedResult], current_time: float
+    ) -> list[HybridResult]:
+        """
+        应用重要性和时间衰减加权
+
+        使用加权求和（而非乘法）避免任何单一维度低分导致整体清零。
+        时间衰减基于 max(create_time, last_access_time)，高频访问记忆衰减更慢。
+
+        Args:
+            fused_results: RRF融合后的结果
+            current_time: 当前时间戳
+
+        Returns:
+            List[HybridResult]: 加权后的结果,按最终分数降序排列
+        """
+        if not fused_results:
+            return []
+
+        # 先归一化 RRF 分数到 [0, 1]
+        max_rrf = max(r.rrf_score for r in fused_results)
+        if max_rrf <= 0:
+            max_rrf = 1.0
+
+        hybrid_results = []
+
+        for result in fused_results:
+            # 安全解析metadata，确保它是字典类型
+            metadata = result.metadata
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                    logger.debug(
+                        f"[hybrid_retriever] 将字符串metadata转换为字典: doc_id={result.doc_id}"
+                    )
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(
+                        f"[hybrid_retriever] 解析metadata JSON失败: {e}, doc_id={result.doc_id}, "
+                        f"metadata类型={type(metadata)}, 使用空字典"
+                    )
+                    metadata = {}
+            elif metadata is None:
+                logger.debug(
+                    f"[hybrid_retriever] metadata为None, doc_id={result.doc_id}, 使用空字典"
+                )
+                metadata = {}
+            elif not isinstance(metadata, dict):
+                logger.warning(
+                    f"[hybrid_retriever] metadata类型不支持: {type(metadata)}, doc_id={result.doc_id}, "
+                    f"使用空字典"
+                )
+                metadata = {}
+
+            # 获取重要性(默认0.5)，限制在 [0, 1]
+            importance = clamp_float(metadata.get("importance"), default=0.5)
+
+            # 时间衰减：取 create_time 与 last_access_time 的较大值
+            # 高频访问的记忆衰减更慢，符合"记忆强化"认知规律
+            create_time = safe_float(metadata.get("create_time"), current_time)
+            last_access_time = safe_float(metadata.get("last_access_time"), 0.0)
+            reference_time = max(create_time, last_access_time)
+            days_old = max(0.0, (current_time - reference_time) / 86400)
+            recency_weight = math.exp(-self.decay_rate * days_old)
+
+            # 归一化 RRF 分数
+            rrf_normalized = result.rrf_score / max_rrf
+
+            # 相关性项：启用重排序时以 Rerank 相关性分数替代 RRF 归一化排名
+            # （Rerank 分数已在 _apply_rerank 中归一化到 [0,1]）
+            if result.rerank_score is not None:
+                relevance_score = clamp_float(
+                    result.rerank_score, default=rrf_normalized
+                )
+            else:
+                relevance_score = rrf_normalized
+
+            # 加权求和：各维度互补而非互斥
+            final_score = (
+                self.score_alpha * relevance_score
+                + self.score_beta * importance
+                + self.score_gamma * recency_weight
+            )
+
+            score_breakdown = {
+                "rrf_normalized": round(rrf_normalized, 4),
+                "importance": round(importance, 4),
+                "recency_weight": round(recency_weight, 4),
+                "days_old": round(days_old, 2),
+                "final_score": round(final_score, 4),
+            }
+            if result.rerank_score is not None:
+                score_breakdown["rerank"] = round(relevance_score, 4)
+
+            hybrid_results.append(
+                HybridResult(
+                    doc_id=result.doc_id,
+                    final_score=final_score,
+                    rrf_score=result.rrf_score,
+                    bm25_score=result.bm25_score,
+                    vector_score=result.vector_score,
+                    content=result.content,
+                    metadata=metadata,
+                    score_breakdown=score_breakdown,
+                )
+            )
+
+        # 按最终分数降序排序
+        hybrid_results.sort(key=lambda x: x.final_score, reverse=True)
+
+        return hybrid_results
+
+    def _apply_mmr(self, results: list[HybridResult], k: int) -> list[HybridResult]:
+        """
+        最大边际相关性（MMR）去重，避免多条语义重复的记忆占据 Top-K。
+
+        使用内容词袋相似度作为轻量代理（无需额外向量计算）。
+        mmr_lambda 越高越偏向相关性，越低越偏向多样性。
+
+        Args:
+            results: 已按 final_score 降序排列的候选结果
+            k: 最终返回数量
+
+        Returns:
+            List[HybridResult]: 去重后的结果
+        """
+        if len(results) <= k:
+            return results
+
+        def _token_set(text: str) -> set[str]:
+            tokens = set(text.lower().split())
+            return tokens if tokens else {"<empty>"}
+
+        selected: list[HybridResult] = []
+        candidates = list(results)
+
+        while candidates and len(selected) < k:
+            if not selected:
+                # 第一条直接选最高分
+                selected.append(candidates.pop(0))
+                continue
+
+            best_idx = -1
+            best_mmr = -1.0
+            selected_tokens = [_token_set(s.content) for s in selected]
+
+            for i, cand in enumerate(candidates):
+                cand_tokens = _token_set(cand.content)
+                # 与已选结果的最大 Jaccard 相似度
+                max_sim = max(
+                    len(cand_tokens & st) / max(len(cand_tokens | st), 1)
+                    for st in selected_tokens
+                )
+                mmr_score = (
+                    self.mmr_lambda * cand.final_score - (1 - self.mmr_lambda) * max_sim
+                )
+                if mmr_score > best_mmr:
+                    best_mmr = mmr_score
+                    best_idx = i
+
+            if best_idx >= 0:
+                selected.append(candidates.pop(best_idx))
+            else:
+                break
+
+        return selected
+
+    def _fallback_bm25_only(self, bm25_results: list, k: int) -> list[HybridResult]:
+        """
+        BM25退化:仅使用BM25结果
+
+        Args:
+            bm25_results: BM25检索结果
+            k: 返回的结果数量
+
+        Returns:
+            List[HybridResult]: 退化后的结果
+        """
+        # 将BM25结果转换为FusedResult
+        fused_results = self.rrf_fusion._convert_bm25_only(bm25_results, k)
+
+        # 应用加权
+        current_time = time.time()
+        return self._apply_weighting(fused_results, current_time)
+
+    def _fallback_vector_only(self, vector_results: list, k: int) -> list[HybridResult]:
+        """
+        向量退化:仅使用向量结果
+
+        Args:
+            vector_results: 向量检索结果
+            k: 返回的结果数量
+
+        Returns:
+            List[HybridResult]: 退化后的结果
+        """
+        # 将向量结果转换为FusedResult
+        fused_results = self.rrf_fusion._convert_vector_only(vector_results, k)
+
+        # 应用加权
+        current_time = time.time()
+        return self._apply_weighting(fused_results, current_time)
+

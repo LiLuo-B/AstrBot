@@ -1,0 +1,27 @@
+# Python
+__pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / Editor
+.idea/
+.vscode/
+
+# Local config
+config.local.yaml
+
+# Claude Code Router
+.claude-code-router/
+.*/
+.lsp_mcp.port
+.claude/
+!.claude/skills/
+!.claude/commands/
+
+# WebUI
+webui/node_modules/
+
+# 运行时遗留数据（cmd_config.json / t2i_templates 等，非源码）
+data/

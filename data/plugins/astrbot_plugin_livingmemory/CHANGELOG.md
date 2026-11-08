@@ -1,0 +1,1158 @@
+# Changelog
+
+所有重要的更改都会记录在此文件中。
+
+格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
+并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [2.9.1] - 2026-11-05
+
+2.9.1 修复记忆注入缺少参与者稳定标识，以及定时任务、后台任务等框架合成唤醒混入真实对话记忆的问题。无需调整配置或迁移数据库。
+
+### 记忆注入
+
+- **参与者稳定标识**：注入文本的 `Participants` 行优先读取 `participant_identities`，按“昵称#账号后四位”渲染。同名用户可以直接区分，用户改名后仍能凭稳定后缀认出是同一人；账号只保留尾四位，不向模型暴露完整用户 ID。机器人自身按第一人称语境显示为“我”；没有身份记录的历史记忆继续使用原有昵称列表。
+
+修复 [#388](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/388)，见 [#391](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/391)，贡献者 [@lxfight](https://github.com/lxfight)。
+
+### 反思窗口
+
+- **排除合成唤醒轮次**：定时任务、后台任务与插件唤醒不再写入会话历史。新版 AstrBot 以 `agent_wakeup` 事件承载这些轮次（`platform` 为目标会话平台），4.29.4 及更早版本则表现为平台为 `cron` 的定时任务事件；两种来源都会被识别并跳过。合成轮次不再进入反思窗口，也不改变消息总数、总结游标和未总结轮数，真实对话的总结时机不再受定时任务频率影响。
+
+修复 [#389](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/389)，见 [#392](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/392)，贡献者 [@lxfight](https://github.com/lxfight)。
+
+### 验证
+
+- 完整后端测试 1,211 项、前端测试 150 项通过；文档检查、VitePress 构建及 Dashboard 产物检查通过。
+- 新增回归覆盖同名与改名参与者的注入标识、`agent_wakeup` 与 `cron` 两种合成来源的过滤，以及真实消息仍正常写入。
+
+### 升级说明
+
+1. 更新至 `2.9.1` 后重新启动 AstrBot 并重新打开插件视图，无需数据库迁移或配置调整。
+2. 修复仅作用于升级后新产生的消息；升级前已经写入会话历史的定时任务/后台任务记录会保留，可继续通过既有清理或重新总结流程处理。
+3. [#345](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/345) 的数据库文件打开失败仍需新增诊断日志定位，保持开放。
+
+## [2.9.0] - 2026-11-03
+
+2.9.0 新增按适配器实例配置记忆互通及旧数据归属迁移，并修复反思积压、历史清理和记忆整合中的问题。原有会话、用户作用域和人格过滤继续生效，平台用户 ID 保留原值。
+
+### 适配器互通与旧数据
+
+- **按实例选择互通**：在“设置 → 访问与隔离”选择参与互通的适配器，其他实例各自隔离。同类型的多个机器人也按实例 ID 区分；读取、Agent 工具、原子、图谱、近期记忆与缓存使用同一访问范围。关闭 `legacy` 会话过滤后，也不再强制回退到当前会话。
+- **候选阶段过滤**：SQL 与 FAISS 在选取候选时应用适配器范围，避免大量其他适配器的近邻占满结果上限。
+- **旧记忆归属**：首次启动从来源会话、保留原文及旧作用域恢复归属，并同步图向量文档元数据。来源缺失、混合或不能唯一识别的记录保持未归属；可在设置页按旧作用域分配，或将旧适配器的记录整体转交。归属变更前备份 SQLite 库，保留正文、文档 ID、会话、人格和已有向量，无需重新生成 Embedding。
+
+见 [#384](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/384)，贡献者 [@lxfight](https://github.com/lxfight)。
+
+### 反思与整合修复
+
+- **限制单段输入**：新增 `reflection_engine.max_messages_per_segment`，默认每段最多 120 条消息；跨天或空闲边界更早时先切分。同一任务继续消费后续片段，并遵守原有 `max_segments_per_run` 预算。重试及放弃失败片段也不会越过后续积压。
+- **历史保留上限收敛**：即使总结游标为 0，也会执行 `max_messages_per_session` 上限。优先清理已总结消息；不足时淘汰最旧的未总结缓存并警告，尚未形成长期记忆的内容可能丢失。
+- **裁剪后游标正确推进**：读取总结快照时协调头部裁剪，提交时按最后一条消息的 ID 和时间戳定位，避免旧数组下标跳过尚未处理的内容。正在总结的历史快照可以提交，显式回滚或编辑仍会拒绝失效任务。
+- **协调写入与保留隔离**：反思触发的整合在积压任务结束后调度；整合与反思的持久化互斥，LLM 推理保持并行。会话粒度整合也按人格及适配器归属分组，避免不同人格的事实被合并。
+
+修复 [#385](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/385)，见 [#386](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/386)，贡献者 [@lxfight](https://github.com/lxfight)。同时清理重复计数审查、裁剪后状态回读、重复游标提交重试和重复分组逻辑。
+
+### 验证
+
+- 完整后端测试 1,203 项、前端测试 150 项通过；Ruff、Dashboard 产物检查、文档检查及构建通过。
+- 真实 SQLite/FAISS 回归覆盖互通与隔离、人格/会话交集、并发缓存、8,300 条干扰近邻、归属备份/回滚、总结分段及裁剪前后提交。
+- Chrome 桌面、平板和手机检查覆盖名单保存、旧策略保留、归属操作成功与失败反馈。
+
+### 升级说明
+
+1. 升级前停止插件并备份完整数据目录，保留原始对话和向量文件。**若已有大量未总结历史且希望全部保留，请先提高 `max_messages_per_session` 或导出原文**；升级后触及硬上限会淘汰最旧缓存。
+2. 更新至 `2.9.0` 后重新启动 AstrBot 并重新打开插件视图。未设置互通名单时不额外限制适配器；设置名单后，未选中及新加入的实例各自隔离，未归属旧记录需先分配才能进入适配器召回。
+3. 会话隔离开启时，不同实际会话仍然隔离。已有按实际会话保存的记忆，可保留 `legacy` 模式并关闭会话过滤，在互通名单及人格范围内共享读取。
+4. 手动批量转交归属前，暂停相关适配器并等待进行中的总结结束，完成后再恢复。归属迁移不改写原始会话 ID。
+5. [#345](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/345) 的数据库文件打开失败仍需新增诊断日志定位；本版本不宣称解决所有 SQLite 锁或文件系统错误。
+
+## [2.8.4] - 2026-11-01
+
+本次维护版本修复官方插件视图中的 3D 加载失败，完善 SQLite 打开错误的诊断信息，并明确时间戳写入错误的宿主升级路径。无需修改插件配置或迁移数据库。
+
+### 修复与诊断
+
+- **3D 图谱加载**：使用 AstrBot 改写后的资源地址，保留访问令牌；页面打开时预加载模块，切换到 3D 时才创建场景，避免页面停留后令牌过期影响加载。离页仍释放 WebGL 与 Worker 资源；导入期间离页也不会创建闲置场景。修复 [#371](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/371)，见 [#378](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/378)。
+- **SQLite 故障诊断**：访问统计写入失败时，日志增加数据库路径、原生错误码及错误名称，保留扩展错误码与完整堆栈，便于区分写锁和文件打开失败。访问统计失败继续保留正常读取能力。见 [#380](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/380)。[#345](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/345) 的打开失败根因仍需结合新增日志确认，该 Issue 保持开放。
+- **时间戳兼容性指引**：明确 SQLModel 0.0.45 起的时间类型变化与旧版 AstrBot 文档模型不兼容。宿主修复已随 AstrBot 4.29.0 发布；出现 `Datetime values must have timezone information` 时，需要升级 AstrBot。见 [#379](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/379)、上游 [#10211](https://github.com/AstrBotDevs/AstrBot/pull/10211)。
+
+以上改动由 [@lxfight](https://github.com/lxfight) 贡献。
+
+### 依赖安装说明
+
+补充确认：[#374](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/374) 的报告环境安装 `networkx` 后恢复路由注册。`networkx>=3.0` 已在插件依赖清单中；若运行环境仍缺少它，请使用运行 AstrBot 的同一 Python 环境，在 AstrBot 根目录执行：
+
+```bash
+python -m pip install -r data/plugins/astrbot_plugin_livingmemory/requirements.txt
+```
+
+### 验证
+
+- 功能 PR 的完整 CI 通过，最新后端 1,174 项、前端 149 项测试通过。
+- Chrome 沙盒验证覆盖旧版资源鉴权失败复现、令牌过期后切换 3D、离页释放及返回重建；隔离 SQLite 验证了时间戳错误及上游修复。
+- 发布相关测试、Dashboard 产物检查和文档构建通过。
+
+### 升级
+
+1. 保留现有数据和配置，更新至 `2.8.4` 后重新启动 AstrBot，并关闭后重新打开插件视图，使页面重新获得有效资源地址。
+2. 若遇到时间戳写入错误，升级 **AstrBot 至 4.29.0 或更高版本**；宿主修复保留已有本地时间戳语义，无需重新生成嵌入。
+3. 若仍出现数据库打开错误，请提供日志中的数据库路径、SQLite 错误码与完整堆栈，以便继续定位 #345。
+
+## [2.8.3] - 2026-11-01
+
+本次维护版本修复插件依赖缺失时管理接口未注册的问题，防止失效记忆通过旧摘要重新进入提示词，并降低大规模图谱的浏览器内存占用。无需修改配置或迁移数据库。
+
+### 修复
+
+- **依赖安装与管理接口**：补齐 NumPy、Pydantic、Quart 和 SQLAlchemy 的直接依赖声明；页面 API 在插件导入时加载，使缺库异常交由 AstrBot 处理。移除导入或注册失败后跳过页面 API 的兼容分支，避免插件显示已加载但全部管理接口提示“未找到该路由”。FAISS 继续使用宿主提供的版本。修复 [#374](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/issues/374)，见 [#376](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/376)，贡献者 [@lxfight](https://github.com/lxfight)。
+- **记忆生命周期**：普通召回与 Agent 召回注入提示词时，优先使用已按生命周期筛选的原子内容，不再混入父记忆旧摘要和旧关键事实。覆盖过期、遗忘、被替代以及缓存后状态发生变化的记忆；保留有效事实和无原子记忆的原有摘要行为。见 [#369](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/369)，贡献者 [@Ichooooooo](https://github.com/Ichooooooo)。
+
+### 性能与交互
+
+- **大图内存**：移除常驻的未使用边字段，按需构建选择索引，并取消每次布局对全图排序生成签名的开销。
+- **3D 资源释放**：离开图谱页后释放 WebGL 上下文、图形缓冲和布局 Worker；返回时按需重建。移除启动时重复的统计请求。
+- **来源记忆关联**：延迟索引保留条目及记忆自身的节点关联，无关系边的节点也能在详情中显示来源记忆。
+
+以上图谱改动见 [#372](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/372)，贡献者 [@lxfight](https://github.com/lxfight)。原 PR 在同一台设备、10,068 节点 / 200,068 条关系快照上的测量中，2D 加载后 JS 堆内存由 144.1 MB 降至 47.0 MB；离开 3D 图谱后的保留内存由 163.8 MB 降至 49.1 MB。实际效果取决于设备和数据规模。
+
+### 验证
+
+- 合并验证 CI：后端 1,173 项、前端 149 项测试通过。
+- Dashboard 产物检查、文档构建及依赖修复相关 Python 文件的 Ruff 检查通过。
+
+### 升级
+
+1. 保留现有插件数据和配置，更新至 `2.8.3` 后重新启动 AstrBot，再强制刷新管理页面。发布包已包含构建好的离线前端资源。
+2. 若仍报告缺少 Python 库，在 AstrBot 根目录使用运行 AstrBot 的同一 Python 环境执行以下命令，再重新启动：
+
+   ```bash
+   python -m pip install -r data/plugins/astrbot_plugin_livingmemory/requirements.txt
+   ```
+
+3. 无需重新生成嵌入或迁移数据库。返回大型 3D 图谱时会重新执行布局，这是释放离页资源的开销。
+
+## [2.8.2] - 2026-10-28
+
+2.8.2 将 3D 记忆图谱完善为具有社区层次、厚旋臂和星尘的星系视图，保留真实关联与稳定运动，并修复大图中的选点和细节展开。无需数据库迁移、配置变更或新增运行时依赖。([#363](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/363), [#364](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/364), [#365](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/365), [#366](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/366), [@lxfight](https://github.com/lxfight))
+
+### 新增与体验
+
+- **加权社区与星系布局**：使用现有 NetworkX 在线程中计算作用域内的加权 Louvain 社区，按跨社区关联强度安排远近；大社区形成有厚度的旋臂，小社区和孤立节点呈星团分布。分支与末端沿连续半径展开，替换固定球壳式布局。
+- **保留形态的运动**：初始布局由 Worker 完成并直接保留，星系整体缓慢旋转，节点在语义分支附近进行有界的局部引力运动。悬停或聚焦时暂停所属星系的整体旋转并固定目标及上级，恢复时延续已有状态。
+- **分层关系与星尘**：总览显示少量社区主干曲线，靠近后展开内部骨架，悬停或选择时突出真实直接关系；「全部关系」继续保留完整连线。GPU 星尘提供背景密度，不参与记忆计数、选点或检索。
+- **高价值记忆表现**：收敛普通节点辉光与缩放，重要性达到 8/10 的来源记忆优先选择一个总结节点作为脉冲代表，没有总结时使用事实节点，减少核心区域泛白。
+
+### 修复与性能
+
+- **精准选点与细节展开**：按屏幕上的节点中心选取，并同步当前相机矩阵，修复前景节点抢占远处点击及相机更新时的错选；细节层次跟随正在查看的中心，避免前景星系抢占展开。保留触摸选点、点击变焦和实际坐标旋转中心。
+- **大图与空图**：按度数归一化布局拉力，避免密集关系把旋臂拉回核心；节点和关系继续共享位置缓冲，运动时不重建全图索引；修复空图标签初始化。清理旧射线拾取和重复的总览排序。
+
+### 开发工具与文档
+
+- 新增手动运行的 `scripts/seed_visual_graph.py`，默认追加 10,000 节点、200,000 条关系和 1,200 条归档合成记忆，覆盖大小社区、弱连接、孤立节点和高价值内容；使用独立会话和命名空间，保留已有记录，不生成 Embedding。每次运行会继续追加，测试数据本身不随发布包分发。
+- 更新中英文 WebUI、架构说明和演示截图，同步三语 README、文档首页和升级入口；图谱视图快照增加显示用的 `snapshot.nodes[].community` 编号。
+
+### 验证
+
+- 功能 PR 全量 CI：后端 `pytest` 1,161 项、前端 147 项全部通过；Dashboard 产物检查、文档构建和改动 Python 文件的 Ruff 检查通过。
+- 同等 opaque-origin 沙盒中验证运动、暂停、前后台切换、减少动态效果、实际鼠标选点、聚焦、缩放和手机尺寸；八种外观/明暗组合的详情对比度检查通过。
+- 本机实际写入的合成图谱包含 10,000 节点/200,000 条关系，完整关系模式约 25 FPS、4 次绘制调用，索引在运动期间保持复用。实际数据与不同设备的表现可能不同。
+
+### 升级说明
+
+1. 保留现有数据与配置，更新代码后重载插件并强制刷新管理页面，确认版本为 `2.8.2`；本次包含后端社区字段，需同步加载新前后端。
+2. 无需迁移数据库，发布包已包含离线前端资源；系统开启“减少动态效果”时可点击「继续运转」。
+3. 视觉测试数据仅在手动运行生成脚本时追加；已有本地测试数据可用会话 `livingmemory:visual:galaxy` 筛选并点击「全量图谱」查看。
+
+## [2.8.1] - 2026-10-28
+
+2.8.1 完善 3D 记忆图谱的空间布局、动态效果与阅读交互：按记忆类型和真实关联构建分层引力运动，展开内部节点并收紧外围，同时修复详情配色和聚焦旋转中心。无需修改配置或迁移数据库，无新增运行时依赖。
+
+### 新增与体验
+
+- **分层引力运动**：节点由所属人物、主题或总结的中心引力持续改变速度，近处加速、远处减速；同一星系保持一致的旋转方向和三维运动分量。支持暂停/继续，悬停或聚焦时固定当前对象及其上级，恢复时保留位置和速度；离页或标签不可见时停止计算与绘制，系统开启“减少动态效果”时默认暂停。([#357](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/357), [#361](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/361), [@lxfight](https://github.com/lxfight))
+- **星系层级与节点样式**：复用已有拓扑分群，社区中心和节点独立分布在三维空间；人物、主题、总结和事实使用不同大小。内部间距按分支深度分配，外围末端节点采用更紧凑的半径，运转时保持分支在内、末端在外。([#355](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/355), [#360](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/360), [#361](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/361))
+- **恒星辉光与高价值脉冲**：代表恒星带有外层辉光，来源记忆重要性达到 8/10 的事实或总结呈现脉冲光晕与旋转光束；实体连接数不用于判断记忆价值。([#358](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/358))
+
+### 修复与性能
+
+- **三维纵深与关系线**：修复社区发现后近似共面的布局，保留暂停和运转过程中的空间体积；提亮总览和选中关系，完整连线按关系密度调整透明度。([#359](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/359))
+- **聚焦与旋转中心**：全图围绕按社区规模加权的中心旋转，聚焦后围绕实际节点或所选记忆节点的中心旋转；详情留白通过投影偏移处理，修复旋转、缩放、窗口变化及中断聚焦时的目标漂移。([#358](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/358))
+- **主题冲突**：3D 场景中的详情、元数据、编辑字段和迷你图谱使用统一深色配色；返回 2D 或其他页面时恢复原有外观与明暗模式。([#356](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/356))
+- **大图与来源关联**：每个节点只计算所属中心的引力，使用固定步长积分和共享位置缓冲；运动时不重建连线索引，卡顿帧限制物理追帧开销。全量快照补齐记忆与节点的关联，保留高价值内容的来源依据；清理旧相位、类型周期和轨道基向量实现。([#358](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/358), [#361](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/361))
+
+### 文档
+
+- 更新中英文 WebUI 使用说明、演示截图及版本升级文档，同步中英俄 README 和文档首页的稳定版入口。
+
+### 验证
+
+- 功能 PR 的 GitHub CI：后端 `pytest` 1,155 项、前端 136 项全部通过；版本、README、发布工作流、文档及前端产物相关检查通过。
+- Dashboard 产物检查、文档构建和 `git diff --check` 通过。
+- 浏览器沙盒验证覆盖暂停/继续、聚焦旋转与缩放、手机尺寸、前后台切换和三维层级；本机合成 5,000 节点/100,000 条边约 26 FPS、3 次绘制调用，引力计算平均约 0.5 毫秒/帧。真实数据和不同设备的表现可能不同。
+
+### 升级说明
+
+1. 保留现有数据和配置，更新插件代码后重载插件，并强制刷新管理页面，确认版本为 `2.8.1`。
+2. 无需数据库迁移或新增配置；系统开启“减少动态效果”时，可在 3D 图谱中点击「继续运转」主动开启动画。
+3. 发布包已包含离线前端资源；使用插件无需安装 Node.js，只有修改前端源码后才需要重新构建。
+
+## [2.8.0] - 2026-10-28
+
+2.8.0 新增独立的沉浸式 3D 记忆图谱，支持点击变焦、关联记忆联动和大规模节点/关系批量绘制。现有 2D 视图和记忆数据继续沿用，无需配置或数据库迁移。([#353](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/353), [@lxfight](https://github.com/lxfight))
+
+### 新增
+
+- **独立 3D 场景**：使用暖光节点与空间深度，支持旋转、平移、滚轮/双指缩放、点击节点平滑靠近，以及搜索和记忆定位；切换 2D/3D 保留图谱数据与选择。
+- **精简界面**：3D 视图隐藏页面标题、统计栏和重复节点元信息，只保留必要控件、节点名称与关联记忆；支持结构概览和「全部关系」切换。
+
+### 修复与性能
+
+- **AstrBot 沙盒兼容**：布局 Worker 内嵌进离线前端资源，通过 Blob 在插件视图的 opaque origin 中创建，修复 `cannot be accessed from origin 'null'`。
+- **大图绘制与布局**：节点及索引关系交由 GPU 批量绘制，真正的三维布局在 Worker 中执行；静止或离开页面后停止绘制。相同关系的多个记忆来源保留在数据中，显示时共享几何。
+- **全量图谱**：取消固定节点、关系和关联记忆截断，按现有会话/人格范围完整读取；使用 `EXISTS` 查询避免多条记忆入口放大边连接结果。
+- **选择与定位**：修复切换维度后的选择状态，以及从记忆详情定位时沿用旧节点选择的问题；清理重复缓动函数、未使用代码和吞异常回调包装。
+
+### 文档
+
+- 中英俄 README 增加 3D 图谱说明；QQ 一群 953245617 标记已满，新增二群 **1129994749**。
+- 更新中英文 WebUI 使用说明及截图；新增前端构建依赖，发布包已包含离线脚本和第三方许可证，使用插件无需安装前端工具。
+
+### 验证
+
+- 本地后端 `pytest` 1,155 项、前端 115 项通过；功能 PR 的 GitHub CI 通过。
+- Dashboard 产物检查、文档构建、改动 Python 文件的 Ruff 检查和 `git diff --check` 通过。
+- 浏览器在与 AstrBot 相同的 sandbox iframe 中验证交互，合成数据覆盖 3,000 节点/30,000 条边及 5,000 节点/100,000 条边；不代表所有设备或真实数据的性能。
+
+### 升级说明
+
+1. 无需修改配置或迁移数据库，保留现有插件数据即可升级。
+2. 重载插件并强制刷新管理页面，在图谱页顶部切换到「3D 空间」。
+3. 发布包已包含离线前端资源；只有修改前端源码后才需要执行 `npm ci` 和 `npm run build:dashboard`。
+
+## [2.7.3] - 2026-10-26
+
+2.7.3 是运行时修复版本，修复 SQLite 写事务异常后持续占锁与反思窗口积压无法在一次触发内消化的问题，并适配 AstrBot 新的异步 Provider 与 Plugin View API。不引入新的运行时依赖，也没有强制迁移步骤；稳定版会正常参与 AstrBot 的版本更新提示。
+
+### 修复
+
+- **SQLite 写锁释放 (#345)**：共享连接上的写操作统一使用 `BEGIN IMMEDIATE` 与实例级写锁；异常、取消或提交失败都会回滚，复用连接前清理残留事务，关闭前也会回滚。修复未提交写事务长期占锁、其他连接持续收到 `database is locked`、关闭持锁连接后才恢复的问题。([#348](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/348), [@lxfight](https://github.com/lxfight))
+- **反思积压无法在一次触发内消化 (#344)**：窗口按天或空闲间隔切分后，后台任务会在同一次运行内从最老片段开始连续总结，直到清空积压或达到 `reflection_engine.max_segments_per_run`（默认 10，范围 1-50）。每段独立写入 `source_window` 并原子推进游标；任一段失败、取消、回滚或游标未前进时立即停止，剩余积压留待下次触发。([#349](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/349), [@lxfight](https://github.com/lxfight))
+
+### 变更
+
+- **AstrBot API 自适应**：默认 LLM Provider 在 AstrBot 4.27.3+ 优先通过 `get_using_provider_async()` 获取，旧版本继续回退同步接口，避免宿主异步 Provider 生命周期下的阻塞与弃用告警。Dashboard 优先使用 `AstrBotPluginView` 桥接，旧版 `AstrBotPluginPage` 保持兼容；文档入口同步为 AstrBot 的 Views 命名。最低兼容版本仍为 4.24.2。([#350](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/350), [@lxfight](https://github.com/lxfight))
+
+### 验证
+
+- 后端 `pytest` 1,154 项全部通过；前端 110 项全部通过。
+- `npm run check:dashboard`、`npm run docs:build` 与 `git diff --check` 通过。
+
+### 升级说明
+
+1. 无需修改配置，也没有强制迁移步骤。
+2. 跨天或长空闲较多、反思积压明显的会话可通过 `reflection_engine.max_segments_per_run` 调整单次消费上限；默认值 10 已覆盖大多数场景。
+3. AstrBot 4.24.2 及以上均可直接升级：4.27.3+ 使用异步 Provider 接口，旧版本自动回退同步接口。
+4. `unable to open database file` 属于 SQLite `SQLITE_CANTOPEN`，不由本次写锁修复覆盖；若升级后仍出现，请提供数据库路径、目录权限、磁盘状态与杀毒软件/同步盘信息。
+
+## [2.7.2] - 2026-10-26
+
+2.7.2 是文档补丁版本，补充 README 与文档站的嵌入模型说明；不修改运行时逻辑、不引入新的依赖，也没有强制迁移步骤。
+
+### 文档
+
+- **嵌入模型科普**：新增中英文「嵌入模型与 BGE-M3」页面，解释嵌入模型如何把文本映射为向量、LivingMemory 如何用它做语义召回，以及为什么索引与查询必须使用同一模型和维度。
+- **硅基流动 BGE-M3 配置**：给出免费 `BAAI/bge-m3` 的 API Key、API Base URL、模型 ID、1024 维配置，以及 AstrBot Provider ID 的查找方式，并说明模型 ID 与 Provider ID 的区别。
+- **README 更新**：中英俄三份 README 增加免费嵌入模型章节和文档入口，让插件市场与仓库首页直接展示可执行的配置步骤。
+- **文档入口与校验**：快速开始、配置参考和 VitePress 侧边栏加入新页面入口，并将该页面纳入中英文 parity 测试。
+
+### 验证
+
+- 后端 `pytest` 1,145 项全部通过；无运行时行为变更。
+- `npm run docs:build` 通过；README 契约与中英文档 parity 测试 8 项通过。
+
+
+## [2.7.1] - 2026-10-22
+
+2.7.1 是 2.7.0 的补丁版本，聚焦配置体验与重复记忆问题；不引入新的运行时依赖，也没有强制迁移步骤。
+
+### 新增
+
+- **写入时近重复合并**：总结记忆落库前与同会话/同人格的近期记忆比较，相似度达到 `memory_dedup.similarity_threshold`（默认 0.92）时合并到已有记忆而不是新增一条，并保留主题、关键事实、原子与来源消息；检测或合并失败时回退为正常写入，回滚补偿只删除本任务新建的记忆。
+- **Dashboard 设置页**：页面顶部保留 8 个常用设置，其余高级配置按「记忆生成与生命周期、召回与工具、图谱与原子、访问与隔离、系统与维护」5 类折叠；支持搜索、一键展开/收起，字段说明沿用配置 schema 与四语本地化文案。
+
+### 变更
+
+- **AstrBot 插件配置页精简**：只保留模型 Provider（含必填 Embedding Provider ID）与回复语言；其余配置在 schema 中标记为隐藏，由 Dashboard 设置页管理。
+- **Embedding Provider 必须显式配置**：字段提示与配置参考改为必填说明，启动日志在回退到第一个可用 Provider 时输出 warning；避免选错模型导致向量/图索引初始化失败。
+
+### 验证
+
+- 后端 `pytest` 1,145 项、前端 `node --test` 109 项全部通过。
+- 版本一致性守卫与中英文档 parity 守卫通过；Dashboard 构建产物与源码一致。
+
+### 升级说明
+
+1. 无需修改配置，也没有强制迁移步骤。
+2. 若尚未填写 Embedding Provider ID，请先在 AstrBot「LLM 配置」中启用后填写，否则向量/图索引可能初始化失败。
+3. 保存 Dashboard 设置后重载插件，使初始化阶段读取的配置生效；近重复合并等运行时选项即时生效。
+4. 旧记忆需要补图数据时可执行 `/lmem rebuild-graph`；更换 Embedding 模型后执行 `/lmem rebuild-index`。
+
+## [2.7.0] - 2026-10-21
+
+2.7.0 稳定版发布，整合 `2.7.0-beta.1` 至 `2.7.0-beta.4` 的全部改动，是 2.6.1 之后的正式稳定版本。稳定版不是预发布版本，会正常参与 AstrBot 的插件版本更新提示。
+
+### 重点
+
+- **管理面板重做**：记忆列表标注写入方与写入动机，召回测试页按检索路线展示分项得分，图谱与记忆双向联动，系统页/提示词页失败改为页面内可重试提示，新增四种视觉风格。
+- **召回质量**：文档路融合改为分数级加权融合，候选池按倍数扩大并加入跨路一致性奖励，BM25 增加中文连续段字符二元组；原子生命周期参与主召回，结果与缓存命中都会重新检查过期事实。
+- **注入与一致性**：记忆注入统一为 add-only 临时片段，不写入宿主对话历史；WebUI 编辑/重试回滚与插件会话库对账，修订号、总结游标与补偿删除保证并发一致。
+- **生命周期**：总结窗口按天/空闲切分，类型化原子 TTL 与衰减，记忆整合支持回滚与归档恢复，数据库迁移强制备份并在失败时恢复。
+- **性能与索引**：召回热路径解除 FAISS 落盘阻塞，写操作 journal 与修复链删除（单条写入从最多 8 个事务降为 2 个），索引维护后台化并使用影子代际切换，Dashboard 图标与静态资源打包瘦身。
+- **工程化与本地化**：CI 固定 AstrBot 宿主提交、测试依赖锁定、版本与文档一致性守卫、完整日语支持（命令回复、配置页、Dashboard）。
+
+### 升级说明
+
+1. 无需修改配置，新增项均有默认值。
+2. 升级后首次启动会自动补齐版本与索引信息；建议执行一次 `/lmem rebuild-index`。
+3. 召回默认值变化：`fusion_mode=score`、`fusion_bm25_weight=0.5`、`recall_candidate_multiplier=3`、`fusion_agreement_bonus=0.25`；设置 `fusion_mode=rrf` 可回到旧的排名级融合。
+4. 插件最低要求 AstrBot 4.24.2；`@register` 已移除，元数据来自 `metadata.yaml`。
+5. Dashboard 偏好（主题、明暗、语言）保存在浏览器本地，升级不受影响。
+
+逐项改动与 PR 列表见 `2.7.0-beta.1` 至 `2.7.0-beta.4` 章节及 GitHub Release。
+
+## [2.7.0-beta.4] - 2026-10-21
+
+本版本是 2.7 系列的维护性预发布，覆盖 PR 308–332 共 25 个合并请求，重点是召回与写入热路径性能、数据一致性加固、架构职责收敛，以及管理面板载荷与日语支持。不引入新的运行时依赖，无强制迁移步骤，现有配置可直接沿用；稳定通道仍为 2.6.1。
+
+### 性能
+
+- **召回热路径解耦**：FAISS 异步落盘改为读写锁，检索不再被整索引 flush 阻塞，检索在线程池执行；LLM 钩子不再轮询等待初始化完成；启动阶段的 FAISS 探测与两份索引读取移出事件循环；图召回补齐反向边索引并复用只读连接；召回访问统计按 3 秒窗口合并写入并去重原子策略查询；查询分词增加缓存，向量候选复用避免重复 embedding 计算。
+- **写入路径大幅收敛**：删除写操作 journal 与修复/重放链（净减约 930 行），单条记忆写入从最多 8 个独立事务降为 2 个；批量删除在 FTS 阶段后显式提交，避免独立连接删除向量时 `database is locked`。
+- **管理面板载荷**：全量 lucide（414 KB）替换为 21 个图标子集（约 6 KB），首屏减少约 408 KB；样式与脚本打包压缩，阻塞请求从 14 个降为 5 个，CSS 85.9 KB → 69.2 KB；CSS 层叠安全去重再减 35 行。
+
+### 可靠性
+
+- **整合与衰减**：语义粒度整合按 `(session_id, persona_id)` 分组，归档失败时回滚；每日衰减只通过 SQL `json_set` 更新 importance/access_count，失败不再写入“今日已衰减”标记，避免当日永久跳过。
+- **迁移与索引**：数据库迁移要求先成功备份，备份失败则中止并恢复；索引重建重试统一为指数退避（移除按异常文本猜测限流与 30 秒特殊等待）；宿主不支持删除向量时，归档写入 `needs_index_rebuild`，由启动校验重建以清除幽灵向量；原子 FTS 补齐回填。
+- **运行时健壮性**：注入内容增加字符预算与单条长度上限；后台任务异常统一记录；插件卸载等待在途任务并设置 10 秒超时；禁用废弃的 `@register` 装饰器，插件元数据统一由 `metadata.yaml` 提供。
+
+### 架构与工程化
+
+- **职责收敛**：`HybridRetriever` 只负责查询融合，写侧索引维护拆到 `MemoryIndexWriter`；自动召回与 agentic 证据路径共用原子生命周期策略；RRF 结果类型复用检索器定义；版本表与 documents 热索引 DDL 收敛到 `storage/schema.py` 单一定义。
+- **可读性**：删除 16 个无引用方法；reflection 343 行主方法、`add_memory`、图快照构建方法分别拆为分阶段私有方法（入口 20–56 行）；`main.py` 11 个命令的就绪门禁收敛为统一委托入口。
+- **CI 与测试**：AstrBot 宿主 checkout 固定到已验证的上游提交，CI 不再随上游 master 漂移；测试依赖锁定（pytest 9.1.1 / pytest-asyncio 1.4.0）并新增 `pytest.ini`；前端测试改为递归 glob；2038 行事件处理器测试拆为四个模块 + 共享 support；新增文档中英 parity 守卫。
+- **文档与 i18n**：补齐日语支持（bot 回复、配置页、Dashboard 304 条文案与语言菜单）；同步版本源、部署与架构说明；新增 `scripts/bump_version.py` 版本一致性守卫。
+
+### 安装与升级
+
+1. 无需修改配置，新增项均有默认值。
+2. 升级后首次启动会自动补齐索引与版本信息；如之前完整索引较旧，可执行一次 `/lmem rebuild-index` 以获得检索侧优化收益。
+3. 插件最低要求 AstrBot 4.24.2；`@register` 移除后依赖宿主自动识别继承 `Star` 的插件类。
+4. Dashboard 偏好（主题、明暗、语言）保存在浏览器本地，升级不受影响。
+5. 建议验证：召回结果、记忆写入/删除、图记忆浏览、Dashboard 语言切换与页面加载、索引重建状态。
+
+## [2.7.0-beta.3] - 2026-10-20
+
+### 新增
+
+- **管理员专用 LLM 遗忘工具 (#279)**：新增 `forget_long_term_memory` 工具（配置 `agent_tools.enable_forget_tool`，默认关闭）。按 issue 决策，模型**不做物理删除**，只把记忆归档（`metadata.status="archived"`，从向量/BM25/图谱/原子索引中移除，documents 记录保留），管理员可在 Dashboard 记忆页按 `archived` 状态筛选后改回 `active` 恢复。安全闸门：仅管理员可调用、作用域校验与检索可见性一致且整批 all-or-nothing、单次条数上限（`forget_tool_max_memories`，默认 3）、同一会话冷却（`forget_tool_cooldown_seconds`，默认 60 秒，0 关闭）。归档时写入审计字段（`archived_by="llm_tool"`、`archive_reason`、`archive_session_id`）。
+- **记忆作用域迁移命令 (#285/#287)**：新增 `/lmem migrate-scope <target> [apply] [source]`，把既有记忆（`documents`、`memory_atoms`、`graph_entries`）显式改写到指定作用域，解决切换 `filtering_settings.memory_scope_mode` 后旧记忆失联的问题。默认 dry-run 预览，`apply` 前自动生成数据库备份；`source` 支持 `all`/`*`/`-` 表示全部来源，也支持 `global`/`session`/`user` 关键字与字面作用域。
+- **可选流式 LLM 调用 (#265)**：新增 `provider_settings.llm_stream_mode`（`auto`/`always`/`never`，默认 `auto`）。仅接受 `stream=true` 的模型服务现在可以正常用于记忆处理：`auto` 模式优先非流式，捕获到“不支持非流式请求”错误后自动改用 AstrBot 官方 Provider 流式接口，并在后续调用中记住该 Provider；流式中断、超时或缺少完整响应时按失败处理，不会把不完整结果写入记忆。`never` 保持原有非流式行为。
+
+### 变更
+
+- **中文 BM25 增加字符二元组，召回参数完成跨数据集验证**：BM25 索引与查询在 jieba 词元之外追加**中文连续段字符二元组**——短查询与店名/人名/型号等专有名词在索引侧和查询侧经常被切得不同，二元组补上这类细粒度匹配。中文评测集留出集（594 问）上 MRR 0.9267 → **0.9501**、H@1 0.8906 → **0.9259**、改写层 MRR 0.8512 → **0.9040**，仅 BM25 单路 MRR 0.8675 → **0.9099**；英文与数字段不产生二元组，英文语料行为不变。同时对 `fusion_agreement_bonus` 做 5×5 网格（中文 617 训练 / 594 留出）：0.40–0.60 在中文上略优（+0.3pt），但在英文 LoCoMo 上 0.25 更稳（+1.2pt），故**默认值保持 0.25**。注意：既有记忆的 FTS 仍为旧词元，需执行一次 `/lmem rebuild-index` 后才获得该收益，新写入自动生效。
+- **召回融合改为分数级加权融合（召回质量提升）**：此前文档路把 BM25 与向量结果按名次做无权重 RRF，且只取 k 个候选就融合——弱路（向量）会稀释强路的头部结果；融合后再叠加 0.25 重要性与 0.25 时间衰减，旧的相关记忆容易被较新的弱相关记忆挤后。现在默认 fusion_mode=score：两路分数在本查询内 min-max 归一化后按 fusion_bm25_weight（默认 0.5）加权求和，某一路缺失时按可用路线重新归一化权重；融合前每路按 recall_candidate_multiplier（默认 3）扩大候选池，而不是只在 k 个候选里重排。在 LoCoMo（10 段长对话、272 个会话级记忆、1536 条带证据的多跳/时序问答）上用离线管线复跑：MRR 0.662 → 0.744、Hit@1 0.526 → 0.633、Hit@5 0.849 → 0.897、Recall@5 0.781 → 0.832、nDCG 0.701 → 0.763，四个问题类别均有提升；配置 fusion_mode=rrf 可回到旧的排名级融合。评测脚本与数据集转换方式见 PR 说明。
+- **清理死代码与装饰性文案**：删除 164 个无任何引用的 i18n 键（`nuke.*` 对应已移除的「核爆清除」功能，`edit.*` / `graph.inspector.*` / `recall.*` 等旧版界面文案）、9 段随之变空的注释分节，以及 `graph.visibleNodes` 的重复定义（同一键定义两次、后者静默覆盖前者，与 #299 修掉的问题同源）。`styles.css` 里 34 条颜色/尺度声明在任何情况下都不生效——`art-direction.css` 在它之后加载并以同名变量覆盖——现只保留本文件独有的间距、圆角与阴影尺度，并在注释里写明调色板归属；深色块同样只留阴影。删除四个无调用方的全局导出（`lmApiRequest` / `lmEsc` / `lmStatusPill` / `lmNodeBadge`）及其导入，以及不承载信息的装饰：侧栏「SYSTEM / 02」、画布「LIVE GRAPH / XY」、导航项的 01–05 编号与统计卡的 A1–A4 编号（后两者与页头 `page-index` 的表达重复）。
+- **反馈与状态收敛**：同一个错误此前会同时出现在 toast 和页面提示里（记忆页、召回页、系统页），系统页与提示词页则只有 2.5 秒的 toast、失败后页面停在空白。现在统一为「页面级请求失败 → 常驻提示条 + 重试，动作结果 → 单处反馈」：系统页与提示词页新增可重试提示条，记忆页加载失败不再叠加 toast，记忆整合的成功结果只写一处、失败不再清空、功能未启用时按钮直接禁用。toast 补上 `role="status"` 与 `aria-live`，屏幕阅读器不再静默。系统页其余修正：会话面板单位由「条消息」改为「条记忆」（后端给的是每个会话的记忆条数），删除后端从未返回的 `last_active` 死分支；条形图零值不再因 `min-width` 画出假色条、重要性分布补空态、原子类型按数量降序、两图标签列宽统一；备份列表改用 `backup_unix_time` 本地化并按时间倒序（此前按目录名字典序，v2.9 会排在 v2.10 前），文件数改用 `files_copied`（`file_count` 多算一个 `backup_info.json`）；记忆整合面板前移到会话列表之前。提示词页删除顶部常驻横幅（同一条 JSON 规则此前在横幅、每项说明与徽标 tooltip 出现三次）；无变量时不再显示空的 Variables 标签；编辑器去掉与面板标题重复的副标题。加载提示改为覆盖表格顶部，不再让每次筛选顶动整张表，加载中也可以滚动；恢复移动端被隐藏的会话过滤框（文档一直承诺它可用）。
+- **图谱视觉编码自洽与稳定性**：图例此前混入关系 chip（无色点、无法对应画布边色、关系名还是未本地化的枚举），现在只保留解释画布颜色的节点类型，并在服务端截断全量图时补上「节点 可见数 / 总数」——此前 stat-pill 显示真实总数而画布只画了上限内的节点，两个数字当面矛盾。社区椭圆改为中性描边并去掉无图例解释的 `C/xx` 编号，同时修复 Worker 布局路径下社区编号没有回填到主线程节点、导致大图根本画不出社区边界的问题。节点 hover 元信息 `3M / 5 links` 改为本地化文案。节点类型色此前在 canvas 调色板、CSS 变量与详情徽章三处漂移（图例色点与节点徽章同屏异色），现以 `graph-shared.js` 的调色板为准对齐 CSS 变量，徽章底色改用中性表面。交互上滚轮缩放由加法步长改为乘法（大图适配后一格滚轮会跳 40%），拖拽平移时给出抓取光标，首屏不再显示常驻的引擎说明文案。
+- **图谱与记忆双向可达**：节点详情此前只有 4 个数字，点不进任何一条记忆——`nodeToMemories` 已经建好却没用上，图 → 记忆是死路。现在选中节点会列出该节点关联的记忆，点任意一条直接进入记忆详情；图谱页的节点详情改为非模态（不加遮罩），可以连续点选节点对比。反向新增「在图谱中定位」：记忆详情的知识图谱关联区块给出按钮，切到图谱页并定位该记忆的子图；原来 `cursor: pointer` 但零点击处理的小视图不再伪装成可点控件。同时删除工具栏里要求用户手输记忆 ID 的 Focus 控件（用户无从得知 ID），会话范围输入改为带候选列表并支持 Enter。
+- **记忆来源与写入动机可见**：记忆列表在摘要下方标注写入方（Agent 主动写入 / 导入 / 重新总结，无标记为自动总结），摘要质量偏低时单独标出；这些信息此前已在列表接口的 metadata 中返回，界面一处都没渲染，用户无法分辨哪些记忆是 Agent 自己写的。详情面板增加来源、Agent 写入时的记忆原因（`memorize_reason`）与内容编辑后的原记忆 ID（`previous_id`），并去掉与头部重复的状态/类型/重要性；原始消息改为默认折叠并标出机器人回复的句子；详情请求失败时提示"显示本地缓存"而不是静默降级；批量删除失败时显示后端返回的失败 ID；重新总结后刷新列表，不再残留已被替换的旧记录。
+- **召回测试页展示检索路线分项**：结果卡按实际命中的检索路线（文档关键词 / 文档向量 / 图关键词 / 图向量）列出分项得分。后端 `score_breakdown` 一直返回这份数据，此前页面只显示融合后的最终得分，无法判断召回来自哪条路径。同时：结果头回显本次请求的 `k` 与会话过滤；最终得分不再按 0.75 / 0.45 阈值着色（该阈值没有可解释的来源）；卡片里硬编码的 `ID:` / `Score:` / `Session:` 英文改为跟随界面语言；结果类型改用与记忆页一致的本地化标签；召回失败只在结果区提示一次，不再叠加 toast；首次进入结果区显示引导文案而不是空白。
+
+### 修复
+
+- **FAISS 写路径不再只依赖 monkey-patch (#290)**：新增 `core/utils/faiss_path_bridge.py` 对称 ASCII 兜底（`needs_bridge` / `safe_temp_dir` / `safe_temp_file` / `read_index_safe` / `write_index_safe` / `bridge_installed`）。异步落盘的 `_write_index_atomic` 与索引重建的读写改走显式兜底：非 ASCII 路径下 FAISS 的临时文件只创建在纯 ASCII 目录，再 `os.replace` 原子落回目标（跨卷退回复制 + 删除），因此即使全局 monkey-patch 缺失也不会静默写盘失败。桥接补丁函数带 `__lmem_ascii_bridge__` 标记；`FaissVecDB` 被提前加载导致补丁缺失且处于 Windows 非 ASCII 目录时会一次性告警，并新增补丁安装回归测试与桥接读写测试。
+- **总结窗口不再跨天/跨长空闲合并 (#255)**：总结仍按未总结轮次触发，但窗口会按本地日期变化（`reflection_engine.window_split_by_day`，默认开启）或空闲间隔（`reflection_engine.window_split_gap_minutes`，默认 180 分钟，0 表示禁用）切分，一次只总结最老的连续片段，较新片段留待后续触发，避免一整段跨天对话被合并进同一条记忆、时间与内容互相混淆。消息入库时间改用平台消息时间戳（缺失或明显异常时回退到接收时间），使窗口边界贴近消息实际发生时间。
+- **记忆整合 JSON 解析 (#278)**：先解析原始响应；JSON 修复保留结构空白，只在字符串内转义裸控制字符，避免合法多行 JSON、字符串内括号与逗号被破坏。
+- **总结提示词前缀缓存 (#277)**：默认 system prompt 保持固定，私聊/群聊模板将当前时间和待总结对话移到固定规则、格式和示例之后。相对时间优先按各条消息的发送时间解释。自定义模板仍支持原变量；使用旧自定义模板的用户可在提示词管理页载入默认内容并保存，或自行将动态变量移到末尾。实际缓存命中率取决于 Provider。
+- **WebUI 编辑/重试后对话历史回滚同步**: AstrBot Dashboard 的「编辑上一条消息并重新请求」「换模型重试上一条对话」会在 LLM 侧截断/删除对应轮次（conv_mgr 历史），此前插件会话库对此无感知——被撤销的旧用户消息与旧回复会残留在库内，用户消息被重复入库，随后被滑动窗口总结写入长期记忆，导致记忆与用户修正后的上下文矛盾。现在插件在 `on_llm_request` 时以 AstrBot 会话历史的 `_checkpoint` 段（llm_checkpoint_id）为锚点对账：检测到库尾存在被回滚的轮次即原子删除，并同步修正 `message_count` / `last_summarized_index` / `pending_summary` 游标；`on_llm_response` 增加守卫，重试瞬间迟到的旧轮回复不再落库。群聊、无 checkpoint 的遗留数据与非 webchat 平台保守跳过，行为不变；已写入长期记忆的内容不会自动撤回（局限说明见 PR）
+
+- **回滚只删除已确认的连续失效尾部**: 对账遇到"中段缺口"（store 缺行、插件曾被禁用等导致有效轮次之间出现空档）时，不再把删除范围向前扩展到已对齐的有效轮次，避免误删仍在 LLM 历史中的轮次；此时仅返回已确认的安全尾部边界，无失效尾部则保守不删
+- **回滚与总结游标提交的并发一致性**: 回滚的删除在会话锁之外完成，而"已通过修订号校验、正在写元数据"的后台总结任务仍会在删除之后提交旧游标——真实 SQLite 下可确定复现 `message_count=2` 而 `last_summarized_index=4` 的倒挂；倒挂游标会被反思自愈钳回消息数，于是重发的那一轮不再触发总结而被静默吞掉。现在：① 回滚的**游标钳制 + 修订号推进**与条件元数据写入落在同一会话锁临界区；② `update_session_metadata_if_revision` 在锁内、以及无条件写入路径 `update_session_metadata` 内，都按当前消息数钳制 `last_summarized_index`，条件写入路径下任意交错顺序都不会倒挂；③ 对账的**所有返回路径**（空会话、库尾一致短路、无法安全判定、删除数为 0）都会做一次廉价自愈，修正倒挂游标与越界 `pending_summary`（起点越过末尾则清除、终点越界则收敛到当前长度）；`clear_session` 的删除消息 + 重置元数据 + 推进修订号收进同一临界区
+- **滑动窗口清理纳入会话锁并同步游标（刻意不推进修订号）**: 新增 `ConversationManager.trim_session_messages` 包装（持会话锁 + 钳制游标 + 失效缓存），消息清理改走该包装；`store.trim_session_messages` 同步把 `pending_summary` 的绝对下标整体前移。此前滑动窗口直接调用 store，既不持会话锁也不修正待处理范围，会与游标写入交错造成倒挂。**不推进修订号是刻意的**：滑动窗口只删已总结消息，在途任务的总结范围并未失效，其提交的 `end_index` 经原子钳制后恰好是正确游标；推进修订号反而会判废合法提交并触发下面的补偿删除，把刚写完的合法记忆删掉
+- **回滚后补偿删除刚落库的记忆**: 捕获 `add_memory` 返回的记忆 id，当总结游标提交因修订号变化被拒时补偿删除该记忆；任务被取消（回滚会 cancel 任务，`CancelledError` 会穿透 `except Exception`）时同样用 `asyncio.shield` 补偿后再抛出。修订号校验发生在调用记忆引擎之前，仅靠它无法撤回已经落库的已撤销内容
+- **对账改为按快照 id 精确删除**: `delete_messages_from_position` 新增可选 `message_ids`，对账传入快照中确认失效的 id 集合。按位置/时间边界删除会连带删掉"快照之后并发新增的合法消息"，并在库中留下永久缺口
+- **总结游标钳制统一到 store 写锁内**: 新增 `_clamp_summary_metadata`（统一游标/`pending_summary` 规则，消除滑动窗口与对账两处语义分叉）与 `update_session_metadata_atomic`（在 `_write_lock` 内原子钳制后写入），使"读消息数 → 钳制 → 写入"不会被滑动窗口清理或对账删除穿插
+- **回滚使进行中的后台总结任务失效**: 新增会话修订号，编辑/重试回滚与清空会话都会推进；后台总结任务在推进总结游标前按修订号校验（校验与游标写入原子互斥），并会在回滚时被取消；若任务已进入记忆写入阶段，回滚后会对刚落库的记忆做**补偿删除**（见下条），因此不再需要"已写入内容无法撤回"这一妥协。修复"慢总结期间编辑/重试"导致旧范围内容被写入记忆、`last_summarized_index` 被写回旧位置的问题
+
+### 测试
+
+- 新增 `tests/test_pr264_review_race.py`：并发新增消息不被误删、滑动窗口清理推进修订号、回滚期间记忆写入的补偿删除，以及评审提供的真实 SQLite 并发复现（旧写入与回滚交错）、反序（回滚先行 → 旧写入被修订号校验拒绝）、写入侧兜底钳制、清空会话与迟到写入同一窗口、短路路径自愈（倒挂游标 + 越界 `pending_summary`）、两种交错顺序的重复压力
+- 新增回滚检测纯函数、尾部删除游标钳制、编辑/重试事件流与真实数据库端到端回归测试；补充"中段缺口 + 尾部回滚"与"慢总结期间编辑/重试"（内存写入丢弃、游标原子校验被拒、总结任务取消）回归测试
+
+## [2.7.0-beta.2] - 2026-09-16
+
+本版本为预发布测试版，覆盖 `2.7.0-beta.1` 之后的重构与行为规范收敛。稳定使用可继续选择 2.6.1。
+
+### 变更
+
+- **记忆注入机制规范化，不再干预宿主对话历史**：为保持与 AstrBot 上游架构的长期兼容、适配其后续版本的技术演进，本版本对插件与 LLM 请求链路的交互方式进行了规范化收敛，收缩并移除了部分超出插件职责边界的非标准操作。记忆注入全面统一为 AstrBot 官方扩展点的追加式（add-only）写入：`req.extra_user_content_parts.append(TextPart(...).mark_as_temp())`，临时片段由 AstrBot 在保存对话历史时自动过滤，注入不写入对话历史、不影响前缀缓存。
+- **移除历史格式归一化逻辑**：插件不再改写历史消息的 content 结构，content parts 列表与纯文本字符串均保持 AstrBot 写入时的原样。
+- **废弃非追加式注入方式**：`user_message_before`、`user_message_after`、`fake_tool_call`、`fake_tool_call_deepseek_v4`（含此前已废弃的 `system_prompt`）会改写用户消息或向对话历史写入消息，配置后自动回退至 `extra_user_content` 并记录日志，无需手动调整配置。
+- **保留遗留残留清理**：`auto_remove_injected` 仅用于从请求上下文视图移除旧版本注入方式残留在历史中的记忆片段，不触及用户自身的任何历史消息。
+
+### 重构
+
+- **模块化与公共 API 收敛 (#268–#272)**：删除无效代码路径与未使用导出；页面 API 与记忆整合管理器收敛至 MemoryEngine 公共 API；JSON 工具去重并将 schema DDL 归一到单一来源；召回作用域回退与写入侧语义对齐；Mixin 宿主契约改为类注解声明。
+
+### 升级说明
+
+- 旧配置中的注入方式无需手动调整，运行时自动回退；如需清理历史中以文本形式残留的旧注入片段，可执行 `/lmem cleanup`（伪造工具调用消息对会在每次请求时自动从上下文中移除）。
+- 从 `2.7.0-beta.1` 升级时保留插件数据目录与配置即可。
+
+### 完整 PR 与作者
+
+| PR | 改动 | 作者 |
+| --- | --- | --- |
+| [#268](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/268) | 移除死代码路径与未使用导出 | [@lxfight](https://github.com/lxfight) |
+| [#269](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/269) | 页面 API 与整合管理器路由至 MemoryEngine 公共 API | [@lxfight](https://github.com/lxfight) |
+| [#270](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/270) | JSON 工具去重，schema DDL 归一 | [@lxfight](https://github.com/lxfight) |
+| [#271](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/271) | 召回作用域回退与写入侧语义对齐 | [@lxfight](https://github.com/lxfight) |
+| [#272](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/272) | Mixin 宿主契约声明为类注解 | [@lxfight](https://github.com/lxfight) |
+| [#273](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/273) | 记忆注入规范化为 add-only，不再干预宿主对话历史；版本 2.7.0-beta.2 | [@lxfight](https://github.com/lxfight) |
+
+## [2.7.0-beta.1] - 2026-09-07
+
+本版本为预发布测试版，汇总 2.6.1 之后的 #259–#262 与发布准备 #263；稳定版仍为 2.6.1。
+
+### 新增
+- **四种可切换主题 (#260)**：Editorial、Studio、Paper、Terminal 提供不同的配色、字体、边框和布局，均支持浅色、深色及自动模式；外观偏好在当前浏览器保存。
+- **操作流程优化 (#262)**：记忆页按“筛选 → 选择 → 操作”组织，独立展示导入导出、导出范围和批量操作；导入提供读取、预检、确认与写入状态，空预览不提交写入。
+
+### 修复
+- **召回完整性与隔离 (#259)**：保留新写入长记忆的完整正文；关键词检索先过滤会话、人格与状态再限制结果数；向量候选自适应扩展，图路来源记忆去重，单路失败不再丢弃其他路的有效结果。历史已被截断的正文无法自动恢复。
+- **原子生命周期与索引恢复 (#259)**：新鲜和缓存召回都检查原子有效状态，访问后更新原子统计；图谱重建失败时保留增量以供回放，实时变更和重建切换保持一致。
+- **图谱放大文字稳定性 (#261)**：放大阅读、悬停和选择节点时暂停环境漂浮，使用稳定的标签优先级与碰撞区域，限制字号，修复密集节点文字闪烁；静止阅读时停止空闲渲染。
+- **编辑和请求时序 (#262)**：记忆与提示词编辑增加未保存确认和保存锁；慢提示词响应不再覆盖新编辑对象，载入默认内容后必须保存才生效；新召回请求清除旧结果，避免失败后误读过期结果。
+- **页面反馈和移动端 (#259、#262)**：列表加载失败保留上次成功内容并提供重试，过期数据禁止操作；补全键盘访问、零值显示和移动端表格；图谱输入与操作按钮配对，手机端也能设置会话范围。
+
+### 性能
+- **减少召回与页面重复工作 (#259)**：同次双路查询共享 Embedding，批量读取图路来源文档，FAISS 搜索移出事件循环；图节点检索加入 trigram 加速与兼容回退。前端合并同参数在途 GET 和滚动帧，避免重复渲染未变化的可视行。
+
+### 文档与升级
+- 重设计中、英、俄 README 及项目封面；VitePress 中英文站增加测试版入口、发布说明和安装/回退指引。
+- 升级前保留插件数据和配置备份，按测试版标签安装；重载插件并刷新管理页面。主题偏好只保存在浏览器，不会改变记忆数据。
+- 重点验证主题切换、图谱放大阅读、导入预检、未保存编辑保护，以及真实 Provider 下的召回和写入。测试版安装说明见文档站的“版本与升级”。
+
+### 完整 PR 与作者
+
+范围按 Git 标签 `2.6.1` 到本次发布核对，作者取自对应 GitHub PR。
+
+| PR | 改动 | 作者 |
+| --- | --- | --- |
+| [#259](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/259) | 召回、长正文存储与索引恢复修复；管理页面加载和移动端优化 | [@lxfight](https://github.com/lxfight) |
+| [#260](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/260) | 四种可切换的管理界面主题 | [@lxfight](https://github.com/lxfight) |
+| [#261](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/261) | 修复图谱放大后的标签闪烁 | [@lxfight](https://github.com/lxfight) |
+| [#262](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/262) | 筛选、批量操作、导入和编辑的流程及并发保护 | [@lxfight](https://github.com/lxfight) |
+| [#263](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/pull/263) | 测试版发布、完整 PR 署名、README 视觉更新与 VitePress 文档同步 | [@lxfight](https://github.com/lxfight) |
+
+### 测试
+- Python 测试 785 项、前端测试 55 项通过；VitePress 构建通过。
+- 浏览器使用模拟 AstrBot API 验证导入/导出、编辑保护、慢请求、四主题及手机端布局；真实 Provider 的端到端效果仍需测试版反馈。
+
+## [2.6.1] - 2026-09-04
+
+### 性能
+- **FAISS 索引异步落盘 (#258)**: 文档索引与图谱索引的持久化移入单线程执行器，避免大索引写盘阻塞事件循环；连续变更通过防抖合并写入，并使用同目录临时文件原子替换，降低高频写盘开销且避免留下不完整索引
+
+### 修复
+- **索引关闭与重建一致性 (#258)**: 插件退出时强制刷写待落盘变更；全量重建替换索引文件前排空进行中的写入，避免旧索引覆盖重建结果。启动时既有一致性检查仍会修复异常退出时防抖窗口内尚未落盘的变更
+
+### 测试
+- 新增异步落盘的防抖合并、并发写入、立即刷写、幂等关闭、失败重试、实例隔离及重建竞态回归测试
+
+## [2.6.0] - 2026-09-02
+
+### 新功能
+- **Rerank 重排序接入混合检索 (#226)**: 新增 `recall_engine.rerank_enabled` / `rerank_provider_id` / `rerank_candidates` 配置。启用后在 RRF 融合后调用 AstrBot 的 Rerank 提供商对更大候选池（默认 20 条）按查询相关性重打分，Rerank 分数（候选集内归一化到 [0,1]）替代 RRF 归一化排名作为相关性项参与加权，并截断回 top_k；提供商解析失败、调用异常或返回为空时静默降级为原 RRF 排名，不影响召回可用性。`score_breakdown` 新增 `rerank` 分量便于排查
+
+### 修复
+- **知识图谱页面不再默认加载全量图 (#248)**: 打开「知识图谱」页（Dashboard 默认落地页）时默认加载受限概览——最近记忆的局部子图，节点/边受后端上限约束（默认 48 节点/72 边），不再一次性绘制全部节点与关系导致视觉毛团；全量图仅在用户显式点击「全量图谱」按钮时加载，空检索框提交也改为走受限概览；「全量图谱」按钮支持受限概览 ↔ 全量图来回切换
+- **图谱画布事实标签短化 (#248)**: 画布上的事实节点标签去掉「人物名 + 日期时间」前缀（如 `人物A 2026-08-14 深夜聊天时被催促去睡觉` → `深夜聊天时被催促去睡觉`），完整内容保留在节点详情面板；仅对 fact 节点生效，person/topic/summary 标签不变
+- **小图在 Web Worker 布局下不再堆叠在原点**: ≤60 节点的小图此前走同步布局分支，但 Worker 布局的 `compute()` 只发送 `begin` 消息、从不发送 `step`，位置永远不回传，节点全部停留在 (0,0) 并堆成一团（真实浏览器中受限概览即触发）；现在 Worker 布局一律走渐进分片，小图同样正常铺开
+- **渐进布局不再渲染未收敛的中间态**: 首次加载大图（如点击「全量图谱」）时，`loadData` 末尾的 `animator.wake()` 会在布局收敛前恢复主渲染循环，每帧执行环境漂浮并把节点向空 targets 拉扯、重绘乱动的中间位置——整幅图表现为持续「抽搐/缩放抖动」（布局完成后不再出现，再次加载走布局缓存所以正常）。现在布局收敛前主循环不渲染也不漂浮，收敛后由 `_finishLayout` 一次性绘制并适配视口
+- **图谱视图切换保留布局记忆**: 布局缓存由单槽改为多槽（按图签名记忆最近 3 屏），受限概览 ↔ 全量图来回切换时，已加载过的视图直接复用上次布局结果秒开、不再重新布局重等空白（#248 演示反馈）
+- **布局期间显示本地化提示**: 生成图谱布局期间画布显示「正在生成图谱布局...」（zh/en/ru），布局完成后自动清除，替换此前布局等待期的空白画布（#248 演示反馈）
+- **画布状态提示不再被裁剪**: `art-direction.css` 将画布提示框移动到左上角（16px）时未重置 `styles.css` 的居中 `translate(-50%, -50%)`，提示框一直以「左上角 -50% 宽/高」定位被容器裁掉一半；现在显式 `transform: none`，提示在左上角完整显示
+- **配置越界自动修正，不再整包回退默认**: 此前任一配置项超出硬性范围（如 `recall_engine.top_k=60`）都会导致插件把整包配置静默降级为默认值，用户设置无感丢失。现在加载时逐项修正：数值截断到最近边界、非法类型回退该项默认值、结构损坏仅重置对应节，修正结果写回配置文件并逐项输出 warning 日志
+- **配置页展示数值硬边界**: 为 `_conf_schema.json` 所有有界数值项补充 `slider`（最小值/最大值/步长），AstrBot 配置页以滑条+数字输入框显示允许范围；hint 同步标注范围（zh/en/ru）
+- **WebUI 存储型 XSS 修复 (#253)**: `esc()` 此前经 `textContent → innerHTML` 只转义 `& < >` 不转义引号，而 `memory_type` 是自由文本（批量编辑/LLM/导入均可写入），在记忆编辑视图被拼进 `value="..."` 属性可 breakout 注入任意事件处理器（页面上下文持有完整插件 API bridge）。现改为完整五字符转义（`& < > " '`），并新增回归测试锁定
+- **WebUI 交互修复 (#253)**: 虚拟滚动行高改为首渲染后实测（原硬编码 56px 与实际 ~63px 不符导致 spacer 逐行漂移、末尾行不可达）；删除后页码越界自动回退最后一页；Escape 分层处理（批量编辑对话框 → 确认框 → 编辑态回退详情 → 关闭面板），不再静默丢弃未保存的编辑；批量编辑对话框在面板关闭时正确 resolve（修复 promise 泄漏）；图谱/召回搜索回车增加并发守卫；prompt 编辑器不再叠加 input 监听
+- **WebUI POST 不再默认重试 (#253)**: `memories/update`（结构化编辑 = 重建新记忆 ID）此前在桥接超时时自动重试会造成记忆重复创建；现 POST 默认不重试（GET 保持重试），需要重试的调用方显式声明
+- **图谱氛围动画在切页后暂停 (#253)**: SPA 切页只改 `display:none`，图谱 RAF 循环此前永不停歇，离开图谱页仍以 30-60fps 空转烧 CPU；现在离开图谱页停止渲染循环、返回时恢复（Worker 布局后台继续不受影响）
+- **peek 详情竞态修复 (#253)**: 详情请求增加 generation 守卫，慢响应不再覆盖新点击的记忆、关闭后的面板不再被旧响应重新打开
+
+### 性能
+- **召回关键路径索引化 (#254)**: 近期记忆合并查询（每次缓存未命中召回必经，位于 LLM 调用前）与 WebUI 记忆列表查询此前用 `CASE/COALESCE/CAST` 包装表达式，与既有裸表达式索引不匹配，退化为全表扫描 + 临时 B 树排序。新增与查询逐字匹配的表达式索引（`idx_doc_status`、`idx_doc_memory_type`、复合 `idx_doc_create_time`），改写查询表达式并用 `INDEXED BY` 固定近期记忆查询的计划；5 万条记忆基准 14.0ms → 0.37ms（约 38×）。新增 `EXPLAIN QUERY PLAN` 回归测试防止表达式漂移
+- **导入导出移出事件循环 (#256)**: ≤50MiB 导入内容解析、导出全库记录构建（含逐行 source_messages 解析）与序列化改为 `asyncio.to_thread` 执行，不再冻结全 bot；导入去重键扫描只取三列而非整份 metadata
+- **图谱页去除冗余全表统计 (#256)**: overview/query 端点此前每次请求调用 `get_statistics()`（全表 keyset 扫描 + 逐行 JSON 解析），但 payload 只消费 3 个图谱计数；现改用轻量 COUNT 查询
+- **全量图谱防御性上限 (#256)**: 节点/边/记忆查询加 5000/10000/2000 上限，极端规模下单次「全量图谱」不再拖垮事件循环
+- **元数据编辑跳过无效图重建 (#256)**: 仅修改 status/type 等字段时不再执行图谱删除重建 + FAISS 落盘（content/topics/key_facts/structured 编辑仍全量重建）；批量编辑 N 条只读改状态不再产生 N 次重建
+- **BM25 重建分词移出事件循环 (#256)**: 启动自动重建的批量 jieba 分词改为 `to_thread`，重建期间不再反复阻塞其他会话
+
+### 测试
+- 新增图谱页默认受限概览与「全量图谱」按钮切换受限/全量行为的前端测试（`tests/frontend/graph-ui.test.js`）
+- 新增画布事实标签短化行为测试（`tests/frontend/graph-layout.test.js`）
+- 新增小图 + Web Worker 布局回归测试（此前该组合永远不会完成布局）
+- 更新 Dashboard 资产断言以匹配新的默认/按钮行为
+
+## [2.6.0-beta.3] - 2026-08-14
+
+### 性能
+- **图谱渲染优化**: 选中节点聚焦只平移视口，不再重算整轮力布局；节点/边结构未变时复用布局缓存；空间网格改用数值键并跨迭代复用桶数组；中等及以上图（>60 节点）改为渐进式布局（分片迭代、边算边显示，不阻塞主线程）；空闲环境漂浮动画按图规模降帧渲染；边命中测试加 AABB 预过滤；背景点阵/网格缓存到离屏画布（平移只改 blit 偏移）；标签碰撞检测由 O(L²) 改为空间网格 O(L)；标签宽度 measureText 缓存；空闲时社区椭圆几何缓存（布局/视口变化自动失效）；缩小视图时边按 LOD 抽样绘制（高亮边始终完整）
+- **力布局移入 Web Worker**: 布局迭代在主线程外运行（消息协议分片回传位置），超大图不再占用主线程 CPU；Worker 不可用时自动回退主线程内联布局。力布局核心抽取为 `graph-layout-core.js` 共享模块（主线程与 Worker 单一数据源）
+
+### 重构
+- **图谱前端模块化**: `graph-2d.js` 拆分——常量/工具（`graph-shared.js`）、Canvas 渲染器（`graph-renderer.js`）、交互（`graph-interaction.js`）、布局/动画/入口（`graph-2d.js`），各文件按需加载，便于维护
+- **WebUI 布局重构**: 修复组件相互遮挡——记忆页表格由硬编码 `calc(100vh - Npx)` 改为弹性布局（筛选栏固定、表格自动填满剩余高度并内部滚动，分页不再被挤出视口）；页头高度自适应（消除 112px 固定高度与大标题的溢出冲突）；图谱页由 `overflow: hidden` 改为可滚动，短窗口下工具栏/图例不再被裁剪或重叠；画布移除 `min-height: 400px` 与容器尺寸错位；图谱统计列改为紧凑并防溢出
+- **WebUI 死代码清理**: 移除约 45 个未使用的 CSS 类（`graph-tooltip`、旧评分明细 `result-scores`/`result-score-row-*`、旧类名 `session-id`/`backup-version`、`modal-*`、`skeleton`+shimmer 动画、`page-size-control`、`peek-*` 遗留类、`node-badge` 旧系列、`graph-node-*`、`card`/`card-title`、`flex-1`/`gap-*` 等工具类），以及从未被调用的 `renderBarChartItem`/`formatFileSize` 死方法；清理后全量校验无活动类遗漏
+
+### 修复
+- **渐进式布局并发守卫**: 快速连续加载两张图时，旧布局链路会被代数守卫丢弃，避免双倍步进或提前结束布局
+- **渐进布局过期边**: tier>0 渐进过程中清空上一张图的边子集与社区束，布局完成后统一重建
+- **移除 faiss-cpu 依赖固定**: 插件不再在 `requirements.txt` 中声明 `faiss-cpu`（由 AstrBot 核心提供），修复 2.6.0-beta.1 以来与 AstrBot 固定版本（如 `faiss-cpu==1.14.2`）的依赖冲突导致的升级失败 (#247)
+
+### 测试
+- 新增图谱布局前端测试（同步/渐进式/Worker/回退/布局缓存/聚焦不重算/快速双加载/标签宽度缓存/社区缓存，共 9 项）；完整 Python 测试集 743 项通过，前端测试 15 项通过
+
+## [2.6.0-beta.2] - 2026-08-13
+
+### 新增
+- **记忆库定期整合**: 新增 `memory_consolidation` 配置节，从源头控制记忆库规模——把零散的低价值记忆聚合、整理、总结为更精炼的一条，替代注入时的硬截断方案。支持按同一会话（`granularity=session`）或跨会话语义聚类（`granularity=semantic`）聚合，整合后旧记忆可归档（`keep_original=archive`）或删除（`keep_original=delete`），触发方式可选每日定时（`trigger=daily`）或每次反思时顺带执行（`trigger=reflection`，带 6 小时冷却）。语义聚类直接复用索引内已存向量做批量 Faiss 搜索（分块、无 Embedding API 重复调用），可扩展到上万条记忆；整合结果由 LLM 无损合并生成，写入新记忆并保留 `consolidated_from` 溯源
+- **WebUI 整合展示**: 系统概览页新增「记忆整合」面板（配置状态 + 已整合/已归档统计 + 立即整合按钮）；记忆列表为整合产生的记忆显示「整合 N」徽标，详情面板展示来源记忆列表
+
+### 修复
+- **会话重置信号兼容**: 适配 AstrBot 将 `/reset`、`/new` 的会话清理信号从 `_clean_ltm_session` 改名为 `_clean_group_context_session`，两个信号均识别 (#244)
+
+### 移除
+- **记忆注入预算控制**: 移除 2.6.0-beta.1 引入的注入预算控制（`recall_engine.injection_budget_chars` / `injection_min_chars_per_memory` / `injection_max_chars_per_memory` 及配套截断逻辑）。硬截断会丢失语义连贯性与结尾信息，改为在记忆库层面定期整理聚合
+
+### 测试
+- 新增记忆整合分组 / 语义聚类 / 合并解析 / 归档删除 / 向量批量相似对 / Page API 整合状态等 20 项测试；完整 Python 测试集 743 项通过，前端测试 7 项通过
+
+## [2.6.0-beta.1] - 2026-08-13
+
+### 修复
+- **图存储外键级联**: 运行时连接此前未开启 `PRAGMA foreign_keys`，导致 `ON DELETE CASCADE` 在运行期失效；现在每个连接都显式开启，删除节点时关联边会被正确级联清理
+- **图边写入竞态**: `_add_edge` 改用 `INSERT ... ON CONFLICT(edge_key)` 原子写入，避免并发下撞唯一约束导致回滚；语义合并的权重累积改为按 `edge.weight` 缩放而非固定 +0.15
+- **图 FTS 检索兜底**: `search_entries_by_bm25` 增加异常兜底，非法 FTS 查询不再中断整条图路由检索
+- **删除崩溃恢复补全**: 删除操作的写日志重放现在会先补删 documents 表与向量/BM25 索引，避免崩溃后记忆仍可检索、图/原子却已删除的不一致
+- **访问时间原子化**: 召回路径的访问时间/访问计数更新合并为单条原子 SQL（`json_set`），消除并发下的读改写丢失更新，并批量提交降低写放大
+- **会话/原子并发安全**: `create_session` 幂等化（`ON CONFLICT DO NOTHING`）；`trim_session_messages` 的读改写整体纳入写锁；`reinforce` 用 `BEGIN IMMEDIATE` 抢占写锁避免计数丢失
+- **初始化可重试**: 完整初始化失败不再永久禁用插件——清理半初始化资源后转交后台重试（带上限），瞬态错误（如数据库锁、索引重建失败）可在进程内恢复
+- **迁移与启动修复**: 全新数据库（空版本表）不再误判为 v1 跑完整迁移链；v7→v8 只回填缺失的 `access_count` 字段；重试耗尽后的写操作日志正确进入终态 `failed`
+
+### 性能
+- 召回热路径批量更新访问时间（单次 commit 替代逐条 commit）
+- 每日衰减的逐行 JSON 计算卸载到线程池
+- `get_statistics`/`cleanup_old_memories` 由 O(N²) OFFSET 分页改为主键 keyset 流式分页
+- `get_session_memories` 改为单条 SQL 过滤+排序+分页
+- 旧数据会话迁移、索引重建、图入口分组遍历均复用连接并批量写入
+- 一致性检查的 BM25 缺失计数改为 SQL 层计算，避免加载全量 ID 集合
+
+### 代码清理
+- 移除废弃的 `cleanup_injected_memories` 与不可达的 `_try_restore_from_backup` 死代码
+
+### 测试
+- 新增针对外键级联、图边幂等、会话幂等、访问计数并发、原子强化并发、初始化重试、会话记忆排序、语义合并权重等 11 项回归测试；完整 Python 测试集 751 项通过
+
+## [2.5.7] - 2026-08-04
+
+### 修复
+- **提示词页国际化补全**: WebUI 提示词页此前 i18n 不完整——名称始终中英并排、描述与使用说明仅有中文、切换语言后已渲染内容不刷新。现后端为提示词与分类补充英文描述/说明字段，前端按当前语言选择中/英文案（中文界面保留英文副标题），并在切换语言时重渲染提示词页与已打开编辑器的标题
+
+### 测试
+- 新增提示词注册表双语字段回归断言与提示词页中/英/回退渲染的前端行为测试；完整 Python 测试集 712 项通过
+
+## [2.5.6] - 2026-08-04
+
+### 新增
+- **WebUI 批量编辑**: 记忆列表勾选记忆后可通过「批量编辑」按钮统一修改重要性 / 状态 / 类型，补齐批量更新 API 的前端入口（含中/英/俄三语）
+
+### 修复
+- **总结质量恢复**: 移除内置提示词中的 `canonical_summary` 双摘要要求，模型一次只生成一份人格化 `summary`，消除竞争输出导致的质量下降；检索内容改由代码从 `summary` + `key_facts` 组装，修复 2.4.0 以来检索语料与 Agent 主动召回内容变薄的问题；自定义提示词输出的 `canonical_summary` 仍被兼容保留（供图抽取等消费方使用）
+
+### 升级说明
+- 本次修复仅对更新后新产生的记忆生效；历史记忆已存储的检索内容保持不变，元数据结构（v2）完全兼容
+
+## [2.5.5] - 2026-08-03
+
+### 修复
+- **FAISS 核心依赖兼容性**: 将 `faiss-cpu` 最低版本从 `1.12.0` 提升到 `1.14.3`，与 AstrBot 4.27.1 的项目元数据和锁定版本保持一致；最低版本已自然排除存在已知绑定与指令集问题的 1.14.2
+
+### 升级说明
+- 如果升级后仍提示核心依赖与 `faiss-cpu 1.14.2` 冲突，说明 AstrBot Desktop 的实际依赖锁或安装缓存仍是旧版本；请更新或修复 Desktop 环境，而不是让插件覆盖 AstrBot 的核心依赖
+
+### 测试
+- 更新 FAISS 依赖基线回归断言，并验证 AstrBot 与插件约束在 Windows / Python 3.12 目标上共同解析为 `faiss-cpu 1.14.3`
+
+## [2.5.4] - 2026-08-02
+
+### 修复
+- **私聊 Bot 身份归属**: 助手消息统一使用 Bot 昵称与平台 `self_id`，不再继承触发消息的用户身份或用户别名；群聊、私聊和缺失 `self_id` 场景使用一致的安全回退 (#232)
+- **Dashboard 筛选一致性**: 记忆筛选只接受最新请求的响应，避免较慢的旧请求覆盖当前查询并导致列表与输入条件不一致
+- **Dashboard 大分页滚动**: 虚拟列表按当前数据动态计算可见窗口，并使用表格占位行保持完整滚动高度；从 20 条切换至 50 或 100 条后仍可访问全部记忆
+- **Dashboard 键盘导航**: 移除无入口的旧编辑弹窗，关闭状态的详情侧栏退出键盘焦点顺序与无障碍树
+
+### 文档
+- 仓库默认 README 改为中文首页，英文说明迁移至 `README_en.md`，并保留旧 `README_zh.md` 链接兼容
+
+### 测试
+- GitHub Actions 新增 Node 前端行为测试，覆盖乱序筛选响应和虚拟滚动数据更新；完整 Python 测试集 711 项通过
+
+## [2.5.3] - 2026-08-01
+
+### 修复
+- **FAISS 绑定不匹配诊断**: 识别 `SuperKMeans` 等 Python 封装与二进制扩展不一致错误，停止无效的 generic 指令集重试，并明确提示这不是 Embedding Provider 配置问题 (#198)
+- **规避已知异常依赖**: `faiss-cpu` 基线与 AstrBot 对齐到 1.12.0，并排除已知异常的 1.14.2；真实的 CPU 指令集或动态库加载失败仍保留 generic 回退
+
+### 升级说明
+- 已安装且损坏的 AstrBot Desktop 内置环境不会被插件自动修改；请升级或修复 Desktop 环境，并在同一 Python 环境中干净安装兼容的 FAISS 版本（建议 1.14.3 或更高版本）
+
+### 测试
+- 新增 FAISS 绑定不匹配、依赖版本约束和 generic 回退回归测试；完整测试集 707 项通过
+
+## [2.5.2] - 2026-08-01
+
+### 修复
+- **大规模索引维护不再阻塞插件启动**: 启动阶段只调度后台一致性检查与修复，并通过 `/lmem status` 暴露检查、重建、部分完成、失败和取消状态
+- **文档索引安全重建**: BM25 使用影子表原子切换，FAISS 使用影子索引和断点续跑；Embedding Provider 即使维度不变但模型发生变化，也会触发完整向量代际重建
+- **图谱索引安全重建**: active 记忆按主键流式分批构建到影子图谱，完成后事务切换；失败保留线上代际，重建期间的新增、更新和删除会在切换前回放
+- **归档记忆索引一致性**: 一致性检查和全部重建路径只处理 active 记忆，避免归档数据在重启后被重新加入 BM25、向量或图谱索引
+- **并发写入收尾补偿**: 后台维护完成后再次检查一致性，并对维护期间进入的新文档执行一次有上限的补偿修复
+
+### 测试
+- 新增 Provider 指纹、全量向量断点续跑、BM25/图谱失败回滚、并发图谱变更回放、active 流式分批和后台维护状态回归测试；完整测试集 705 项通过
+
+## [2.5.1] - 2026-07-31
+
+### 修复
+- **稳定人物身份**: 知识图谱使用平台与发送者 ID 组合作为人物节点标识，昵称变化时复用同一节点并保留别名历史；原子图谱不再把已识别参与者重复生成为主题节点 (#224)
+- **人格化记忆展示**: Dashboard 列表与详情优先展示第一人称 `persona_summary`，事实型 `canonical_summary` 继续仅用于检索；私聊与群聊提示词进一步区分主观回忆和客观检索摘要 (#223)
+- **图谱工具栏响应式布局**: 中等桌面宽度下将图例和工具栏分行，窄桌面下输入框与操作按钮自适应排列，避免 1080p / 125% 缩放和 1280×720 视口发生遮挡 (#222)
+- **归档恢复兼容性**: 当前 AstrBot embedding provider 未提供可选重试接口时，回退到标准接口重建归档记忆向量
+
+### 测试
+- 新增最新 issue 回归测试，并在 Pull Request 与 `master` 推送时通过 GitHub Actions 运行完整测试集
+
+### 实现边界
+- 稳定人物身份只影响升级后新生成或重新构建的图谱数据；已有重复人物节点不会自动合并
+- 旧记忆缺少 `persona_summary` 时继续回退显示事实摘要或原始内容
+
+## [2.5.0] - 2026-07-29
+
+### 新增
+- **召回策略**: 支持最低向量相似度、近期记忆保留槽位和事件型记忆过滤 (#64, #99, #139)
+- **确定性时间标签**: 从原始消息时间写入来源日期范围，不依赖大模型推断 (#175)
+- **可恢复自动归档**: 旧低重要性记忆可移出检索索引但保留原始文档，并在恢复时重建全部派生索引 (#155)
+- **重要记忆保护**: 达到可配置重要性阈值的记忆不再参与每日衰减 (#139)
+- **记忆白名单**: 统一限制自动捕获、总结、召回、手动总结和 Agent 记忆工具，可按用户、群组或完整会话授权 (#61)
+- **可配置记忆作用域**: 支持兼容旧配置、按会话、按用户和全局四种模式，并允许指定会话强制隔离 (#92, #187)
+- **用户身份别名**: 在写入会话历史和生成总结前，将平台用户 ID 或用户名映射为统一显示名称 (#112)
+- **重要记忆原文保留**: 达到可配置重要性阈值时，将结构化原始消息独立保存于 SQLite，不写入检索与图索引；Dashboard 可核验并重新总结，Agent 可按需回溯原文 (#129, #167)
+- **指定条数手动总结**: `/lmem summarize [message_count]` 可忽略既有总结进度，重新总结当前会话最近 N 条消息 (#144)
+- **WebUI 记忆迁移**: 支持原生 JSON 完整往返、CSV 和常见外部 JSON 字段；导入前预检并按内容与作用域去重，仅含多轮原文时可调用 LLM 生成摘要 (#23, #129)
+
+### 实现边界
+- 记忆作用域和身份别名仅影响升级后新写入的数据；不会自动迁移旧记忆、重新总结原始对话或重新生成向量
+- `user` 作用域按平台和规范化身份组合，同一平台内跨群聊与私聊共享；跨平台共享应使用 `global` 作用域并结合白名单
+- 原文保留增加 SQLite 磁盘占用；重新总结会产生一次 LLM 调用，并重新生成该记忆的 Embedding 与派生索引
+- 导入不会复用外部向量或图索引；每条成功导入的记忆都会重新生成 Embedding，并按当前启用配置与数据条件生成图、原子等派生索引；仅含原始对话的导入项还会各产生一次 LLM 调用
+
+## [2.4.1] - 2026-07-29
+
+### 变更
+- **超大图谱分级渲染**: 高密度概览以社区连接束和内部骨架替代逐帧绘制全部关系，选中节点或记忆时展开精确邻接边；大图稳定后停止动画循环，并使用空间索引加速命中测试
+- **图向量记忆级压缩**: 图 SQLite 继续保存全部节点、关系和关键词条目，独立图向量索引改为每条来源记忆一个聚合语义向量；索引规模由 graph entry 数量收敛到来源记忆数量 (#197)
+- **整库图索引批量重建**: `/lmem rebuild-graph` 先统一清空图向量，再一次性嵌入并写入全部记忆，完整重建固定为一次清空保存和一次批量保存
+
+### 修复
+- **旧版双通道摘要注入去重**: 对可精确识别的 v2 `persona_summary | key_facts` 旧记录移除正文中的事实后缀，避免与 `Key facts` 元数据重复注入；普通旧记录保持原文 (#202)
+
+### 实现边界
+- 日常新增或删除一条来源记忆仍会保存一次完整图 FAISS 索引，但该索引现在只包含每条来源记忆一个向量，不再按每个 graph entry 膨胀
+- 旧记录的检索正文与既有向量不会在后台自动重新生成，避免升级时产生不可控的 LLM 和 Embedding 成本；新记忆继续使用独立 factual `canonical_summary` 检索
+
+## [2.4.0] - 2026-07-28
+
+### 新增
+- **全量知识图谱**: Dashboard 概览支持按当前 persona/session 作用域加载全部图节点、关系和轻量记忆预览，不再受检索子图的 80 节点 / 120 关系上限约束
+- **大规模图谱分区**: 基于拓扑社区进行确定性布局，独立收纳未连接节点；千节点场景使用空间网格斥力、社区锚定、曲线关系和粒子预算保持可读性
+- **召回最低重要性过滤**: 新增可选的最低重要性阈值，在统一检索出口过滤低重要性记忆 (#116)
+- **扩展上下文时间限制**: 召回查询仅拼接配置时间范围内的历史消息，避免跨话题时间间隔造成干扰 (#182)
+- **Dashboard 批量删除记忆**: 支持在当前记忆页多选并确认删除；一次批量请求内合并文档和图向量索引保存 (#192)
+- 支持在 WebUI 中联合编辑记忆内容、主题与关键事实，并重建对应的检索、原子和图数据。
+- **WebUI 提示词管理页面**: 在 Dashboard 中集中管理插件所有可自定义的 prompt 模板，支持按分类浏览、编辑、保存、恢复默认，含 JSON 格式警告标识和 i18n 多语言支持
+- **PromptManager**: 提示词注册表 + 文件持久化引擎，自定义内容保存至 `data/prompts/`，内置默认不受影响；原有硬编码 prompt（system_prompt_base、system_prompt_with_persona、injection_header/footer）提取为独立模板文件
+- **提示词 API**: Page API 新增 `prompts`、`prompts/detail`、`prompts/update`、`prompts/reset`、`prompts/default` 五个路由
+
+### 变更
+- **Dashboard 浅色视觉重构**: 使用雾白、冷灰绿与克制的多色信号重建五个管理页面，补充响应式移动导航、主题适配、动态反馈与减弱动效支持
+- **统一 Lucide 图标**: 本地 vendoring Lucide 资源并覆盖静态、提示词和详情面板的动态图标；移除界面表情符号和手写 SVG 图标
+- `MemoryProcessor._load_prompts()` 和 `_build_system_prompt_with_persona()` 改为通过 PromptManager 加载模板，保留后备降级路径
+- `format_memories_for_injection()` 的记忆注入头部/尾部文本改为从 PromptManager 读取
+
+### 修复
+- **双通道摘要与注入**: 新生成的记忆独立请求事实型 `canonical_summary` 用于检索，注入优先使用 `persona_summary`；旧记录保持兼容回退，本次不迁移既有向量 (#202)
+- **FAISS 加载兼容性**: 移除插件模块加载阶段的 FAISS 导入，并在优化扩展不可用时尝试 generic 指令集模式；不替代损坏或不兼容安装的环境修复 (#153, #198)
+- **图记忆磁盘写放大**: 以单条来源记忆为边界批量新增和删除图向量，避免每条 graph entry 分别保存索引；非空批次仍会写入完整 FAISS 快照 (#197)
+
+### 测试
+- 新增 Dashboard 资源契约、全量图谱快照与 Page API 路由测试；完整测试集 621 项通过
+
+## [2.3.6] - 2026-06-28
+
+### 修复
+- **WebUI 重要性 1.0 保存成 10.0**: 详情编辑提交显示值标记，后端兼容 0-1/0-10 两种重要性输入语义 (#189)
+- **图记忆长文本召回 SQLite 表达式树过深**: 图节点 token 查询去重并分批执行，避免长中文输入生成过多 OR 条件 (#176)
+- **extra_user_content 注入上下文残留**: 仅清理 LivingMemory 自己临时注入的记忆片段，并归一化纯文本历史 content parts，避免污染长期上下文 (#185)
+
+## [2.3.5] - 2026-06-09
+
+### 重构
+- **EventHandler 模块化**: 将事件处理器拆分为 `GroupCapture`、`MemoryRecall`、`MemoryReflection` 三个子模块，提高代码可维护性 (#172)
+- **Page API 模块化**: 将 `page_api.py` 的处理逻辑提取到 `page_api_modules/` 目录下独立模块，职责分离更清晰 (#173)
+- **WebUI Dashboard 页面模块化**: 将前端页面逻辑拆分到 `modules/` 目录（memory-page.js、recall-page.js、graph-page.js、system-page.js）
+
+### 测试
+- 测试覆盖率从 73% 提升至 76% (#171)
+
+### 修复
+- **群聊全量捕获误唤醒 AstrBot**: 修复 `PassiveGroupCaptureFilter` 未正确屏蔽群消息导致触发 LLM 响应的问题 (#170)
+- **inspect-stack 崩溃**: 传递 `plugin_name` 给 `StarTools.get_data_dir()` 避免堆栈检查失败 (#169)
+- **WebUI Page API 过滤器规范化**: 统一前端 API 请求的参数处理逻辑
+
+## [2.3.4] - 2026-06-02
+
+### 修复
+- **#166 排查确认**: TextPart 序列化崩溃非 LivingMemory 导致，而是其他插件（如 llmperception）注入 TextPart 引起。`mark_as_temp()` 标记的 TextPart 在 `dump_messages_with_checkpoints()` 中被过滤不落地，不会进入上下文压缩器。保持原有 `extra_user_content_parts` + `TextPart.mark_as_temp()` 注入方式不变。
+- **系统概览页重要性分布图始终为空**: `get_statistics()` 遍历了全部文档却未对重要性分桶，现在在批次处理循环中按 0-10 分 10 档统计
+- **系统概览页原子计数始终为 0**: `AtomStore` 缺少 `count_atoms()` 方法导致 `AttributeError` 被静默吞掉，现已新增该方法
+- **系统概览页原子类型分布图始终为空**: 新增 `AtomStore.count_by_type()` 方法（SQL GROUP BY atom_type），修复 per-type 统计缺失
+- **系统概览页 atom_breakdown 已接入**: `page_api.get_stats` 现在正确调用 `atom_store.count_by_type()` 填充类型分布数据
+- **WebUI 记忆列表创建时间列始终显示 "--"**: 当 `metadata.create_time` 缺失时前端会忽略 SQL 层的 `created_at` 列，现增加 fallback
+- **WebUI 记忆编辑静默失败**: 状态/类型/重要性的编辑操作未检查 API 响应是否成功，失败时仍弹成功 toast，现已用 `unwrapApiData()` 包装错误检测
+- **知识图谱页 Graph2D 未初始化时崩溃**: `renderPayload` 中 `window.Graph2D.selectNode/selectMemory` 缺少 `state.isGraphReady` 守卫
+- **召回测试结果点击无效**: 当召回的記憶不在当前记忆列表分页中时，点击无任何反馈，现已添加 API 回退直接拉取記憶详情
+- **知识图谱节点详情面板类型字段丢失**: 图谱記憶对象使用 `memory_type` 字段名，前端错误使用了 `memory.type`
+- **备份管理器版本号不匹配**: `PLUGIN_VERSION` 为 2.3.1 但 `metadata.yaml` 为 2.3.3，导致每次启动错误触发版本变更备份
+- **`datetime.utcnow()` 弃用警告**: 迁移 `db_migration.py` 中 3 处调用为 `datetime.now(timezone.utc)`
+- **记忆详情 fallback SQL 查询缺少列**: `_get_memory_record` 回退查询未选取 `doc_id`、`created_at`、`updated_at`
+- **配置项 `enable_full_group_capture` 缺失**: `_conf_schema.json` 中未暴露该字段，用户无法在 WebUI 配置
+
+### 变更
+- `page_api.update_memory` 统一使用 `self._ok()` 返回格式
+- 更新测试文件以匹配注入行为变更
+
+## [2.3.3] - 2026-06-02
+
+### 修复
+- **WebUI 删除功能无效**: 修复因 AstrBot Dashboard iframe sandbox 缺少 `allow-modals` 导致 `window.confirm()` 被浏览器静默阻止、删除操作无法执行的问题
+  - 用自定义 DOM 确认对话框（渲染在 peek 面板内）替代浏览器原生 `window.confirm()`
+  - 支持确定/取消/ESC/遮罩点击关闭，取消时自动恢复记忆详情视图
+
+## [2.3.2] - 2026-06-02
+
+### 新增
+- **知识图谱力导向布局优化**: 重构图谱可视化布局算法，实现更自然的节点分布
+  - 优化斥力参数（6000→1800），节点分布更平滑
+  - 增加边距离（80→120）和弹簧强度，改善节点间距
+  - 实现基于距离的斥力衰减曲线，替代硬性截断
+  - 自适应弹簧强度，长边使用更弱的拉力
+  - 质量缩放的中心引力，重要节点更居中
+  - 增加迭代次数，布局收敛更稳定
+- **Peek 面板迷你图谱力导向布局**: 预览面板中的小型图谱也采用力导向算法，与主视图保持视觉一致性
+
+### 优化
+- 移除固定的中心节点锁定，所有节点自由受力运动
+- 简化布局类命名：`CenteredForceLayout` → `ForceDirectedLayout`
+- 清理废弃的 BFS 环形布局参数（`FORCE_LINK_DEPTH_GAP`、`FORCE_CENTER_PULL`、`FORCE_BRANCH_SPREAD`）
+
+## [2.3.1] - 2026-05-30
+
+### 新增
+- **记忆注入方式 `extra_user_content`**: 将记忆追加到用户消息末尾（`mark_as_temp` 不污染对话历史），不影响前缀缓存，推荐作为默认方式
+- **system_prompt 注入方式废弃**: 配置为 `system_prompt` 时自动回退至 `extra_user_content`（`InjectionAdapter` 废弃模式降级），保留配置项但标注 ⚠️已废弃
+- **Agent 主动记忆写入工具** (`memorize_long_term_memory`): Agent 可主动调用写入长期记忆，通过 `agent_tools.enable_memorize_tool` 配置开关控制（默认关闭）
+- **Agent 工具配置组** (`agent_tools`): 新增 `enable_recall_tool` 和 `enable_memorize_tool` 两个独立开关
+- **两步确认删除**: dashboard 删除选中记忆改为两步确认（点击→按钮变为「确认删除 X 条?」→再次点击执行），替代被 AstrBot 插件页面拦截的 `window.confirm`
+
+### 修复
+- 修复 `MemoryProcessor.__init__` 参数名 `llm_provider_id` → `llm_provider`，兼容传入 provider 实例和 ID 字符串两种调用方式
+- 修复 `test_tokenize_removes_common_stopwords` 在 jieba 未安装时的不稳定行为
+
+### 优化
+- **7 项异步性能优化**:
+  - 记忆注入清理正则提到模块级常量（避免每次调用 `re.compile`）
+  - 去重缓存改为惰性过期 + 超限逐条淘汰（消除 `sorted()` 排序开销）
+  - 版本备份延迟到异步初始化阶段（通过 `asyncio.to_thread` 避免 `__init__` 中同步 I/O 阻塞）
+  - jieba 分词通过 `tokenize_async()` 卸载到线程池
+  - `hybrid_retriever` MMR 和 weighting 卸载到线程池
+  - `memory_engine` 批处理 `json.loads` 通过 `_normalize_batch_metadata` + 线程池批量规范化
+  - `_remove_fake_tool_call_from_context` 两轮扫描合并为单轮
+- `InjectionAdapter` 新增 `_DEPRECATED_MODES` 映射，废弃模式统一降级
+
+### 文档
+- 更新 CHANGELOG v2.3.1 条目
+- 更新所有文档版本号为 v2.3.1（API、ARCHITECTURE、DEVELOPMENT 中/英/俄）
+
+### 测试
+- 新增 17 个测试: hybrid_retriever 元数据多样性 + 删除回滚 (6)、memory_engine 更新回滚 + 分批 + 批量删除 (5)、event_handler 上下文扩展 + 重试逻辑 (4)、text_processor add_custom_words (3)
+- 测试总数: 298 → 332，覆盖率: 69% → 70%
+- 注入方式相关测试: 新增 `extra_user_content` 和 `system_prompt` 自动回退测试
+- 修复 24 个因参数签名不匹配导致的测试失败
+
+## [2.3.0] - 2026-05-29
+
+### 新增
+- **记忆原子化系统**: 将 LLM 输出的 `key_facts` 提升为独立检索单元 (`MemoryAtom`)，每条原子拥有独立的存活时间 (TTL) 和衰减曲线
+  - 五种原子类型: `EPISODIC`(事件型, 7天)、`PLANNED`(计划型, 到期骤降)、`FACTUAL`(事实型, 180天)、`RELATIONAL`(关系型, 90天)、`PREFERENCE`(偏好型, 60天)
+  - 三种衰减函数: `EXPONENTIAL`(指数)、`LINEAR`(线性)、`STEP`(阶梯)
+  - TTL 动态修正: `ttl = base_ttl × (0.5+importance) × (1.0+0.1×reinforcement_count)`
+  - 规则基分类器，零新增 LLM 调用
+- **图谱时间感知增强**: 边置信度跨记忆动态更新 (EMA)、跨记忆语义边合并 (`semantic_edge_key`)、检索评分增加时间衰减乘子
+- **原子生命周期管理器**: 后台周期维护 (过期/遗忘/强化检测)，基于 Jaccard + CJK bigram 的跨记忆原子强化
+- **版本更新自动备份**: 插件启动时检测版本变更，自动将所有数据文件备份到 `backups/v{旧版本}/`，记录 `backup_info.json` 便于数据恢复
+- **备份列表 API**: `GET /page/backups` 端点，支持前端查看完整备份历史
+
+### 修复
+- 修复图路由权重归一化未生效时双路融合数值不稳定的问题
+- 修复 `page_api` 内容更新异常时新旧记忆并存的数据泄漏
+- 修复 `memory_engine` 中 fire-and-forget 后台任务未跟踪，`close()` 时可能静默取消
+- 修复 `event_handler` 记忆存储后元数据更新失败导致同一段消息被重复总结
+- 修复 `command_handler` 中硬编码中文 `"无"` 未走 i18n
+
+### 优化
+- 图谱边存储增加 `semantic_edge_key`，跨记忆合并相同语义关系，避免重复边膨胀
+- 边置信度采用 EMA 动态更新 (`new = old×0.7 + new×0.3`)，weight 累积证据计数
+- `graph_extractor` 支持原子级提取路径 (`_extract_from_atoms`)，原子置信度传播到图谱边
+- `atom_store` FTS5 搜索自动回退 LIKE 查询，兼容低版本 SQLite 的 CJK 分词缺陷
+
+### 文档
+- 更新 README（中/英/俄）: 补充记忆原子化、版本备份、架构模块说明
+
+### 测试
+- 新增 53 个原子系统测试: TTL 计算 (9)、衰减函数 (6)、分类器 (9)、AtomStore (9)、AtomLifecycleManager (3)、AtomRetriever (4)、图谱原子提取 (4)、边合并 (2)、向后兼容 (3)、其他 (4)
+- 新增 22 个备份管理器测试: 版本检测、通配符备份、OSError 容错、多版本排序、损坏 JSON 回退、metadata 版本一致性校验
+- 新增 1 个实际 `metadata.yaml` 版本号与 `PLUGIN_VERSION` 常量的一致性断言
+
+## [2.2.12] - 2026-05-12
+
+### 新增
+- 新增配置 UI 与后端命令响应的英/俄双语国际化支持，适配 AstrBot 原生插件页面与命令输出。
+
+### 修复
+- 修复 MemoryProcessor 持有过期 LLM provider 引用时出现 `Cannot send a request, as the client has been closed` 的问题。
+- 修复 WebUI 生命周期与历史消息批量清理逻辑，避免重载和端口占用引发的异常。
+
+## [2.2.11] - 2026-05-06
+
+### 新增
+- 新增 AstrBot 官方插件 Pages 管理界面支持：可在 AstrBot WebUI 的插件详情页直接进入 `dashboard` 页面，无需额外登录插件独立 WebUI。
+- 新增官方插件 Page 原生后端接口适配层，支持记忆统计、记忆列表、批量删除、记忆编辑、召回测试、知识图谱概览与图谱检索。
+
+### 兼容性
+- 官方插件 Pages 入口依赖 AstrBot 插件 Page / Bridge 能力，要求 AstrBot 版本 `>= 4.24.2`。
+- 保留旧版独立 WebUI 兼容入口；当宿主环境不支持官方插件 Pages 或仍需独立访问时，可继续使用 `/lmem webui` 提供的旧入口。
+
+### 优化
+- `/lmem webui` 命令输出改为优先引导用户进入 AstrBot 官方插件页，同时保留旧独立 WebUI 兼容说明。
+- 官方插件页面前端改为复用 AstrBot 登录态，并适配 sandbox iframe 环境下的 Bridge 请求、主题读取与页面初始化流程。
+
+### 修复
+- 修复 AstrBot 4.23.2 中 `documents_fts` 同名表冲突导致总结记忆存储失败的问题。
+- 将插件自有 FTS 表统一迁移为 `livingmemory_memories_fts` 与 `livingmemory_graph_entries_fts`，避免再次污染宿主数据库命名空间。
+- 新增 v6 数据库迁移：复制旧 `memories_fts` / `graph_entries_fts` 数据到前缀表，删除插件废弃 `documents_fts(search_text)`，保留 AstrBot 同名表。
+- 修复 `/lmem webui` 在旧版独立 WebUI 未启用时缺少兼容提示的问题，并恢复兼容入口访问地址文案。
+- 修复 `top_k=0` 私聊场景下消息存储优先级错误，避免错误写入事件默认文本。
+- 调整记忆注入格式，同时兼容英文提示模板与既有中文记忆条目标识。
+
+### 测试
+- 补充 issue #102 回归测试，覆盖宿主 `documents_fts` 存在时 BM25 写入、旧 FTS 表前缀迁移、废弃插件冲突表清理。
+- 补充 `/lmem webui` 兼容提示、`top_k=0` 私聊存储、记忆注入格式兼容回归测试。
+
+### 移除
+- 移除废弃的 `sparse_retriever` 实现与配置入口，统一使用文档路 BM25/向量检索、图路检索和 RRF 融合链路。
+- 移除废弃的 `reflection_engine.save_original_conversation` 配置项和向量查询预处理开关，减少无效配置面。
+
+### 文档
+- 更新 README 与架构文档中的检索层描述，避免继续引用旧的单路混合检索表述。
+
+## [2.2.3] - 2026-02-21
+
+### 修复
+- 统一清理插件运行时日志与命令返回中的 emoji 字符，避免日志检索和终端显示噪音
+- 优化初始化、命令执行、索引重建、历史清理等失败路径的用户提示：错误信息包含失败动作、错误详情与建议排查步骤
+- 修正插件帮助信息与注册元数据中的仓库地址，统一为 `https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory`
+
+### 测试
+- 补充 `CommandHandler` 与 `PluginInitializer` 单元测试，覆盖未初始化组件提示、异常提示可操作性、索引重建失败提示、Provider 超时错误信息
+- 补充 real-db 功能测试，覆盖命令输入校验、状态异常提示、WebUI 启用/禁用提示分支、cleanup 预演与执行路径
+- 新增插件主生命周期集成测试，覆盖初始化状态消息、`_ensure_plugin_ready` 失败分支、命令处理器未就绪提示、WebUI 启停联动与 `terminate` 资源清理
+
+## [2.2.2] - 2026-02-21
+
+### 新增
+- 新增 `/lmem summarize` 命令：允许管理员手动立即触发当前会话的记忆总结，无需等待自动触发阈值
+- 新增向量检索 token 超限保护：查询文本超过 2000 字符时自动截断，写入内容超过 4000 字符时自动截断，避免 embedding API 报错
+
+### 修复
+- 修复群聊记忆中发送者昵称丢失的问题（#59）：助手消息写入时正确标记 `is_bot_message=True`，`format_for_llm` 同时检查 `metadata` 标记和 `role` 字段，确保 Bot 消息以 `[Bot: 昵称]` 格式呈现给 LLM
+
+### 优化
+- 总结时自动注入当前日期时间（#74）：在 system_prompt 和提示词模板中注入 `{current_date}`，LLM 可将对话中的相对时间（"今天"、"明天"、"下周"等）转换为具体日期后写入记忆，避免记忆内容随时间推移失去时间参考意义
+
+## [2.2.1] - 2026-02-21
+
+### 修复
+- 修复 tool 循环产生的最终总结被错误存入记忆的问题：在 `handle_memory_reflection` 中检测 `tools_call_name` 和 `tools_call_extra_content`，有工具调用上下文时直接跳过，避免 tool loop 的内部总结污染记忆
+- 修复 `/reset` 或 `/new` 后插件仍读取旧对话内容进行总结的问题：新增 `after_message_sent` 钩子监听 AstrBot 的 `_clean_ltm_session` 信号，触发时同步调用 `conversation_manager.clear_session()` 清空消息历史和总结计数器
+- 修复私聊场景下用户消息写入后未执行消息数量上限控制的问题：`handle_memory_recall` 写入用户消息后补充调用 `_enforce_message_limit`；`handle_memory_reflection` 写入助手消息后同样执行上限控制
+
+## [2.2.0] - 2026-02-21
+
+### 新增
+- 新增定期自动备份功能：每日衰减后自动备份记忆数据库，可配置保留天数（默认 7 天），超期备份自动清理
+- 新增图片转述内容存入记忆：读取 AstrBot 已完成的图片转述（`extra_user_content_parts`），按消息组件原始顺序正确映射，无转述时降级为 `[图片]` 占位
+
+### 优化
+- 所有辅助方法改为 `async def`，消除同步文件 IO 阻塞：`stopwords_manager`、`decay_scheduler`、`text_processor` 均改用 `aiofiles`
+- 消息内容提取（`_extract_message_content`）按组件原始顺序拼接，文字与图片相对位置正确保留，不再重复提取转述内容
+- `DecayScheduler` 状态管理（`_load_state`、`_save_state`、`_get_last_decay_date`、`_set_last_decay_date`、`_calculate_missed_days`）全部改为异步，避免阻塞事件循环
+
+## [2.1.9] - 2026-02-21
+
+### 修复
+- 修复 `memory_engine.delete_memory()` 重复删除 `documents` 表的问题：`hybrid_retriever.delete_memory()` 内部已按顺序删除 BM25 → 向量索引 → documents，上层再次删除会造成连接竞争
+- 修复 `update_memory()` 内容更新时旧记忆删除失败静默返回 `True` 的问题：现在改为回滚（删除刚创建的新记忆）并返回 `False`，避免新旧记录并存
+- 修复 `status` 命令缺少 `@permission_type(PermissionType.ADMIN)` 装饰器，任意用户均可查看系统状态
+- 修复 `help` 命令中仓库链接错误（指向了旧地址）
+
+### 优化
+- 数据库迁移（`DBMigration.migrate()`）执行前自动调用 `create_backup()` 创建完整备份，备份失败仅警告不中断迁移，迁移结果中附带 `backup_path`
+
+## [2.1.8] - 2026-02-20
+
+### 修复
+- 修复向量索引冗余槽位导致每次启动都触发全量重建的问题：FAISS `ntotal` 包含逻辑删除后的空槽，属正常行为，不再触发重建；仅 BM25 冗余或索引缺失时才重建
+- 修复 `get_persona_id` 与 AstrBot 主流程优先级不一致的问题：新增最高优先级 `session_service_config`（由 `/persona` 等命令写入），并正确处理 `[%None]`（明确无人格）不再 fallback 到默认人格
+- 修复 `handle_memory_recall` 中 `persona_id` 获取路径：移除直接读取 `req.conversation.persona_id` 的逻辑（`on_llm_request` 钩子在 `_ensure_persona_and_skills` 之前触发，该字段不含 session_service_config 覆盖），统一走完整三级优先级
+
+### 优化
+- Provider 未就绪时的日志提示明确区分 Embedding Provider 和 LLM Provider，并附带配置建议
+- 周期性重试日志显示当前哪个 Provider 仍未就绪
+- 最终超时失败日志列出具体未就绪的 Provider 名称
+
+## [2.1.7] - 2026-02-19
+
+### 新增
+- 新增双通道记忆总结机制：`canonical_summary`（事实导向，用于检索）与 `persona_summary`（人格风格，用于注入表达）解耦存储
+- 新增 `SummaryValidator`（`_validate_summary_quality`）：对总结结果进行字段完整性、长度、泛化词检测，质量不达标时标记 `summary_quality=low`
+- 新增 MMR（最大边际相关性）去重：召回结果在加权排序后执行 Jaccard 相似度去重，避免语义重复记忆占据 Top-K
+- 新增 `score_breakdown` 字段：每条召回结果附带各维度分数明细（`rrf_normalized`、`importance`、`recency_weight`、`days_old`、`final_score`），便于调试
+- 新增 `source_window` 元数据：记忆写入时记录来源会话窗口（`session_id`、`start_index`、`end_index`、`message_count`），支持后续溯源
+- 新增 `summary_schema_version` 字段：新写入记忆标记为 `v2`，旧记录通过数据库迁移补标 `v1`
+- 数据库迁移升级至 v4：为所有旧格式记录批量补充 `summary_schema_version=v1` 和 `summary_quality=unknown` 标记
+
+### 修复
+- 修复群聊双重写入 Bug：`handle_all_group_messages` 现在跳过 Bot 自身消息，避免 assistant 响应被写入两次（`handle_memory_reflection` 为唯一写入方）
+- 修复 `persona_id` 获取不一致问题：优先从 `req.conversation.persona_id` 读取，确保召回与 LLM 调用使用完全相同的人格 ID
+- 修复评分公式"清零"问题：将全乘法 `rrf * importance * recency` 改为加权求和 `0.5*rrf + 0.25*importance + 0.25*recency`，高重要性旧记忆不再被时间衰减压制至接近零
+- 修复 `last_access_time` 未参与衰减计算的问题：时间衰减基准改为 `max(create_time, last_access_time)`，高频访问记忆衰减自然放缓
+- 修复数据库迁移中 `json_set` 语法错误：将无效的 `CASE` 表达式替换为 `COALESCE(NULLIF(TRIM(metadata), ''), '{}')`
+- 修复 `_build_storage_format` 中 `summary_quality` 被硬编码为 `"normal"` 的问题，现由 `_validate_summary_quality` 动态决定
+
+### 优化
+- 记忆注入改为追加到 `system_prompt` 末尾，确保人格提示词在前、记忆内容在后，符合 LLM 理解优先级
+- `content` 字段默认改为存储 `canonical_summary + key_facts`，提升 BM25 检索稳定性
+- MMR 参数（`mmr_lambda`）、评分权重（`score_alpha/beta/gamma`）均可通过配置覆盖
+
+### 测试
+- 新增 `MemoryProcessor` 群聊路径测试（7 个）：`interaction_type`、`participants` 提取、双通道摘要、缺失字段默认值、私聊无 `participants`、长内容不崩溃、泛化词质量标记
+- 新增 `EventHandler` 边界条件与 `source_window` 测试（8 个）：空 prompt 跳过召回、`user_message_before/after` 注入位置、`source_window` 字段写入验证、过期任务跳过、错误/空响应跳过、重试超限放弃
+- 新增 `HybridRetriever` 边界条件与回滚测试（7 个）：空查询返回空列表、两路失败返回空列表、单路降级、空 metadata 不崩溃、k 限制结果数量
+- 新增 `MemoryEngine` 过滤/衰减/清理边界测试（11 个）：session 隔离、`decay_rate=0`/`days=0` 边界、衰减实际生效、`cleanup` 负数/零天边界、内容更新先建后删、删除不存在 ID、空查询、统计字段
+- 全量测试 118 个，全部通过（pytest + pytest-asyncio）
+
+## [2.1.4] - 2026-02-19
+
+### 优化
+- 优化记忆注入方式
+- 优化删除逻辑，确保内容安全
+- 改进 Webui 的会话处理逻辑
+- 添加每日自动清理功能
+- 优化记忆管理和初始化逻辑
+
+
+## [2.1.2] - 2026-01-20
+
+### 修复
+- 修复历史消息清理功能无法处理多模态消息格式的问题
+  - 支持 OpenAI 多模态格式: `{"role": "user", "content": [{"type": "text", "text": "xxx"}]}`
+  - 正确清理 contexts 中 list 类型 content 的记忆注入片段
+  - 修复清理逻辑只处理 string 类型 content 导致的清理失败
+
+### 优化
+- 简化记忆清理日志输出,移除冗余的 DEBUG 级别日志
+- 优化 `_remove_injected_memories_from_context` 方法,支持三种 contexts 格式
+- 改进 cleanup 命令,操作 AstrBot 数据库而非插件自身数据库
+
+## [2.1.1] - 2026-01-19
+
+### 新增
+- 添加 `/lmem cleanup` 命令，支持清理历史消息中的记忆注入片段
+- 增强记忆处理器，支持人格提示和上下文管理
+- 处理 Message 对象的 metadata 字段，支持 JSON 字符串解析
+
+### 优化
+- 更新人格提示和总结要求，增强记忆生成的个性化和准确性
+- 增强命令处理和事件处理逻辑，添加输入验证和后台任务管理
+- 更新消息数量上限控制逻辑，仅删除已总结的消息
+
+## [2.0.11] - 2026-01-06
+
+### 新增
+- 添加 LLM 调用重试机制和 JSON 修复功能，增强数据处理的鲁棒性
+- 添加记忆重要性衰减调度器，支持每日自动衰减处理
+- 增强事件处理器和记忆处理器，支持失败总结重试机制和 JSON 格式输出修复
+
+### 优化
+- 按创建时间降序排序记忆列表，优化用户体验
+- 增强事件处理器和会话管理器，优化群聊判断逻辑
+
+## [2.0.8] - 2026-01-05
+
+### 修复
+- 修复命令无法正确响应问题
+
+### 优化
+- 更新私聊提示，增强消息格式说明和昵称使用规则
+- 重构自动发布工作流，简化版本检查与发布逻辑，移除旧的 release.yml 文件
+
+## [2.0.6] - 2026-01-04
+
+### 新增
+- 添加索引维度检查与修复逻辑，确保与当前 embedding provider 维度一致
+- 增强数据一致性检查，添加实际消息数量获取和同步逻辑
+- 增强响应内容检查，过滤空回复和错误响应，确保消息记录的有效性
+
+### 修复
+- 修复指令无法使用问题
+
+### 优化
+- 优化代码格式，增强可读性，调整多个文件中的代码缩进和换行
+- 增强调试信息，优化消息格式化逻辑，更新群聊提示文档
+
+## [2.0.2] - 2025-12-18
+
+### 修复
+- 修复会话 message_count 不一致问题，增强消息获取逻辑和调试信息
+
+### 优化
+- 更新默认监听端口至 8888
+
+## [2.0.1] - 2025-12-18
+
+### 优化
+- 优化自动发布工作流中的版本检查和日志输出
+- 重构和增强代码结构，添加新测试和性能基准
+- 删除 lint 和 test 工作流配置文件
+
+## [2.0.0] - 2025-12-17
+
+### 🎉 重大重构
+
+这是一个完全重构的版本，旨在提升代码质量、可维护性和可测试性。
+
+#### 架构改进
+- **模块化设计**: 将1663行的main.py拆分为多个职责单一的模块
+  - `PluginInitializer`: 负责插件初始化逻辑（380行）
+  - `EventHandler`: 负责事件处理（450行）
+  - `CommandHandler`: 负责命令处理（220行）
+  - `ConfigManager`: 集中配置管理（95行）
+  - main.py简化至280行，只保留插件注册和生命周期管理
+
+#### 新增模块
+- **异常处理系统** (`core/exceptions.py`)
+  - 定义了8个自定义异常类
+  - 统一的错误码体系
+  - 清晰的异常继承关系
+
+- **配置管理器** (`core/config_manager.py`)
+  - 集中配置加载和验证
+  - 支持点号分隔的嵌套键访问
+  - 提供便捷的配置节访问属性
+
+- **插件初始化器** (`core/plugin_initializer.py`)
+  - 非阻塞初始化机制
+  - Provider等待和重试逻辑
+  - 清晰的初始化状态管理
+  - 自动数据库迁移和索引重建
+
+- **事件处理器** (`core/event_handler.py`)
+  - 统一处理所有事件钩子
+  - 群聊消息捕获
+  - 记忆召回和反思
+  - 消息去重机制
+
+- **命令处理器** (`core/command_handler.py`)
+  - 统一处理所有命令
+  - 清晰的命令响应格式
+  - 完善的错误处理
+
+#### 测试基础设施
+- 创建了完整的测试目录结构
+- 添加了pytest配置文件
+- 编写了ConfigManager和异常模块的单元测试
+- 为后续测试覆盖奠定基础
+
+#### 代码质量提升
+- **代码量优化**: 核心代码从1663行优化至1483行（减少11%）
+- **职责分离**: 每个模块职责单一，易于理解和维护
+- **可测试性**: 模块解耦，支持依赖注入，易于测试
+- **错误处理**: 统一的异常体系和错误处理流程
+- **配置管理**: 集中化的配置加载和验证
+
+#### 文档完善
+- 新增 `REFACTOR_FEATURE_ANALYSIS.md`: 详细的功能分析文档
+- 新增 `REFACTOR_PLAN.md`: 完整的重构计划文档
+- 所有新模块都有完整的文档字符串
+
+### 保持不变
+- ✅ 所有现有功能完全保留
+- ✅ 数据库结构完全兼容
+- ✅ 配置文件格式完全兼容
+- ✅ 所有公开API接口保持不变
+- ✅ 向后兼容旧版本数据
+
+### 技术债务清理
+- 移除了重复的代码
+- 统一了日志记录格式
+- 规范了错误处理流程
+- 优化了初始化逻辑
+
+---
+
+## [1.5.18] - 2025-11-06
+
+### 工作流优化
+- 创建了全新的 GitHub Actions 工作流系统
+- 自动化版本发布流程
+- 智能 Issue 管理
+
+---
+
+注意：请在每次发版前更新此文件，将 [Unreleased] 部分的内容移动到新版本号下。

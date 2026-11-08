@@ -20,10 +20,24 @@ cookies.json
 # Data files
 data_v2.db
 data_v3.db
-data
 configs/session
 configs/config.yaml
 cmd_config.json
+
+# Runtime data stays local, except plugin source so local patches survive upgrades.
+# Excluding the directory itself would make every negation below unreachable.
+data/*
+!data/plugins/
+data/plugins/*
+!data/plugins/*/
+
+# Plugin runtime state and credentials stay local.
+data/plugins/**/config.json
+!data/plugins/**/*_conf_schema.json
+!data/plugins/**/config_r2_example.json
+data/plugins/**/node_modules/
+data/plugins/**/*.pyc
+data/plugins/**/.venv*/
 
 # Plugins
 addons/plugins
@@ -46,6 +60,7 @@ astrbot/dashboard/dist/
 
 # AstrBot specific
 .astrbot
+.astrbot-tmp
 astrbot.lock
 
 # Other
@@ -64,3 +79,4 @@ GenieData/
 .kilocode/
 .worktrees/
 
+dashboard/bun.lock

@@ -1,0 +1,5 @@
+name: astrbot_plugin_sys_tools
+display_name: 系统工具集
+author: cherries
+version: v1.2.0
+desc: 公网 IP 查询与原版 PicStatus 状态图 LLM 工具，保留动漫背景、头像、硬件监控、磁盘 IO 和网络连通性。
