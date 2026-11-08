@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .history import browsing_history
 from .life import LifeState, prepare_database
 
 
@@ -131,110 +132,39 @@ def time_context(value=None, now=None):
     return ctx
 
 
-def _bvid_of(row):
-    """The bvid an episode is about, from structured evidence or a read excerpt."""
-    evidence = row.get("evidence") or {}
-    if isinstance(evidence.get("bvid"), str) and evidence["bvid"].startswith("BV"):
-        return evidence["bvid"]
-    excerpt = evidence.get("result_excerpt")
-    if isinstance(excerpt, str):
-        found = re.search(r'"bvid"\s*:\s*"(BV[0-9A-Za-z]+)"', excerpt)
-        if found:
-            return found.group(1)
-    return None
-
-
-def _title_of(row):
-    """The video title the tool actually returned, if the record kept it."""
-    evidence = row.get("evidence") or {}
-    excerpt = evidence.get("result_excerpt")
-    if isinstance(excerpt, str):
-        found = re.search(r'"title"\s*:\s*"([^"\\]{1,120})"', excerpt)
-        if found:
-            return found.group(1)
-    return None
-
-
-def _day_of(epoch):
-    return datetime.fromtimestamp(epoch, ZoneInfo("Asia/Shanghai")).date()
-
-
 def today_viewing_summary(db, scope, now=None):
-    """State today's viewing as fact instead of leaving it to be inferred.
+    """Summarize today's recorded evidence without claiming complete watching.
 
-    The injected records are written by the browsing run itself, so the ones
-    that survive a small recall limit often say "no frames obtained" while the
-    run that actually read a video sits further back. A model reading only
-    those answers "I did not watch anything" and is then faithful to a
-    misleading record, so today's reads are counted here and stated plainly.
+    Args:
+        db: Existing local activity database connection.
+        scope: Trusted owner scope.
+        now: Optional Unix timestamp used for the Shanghai calendar day.
 
-    Scans today's rows directly rather than the truncated recall slice: a
-    handful of recent rows only covers the last run, which is exactly the run
-    that failed to get frames.
+    Returns:
+        A bounded factual summary and guidance to query other dates explicitly.
     """
-    now = now or time.time()
-    today = _day_of(now)
-    start = datetime.combine(today, datetime.min.time(), ZoneInfo("Asia/Shanghai")).timestamp()
-    rows = [{"kind": row[1], "occurred_at": row[2], "evidence": json.loads(row[3] or "{}")}
-            for row in db.execute("SELECT id, kind, occurred_at, evidence_json FROM episodes "
-                                  "WHERE scope=? AND occurred_at>=? AND kind IN ('read','video','video_note') "
-                                  "ORDER BY occurred_at", (scope, start))]
-    videos, operations, titles, read_times = {}, 0, {}, {}
-    for row in rows:
-        occurred = row["occurred_at"]
-        if type(occurred) not in (int, float) or _day_of(occurred) != today:
-            continue
-        if row["kind"] == "read":
-            operations += 1
-            bvid, title = _bvid_of(row), _title_of(row)
-            if bvid:
-                if title:
-                    titles.setdefault(bvid, title)
-                read_times.setdefault(bvid, []).append(occurred)
-            continue
-        bvid = _bvid_of(row)
-        if not bvid:
-            continue
-        item = videos.setdefault(bvid, {"title": None, "times": [], "frames": False, "subtitle": False})
-        item["title"] = item["title"] or _title_of(row)
-        item["times"].append(occurred)
-        evidence = row["evidence"]
-        if evidence.get("observations"):
-            item["frames"] = True
-        if evidence.get("subtitles"):
-            item["subtitle"] = True
-    if not videos and not operations:
-        return ""
-    for bvid, item in videos.items():
-        item["title"] = item["title"] or titles.get(bvid)
-    for bvid, times in read_times.items():
-        item = videos.setdefault(bvid, {"title": titles.get(bvid), "times": [], "frames": False,
-                                        "subtitle": True, "read_only": True})
-        item["times"].extend(times)
+    result = browsing_history(db, scope, limit=8, now=now)
+    counts = result["counts"]
+    head = ("\n今天（" + result["start_date"] + "，北京时间）的B站记录："
+            + f"浏览过{counts['browsed_videos']}条不同BV，"
+            + f"其中{counts['analyzed_videos']}条取得字幕/画面描述/转写；"
+            + f"尝试分析{counts['analysis_attempt_videos']}条；"
+            + f"保存了{counts['read_records']}条成功资料读取记录。")
     parts = []
-    for bvid, item in sorted(videos.items(), key=lambda kv: min(kv[1]["times"])):
-        first, last = min(item["times"]), max(item["times"])
-        when = datetime.fromtimestamp(first, ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
-        if _day_of(last) != _day_of(first):
-            when += " 起"
-        elif int(last - first) >= 60:
-            when += "-" + datetime.fromtimestamp(last, ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
-        label = f"{bvid}《{item['title']}》" if item["title"] else bvid
-        if item.get("read_only"):
-            saw = "读了资料，没抽帧"
-        elif item["frames"] and item["subtitle"]:
-            saw = "画面+字幕"
-        elif item["subtitle"]:
-            saw = "只有字幕，没取到画面"
-        else:
-            saw = "没取到画面和字幕"
-        parts.append(f"{label}（{when}，{saw}）")
-    head = f"\n今天（{today.month:02d}-{today.day:02d}）已实际读过 {len(videos)} 条视频"
-    if operations:
-        head += f"、另有 {operations} 次首页/搜索/字幕/弹幕/评论读取"
+    for item in result["videos"]:
+        label = item["bvid"] + ("《" + item["title"] + "》" if item["title"] else "")
+        labels = {"frames": "画面描述", "asr": "语音转写", "subtitles": "字幕"}
+        evidence = "/".join(labels[key] for key in item["media"])
+        if not evidence:
+            evidence = "只读取目标资料" if item["browsed_dates"] else "仅尝试分析，未取得内容"
+        parts.append(label + "（" + evidence + "）")
     if parts:
-        head += "：" + "；".join(parts)
-    return head + "。被问到今天有没有刷B站、看没看过某条视频时，这就是事实依据：读过就是看过，哪怕当时没取到画面。"
+        head += "视频：" + "；".join(parts) + "。"
+    if result["next_offset"] is not None or result["coverage"]["counts_are_lower_bounds"]:
+        head += "列表或统计有截断，需查询完整分页并说明覆盖限制。"
+    return head + ("这是本插件已保存的记录，不代表B站全部历史；读取资料、抽样分析不等于完整看完。"
+                   "询问昨天、某一天、上周或精确数量时，调用df_bili_history核对日期、数量和分页；"
+                   "无记录只能说未查到，不能断言当天没浏览。")
 
 
 def recent_activity_block(recent, now=None):
@@ -375,8 +305,8 @@ class Store:
         return row, True
 
     def offered(self, proposal_id, receipt):
-        if not receipt or not receipt.get("message_id"):
-            raise ValueError("proposal delivery needs QQ receipt")
+        if not receipt or not (receipt.get("message_id") or receipt.get("group")):
+            raise ValueError("proposal delivery needs a private QQ receipt or a delivered group approval")
         self.db.execute("UPDATE proposals SET status='offered',offer_receipt=? WHERE id=? AND status='draft'",
                         (canonical(receipt), proposal_id))
 

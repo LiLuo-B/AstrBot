@@ -871,8 +871,9 @@ class FaceConvertPlugin(Star):
     async def _process_video(self, event: AstrMessageEvent, comp) -> VideoAnalysis:
         """最长五分钟，超时/单段失败仍返回已识别结果；外部取消继续传播。"""
         result = VideoAnalysis()
-        if not self.asr_key:
-            result.notes.append("未配置 DashScope key")
+        if not (self.asr_key or self.siliconflow_key or self._host_provider_usable()
+                or str(self.cfg.get("local_asr_url") or "").strip()):
+            result.notes.append("未配置可用的语音识别后端")
             return result
         with tempfile.TemporaryDirectory(prefix="vid_") as tmpdir:
             try:
