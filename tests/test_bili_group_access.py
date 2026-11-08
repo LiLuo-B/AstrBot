@@ -95,6 +95,57 @@ def test_execution_and_group_approval_use_same_access_and_ledger():
     ("2026-11-07看了哪些B站视频", "2026-11-07"),
 ])
 async def test_explicit_group_history_question_queries_before_answer(text, date):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    method = methods("incoming")
+    method.decorator_list = []
+    module = SimpleNamespace(AstrMessageEvent=object, group_access=lambda event, cfg, owner=False: True,
+        re=__import__("re"), json=json,
+        logger=SimpleNamespace(warning=lambda *args: None))
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"), vars(module))
+    controller = SimpleNamespace(cfg=lambda: config(), bili_history=AsyncMock(return_value=json.dumps({
+        "start_date": "2026-11-08", "counts": {"browsed_videos": 2},
+        "videos": [{"bvid": "BV1", "title": "第一条"}, {"bvid": "BV2", "title": "第二条"}],
+        "next_offset": None}, ensure_ascii=False)))
+    current = event(sender="other")
+    current.message_str = text
+    current.message_obj = SimpleNamespace(message_str=text, message_id="g1")
+    current.send = AsyncMock()
+    current.stop_event = Mock()
+    current.plain_result = lambda value: value
+    await module.incoming(controller, current)
+    controller.bili_history.assert_awaited_once_with(current, date)
+    current.stop_event.assert_called_once()
+    answer = current.send.await_args.args[0]
+    assert "2条不同视频" in answer and "《第一条》" in answer and "《第二条》" in answer
+    assert "没刷" not in answer
+
+
+@pytest.mark.asyncio
+async def test_group_history_failure_does_not_deny_activity():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    method = methods("incoming")
+    method.decorator_list = []
+    module = SimpleNamespace(AstrMessageEvent=object, group_access=lambda event, cfg, owner=False: True,
+        re=__import__("re"), json=json,
+        logger=SimpleNamespace(warning=lambda *args: None))
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"), vars(module))
+    controller = SimpleNamespace(cfg=lambda: config(), bili_history=AsyncMock(side_effect=ValueError("bad")))
+    current = event(sender="other")
+    current.message_str = "今天刷了几条b站了"
+    current.message_obj = SimpleNamespace(message_str=current.message_str, message_id="g1")
+    current.send = AsyncMock()
+    current.stop_event = Mock()
+    current.plain_result = lambda value: value
+    await module.incoming(controller, current)
+    assert "暂时没查出来" in current.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_removed_prompt_path_does_not_query_group_history(text="今天刷了几条b站了", date="今天"):
     import sys
     from types import ModuleType, SimpleNamespace
     from unittest.mock import AsyncMock, Mock
@@ -114,9 +165,8 @@ async def test_explicit_group_history_question_queries_before_answer(text, date)
     current.message_str = text
     req = SimpleNamespace(contexts=[], system_prompt="persona", func_tool=None)
     await module.guard_phone(controller, current, req)
-    controller.bili_history.assert_awaited_once_with(current, date)
-    assert "browsed_videos" in req.system_prompt
-    assert "不要用群聊活动" in req.system_prompt
+    controller.bili_history.assert_not_awaited()
+    assert "已为本条浏览历史问题" not in req.system_prompt
 
 
 @pytest.mark.asyncio

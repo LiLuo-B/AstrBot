@@ -1483,28 +1483,6 @@ class BiliActivity(Star):
             logger.info("trimmed %s old tool screenshot(s) from LLM context", trimmed)
         cfg = self.cfg()
         if group_access(event, cfg):
-            logger.info("Bili group tools: %s", req.func_tool.names() if req.func_tool else [])
-            text = getattr(event, "message_str", "") or ""
-            is_history_question = (re.search(r"(?:今天|昨日|昨天|前天|本周|上周|最近\s*\d*\s*天|\d{4}[-年/]\d{1,2}[-月/]\d{1,2}|\d{1,2}月\d{1,2}[日号]?)", text)
-                                   and re.search(r"(?:刷|逛|看|浏览|几条|多少|哪些|什么)", text)
-                                   and re.search(r"(?:b站|bilibili|视频|刷|逛)", text, re.I))
-            if is_history_question:
-                try:
-                    day = re.search(r"(\d{4})[-年/](\d{1,2})[-月/](\d{1,2})日?", text)
-                    date = f"{day[1]}-{int(day[2]):02d}-{int(day[3]):02d}" if day else (
-                        "昨天" if re.search(r"昨天|昨日", text)
-                        else "前天" if "前天" in text
-                        else "上周" if "上周" in text
-                        else "本周" if "本周" in text
-                        else "最近7天" if re.search(r"最近\s*7\s*天", text) else "今天")
-                    evidence = await self.bili_history(event, date)
-                    req.system_prompt = (req.system_prompt or "") + (
-                        "\n已为本条浏览历史问题调用df_bili_history，以下是真实查询结果，不是聊天印象："
-                        + evidence + "\n必须据此回答具体数量和标题；零条只能说未查到记录，不能说肯定没刷。"
-                        "不要用群聊活动、睡觉、调试机器人等猜测替代B站记录。保持原人格和简短口吻，不必再调用工具。")
-                except Exception as exc:
-                    req.system_prompt = (req.system_prompt or "") + (
-                        "\n本条B站历史查询失败（" + type(exc).__name__ + "），请明确说暂时没查到，不能编造数量或否认浏览。")
             allowed = {"df_bili_history"}
             if group_access(event, cfg, owner=True):
                 allowed.add("df_bili_propose")
@@ -1579,8 +1557,39 @@ class BiliActivity(Star):
         cfg = self.cfg()
         group_owner = group_access(event, cfg, owner=True)
         if (event.unified_msg_origin != cfg["owner_scope"] or str(event.get_sender_id()) != str(cfg["owner_id"])) and not group_owner:
-            return
+            if not group_access(event, cfg):
+                return
         if event.get_extra("df_run_id"):
+            return
+        text = getattr(event, "message_str", "") or ""
+        if (group_access(event, cfg)
+                and re.search(r"(?:今天|昨日|昨天|前天|本周|上周|最近\s*\d*\s*天|\d{4}[-年/]\d{1,2}[-月/]\d{1,2}|\d{1,2}月\d{1,2}[日号]?)", text)
+                and re.search(r"(?:刷|逛|看|浏览|几条|多少|哪些|什么)", text)
+                and re.search(r"(?:b站|bilibili|视频|刷|逛)", text, re.I)):
+            event.stop_event()
+            day = re.search(r"(\d{4})[-年/](\d{1,2})[-月/](\d{1,2})日?", text)
+            date = f"{day[1]}-{int(day[2]):02d}-{int(day[3]):02d}" if day else (
+                "昨天" if re.search(r"昨天|昨日", text)
+                else "前天" if "前天" in text
+                else "上周" if "上周" in text
+                else "本周" if "本周" in text
+                else "最近7天" if re.search(r"最近\s*7\s*天", text) else "今天")
+            try:
+                result = json.loads(await self.bili_history(event, date))
+                count = result["counts"]["browsed_videos"]
+                if not count:
+                    answer = f"{result['start_date']}没查到B站浏览记录。只是本插件没记录，不代表一定没刷。"
+                else:
+                    titles = ["《" + (video.get("title") or video["bvid"]) + "》"
+                              for video in result["videos"][:3]]
+                    answer = f"{result['start_date']}查到{count}条不同视频：" + "、".join(titles)
+                    if len(result["videos"]) > 3 or result.get("next_offset") is not None:
+                        answer += "等"
+                    answer += "。这是本插件的记录，读取资料或字幕不等于完整看完。"
+            except Exception as exc:
+                logger.warning("Bili group history query failed: %s", type(exc).__name__)
+                answer = "B站历史暂时没查出来，不能据此说今天没刷。"
+            await event.send(event.plain_result(answer))
             return
         if cfg["contact_coordination_enabled"] and not group_owner:
             self.contact_ledger().owner_message(event.unified_msg_origin,
