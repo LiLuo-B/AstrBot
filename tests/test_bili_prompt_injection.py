@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from data.plugins.astrbot_plugin_bili_activity.interactions import authorization_prompt
+
 
 class HistoryInjectionTests(unittest.IsolatedAsyncioTestCase):
     """Exercise the deployed request hook without starting AstrBot or services."""
@@ -31,6 +33,7 @@ class HistoryInjectionTests(unittest.IsolatedAsyncioTestCase):
         method.decorator_list = []
         module = types.ModuleType("bili_prompt_hook_test")
         module.AstrMessageEvent = object
+        module.authorization_prompt = authorization_prompt
         module.trim_tool_image_history = lambda *args, **kwargs: 0
         module.SelfExpression = Mock(
             side_effect=AssertionError("disabled expression must not run")
@@ -75,7 +78,9 @@ class HistoryInjectionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("今天（", req.system_prompt)
                     self.assertNotIn("近期自主活动记录", req.system_prompt)
                     self.assertNotIn("读过就是看过", req.system_prompt)
-                    self.assertLess(len(req.system_prompt), 600)
+                    self.assertIn("不要在提交前先问批准", req.system_prompt)
+                    self.assertNotIn("默认等待", req.system_prompt)
+                    self.assertLess(len(req.system_prompt), 1200)
             module.MemoryPolicy.assert_not_called()
 
 

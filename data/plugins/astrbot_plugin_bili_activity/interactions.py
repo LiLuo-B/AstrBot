@@ -130,6 +130,33 @@ def auto_allowed(action, target, cfg):
     return True
 
 
+def authorization_prompt(cfg):
+    """Describe submission and authorization using the current controller policy.
+
+    Args:
+        cfg: Current interaction configuration, including action switches.
+
+    Returns:
+        Model guidance that does not grant permissions or approve a target.
+    """
+    cfg = DEFAULTS | cfg
+    candidates = cfg | {"allowed_uids": [], "allowed_keywords": []}
+    automatic = (
+        ",".join(
+            action for action in sorted(WRITES) if auto_allowed(action, {}, candidates)
+        )
+        or "无"
+    )
+    return (
+        "B站账号写入只通过df_bili_propose提交精确对象和内容；想操作时直接提交，不要在提交前先问批准。"
+        f"当前模式={cfg['interaction_mode']}，可按配置自动执行的动作={automatic}；"
+        "仍须通过目标允许范围、额度、登录、冷却及去重检查，不能据此扩大权限。"
+        "未获自动授权的动作由控制器发送真实QQ私聊提议，只有返回awaiting_user/offered才等待哥答复；"
+        "没有另一个待点击的审批界面。以工具返回为准，不代用户批准、不把提交等同于执行成功。"
+        'follow/unfollow的arguments用uid（搜索结果mid须转为uid），例如{"uid":22697887}。'
+    )
+
+
 def day_at(now):
     return datetime.fromtimestamp(now, ZoneInfo("Asia/Shanghai")).date().isoformat()
 
@@ -380,11 +407,14 @@ class Interactions:
             (scope, day, action),
         )
 
-    def guard(self, scope, run_id, now=None):
+    def guard(self, scope, run_id, now=None, *, check_login=True):
         now = time.time() if now is None else now
-        if self.store.get_setting("interaction_login:" + scope) == "invalid":
+        if (
+            check_login
+            and self.store.get_setting("interaction_login:" + scope) == "invalid"
+        ):
             raise InteractionBlocked(
-                "B站登录失效，请哥重新扫码后查询互动状态确认登录。"
+                "登录保护尚未解除，这次没有发送；本次复核未确认登录有效，不能仅凭旧失效记录断言必须重新扫码。"
             )
         if self.store.get_setting("interaction_stopped:" + scope + ":" + run_id, False):
             raise InteractionBlocked("本轮因风控已停止，不再发送下一条。")

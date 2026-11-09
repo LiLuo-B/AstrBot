@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from data.plugins.astrbot_plugin_bili_activity.access import group_access
+from data.plugins.astrbot_plugin_bili_activity.interactions import authorization_prompt
 
 ROOT = Path(__file__).parents[1] / "data/plugins/astrbot_plugin_bili_activity/main.py"
 
@@ -165,6 +166,7 @@ async def test_group_request_does_not_rewrite_qq_scope_and_removes_write_tool():
     module.PHONE_NAMES = set()
     module.BILI_RAW_NAMES = set()
     module.BILI_SERVERS = set()
+    module.authorization_prompt = authorization_prompt
     method = methods("guard_phone")
     method.decorator_list = []
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT), "exec"), vars(module))
@@ -180,6 +182,8 @@ async def test_group_request_does_not_rewrite_qq_scope_and_removes_write_tool():
     assert current.unified_msg_origin.endswith(":GroupMessage:123")
     assert request.func_tool.tools == [read]
     assert "共享" in request.system_prompt
+    assert "当前会话仅可读取B站资料" in request.system_prompt
+    assert "可按配置自动执行的动作=" not in request.system_prompt
 
 
 def test_only_group_history_switch_remains():
