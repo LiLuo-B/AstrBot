@@ -7,6 +7,7 @@
 - 一次性任务和 cron 任务都按本地时间显示；
 - 人格里再补一条行为规则：有日程就按日程走，不要说自己没有定时任务。
 """
+
 import json
 import os
 import sqlite3
@@ -101,7 +102,7 @@ class ScheduleAwarenessPlugin(Star):
             return ""
 
         lines = [f"{MARKER}（程序里真实存在，不是聊天里随口说的）】"]
-        lines.append("时间均为本地时间；到点由程序唤醒你，不需要主人再提醒。")
+        lines.append("时间均为本地时间；到点由程序唤醒你，不需要别人再提醒。")
         for job, payload in mine[:MAX_TASKS]:
             name = (job.get("name") or "未命名任务").strip()
             tz_name = job.get("timezone") or "Asia/Shanghai"
@@ -122,7 +123,7 @@ class ScheduleAwarenessPlugin(Star):
             lines.append(f"- {name}：{when}" + (f"（{note}）" if note else ""))
         lines.append(
             "被问日程时按这份清单回答，不要说自己没有定时任务；也不要编造清单外的任务。"
-            "这些是你自己的安排，到点主动做，不用等主人再提。"
+            "这些是你自己的安排，到点主动做，不用等别人再提。"
         )
         return "\n".join(lines)
 

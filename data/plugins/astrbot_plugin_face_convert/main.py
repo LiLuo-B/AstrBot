@@ -970,33 +970,36 @@ class FaceConvertPlugin(Star):
                 event.message_str = ((event.message_str or "") + " " + extra).strip()
                 logger.info(f"[face_convert] 收信翻译: {extra}")
 
-        # 身份标记（只进她的上下文，对方看不到字面量）：
-        # 群聊 -> [昵称(QQ号)]，管理员标「主人」；陌生人私聊 -> [主人的朋友 昵称(QQ号)]
+        # Sender metadata identifies accounts, never personal relationships.
         try:
             if not event.get_extra("_fy_tagged"):
                 sid = str(event.get_sender_id())
                 is_group = bool(event.get_group_id())
-                is_guest = (not is_group) and event.is_private_chat() and sid not in self.admins
-                if is_group or is_guest:
-                    name = re.sub(r"[\[\]\r\n]", "", (event.get_sender_name() or "").strip())[:16]
-                    if is_group and sid in self.admins:
-                        tag = f"主人({sid})"
-                    elif is_group:
-                        tag = f"{name}({sid})" if name else f"群友({sid})"
-                    else:
-                        tag = f"主人的朋友 {name}({sid})" if name else f"主人的朋友({sid})"
+                if is_group or event.is_private_chat():
+                    name = re.sub(
+                        r"[\[\]\r\n]", "", (event.get_sender_name() or "").strip()
+                    )[:16]
+                    tag = f"{name}({sid})" if name else f"用户({sid})"
                     text = (event.message_str or "").strip()
                     if text:
                         event.message_str = f"[{tag}] {text}"
                         event.set_extra("_fy_tagged", True)
                         logger.info(f"[face_convert] 身份标记: {tag}")
-                    elif is_group and event.is_wake and not any(
-                        (isinstance(c, At) and str(c.qq) == str(event.get_self_id()))
-                        or (
-                            isinstance(c, Reply)
-                            and str(getattr(c, "sender_id", "")) == str(event.get_self_id())
+                    elif (
+                        is_group
+                        and event.is_wake
+                        and not any(
+                            (
+                                isinstance(c, At)
+                                and str(c.qq) == str(event.get_self_id())
+                            )
+                            or (
+                                isinstance(c, Reply)
+                                and str(getattr(c, "sender_id", ""))
+                                == str(event.get_self_id())
+                            )
+                            for c in comps
                         )
-                        for c in comps
                     ):
                         # 只喊了名字、没带内容：给她一个回应的由头
                         event.message_str = f"[{tag}] （喊了你一声）"
@@ -1004,6 +1007,80 @@ class FaceConvertPlugin(Star):
                         logger.info(f"[face_convert] 群聊空唤醒标记: {tag}")
         except Exception as e:
             logger.warning(f"[face_convert] 身份标记失败: {str(e)[:100]}")
+
+    @filter.on_llm_request(priority=-200)
+    async def clarify_identity(self, event: AstrMessageEvent, req):
+        """Keep account metadata separate from personal relationships.
+
+        Args:
+            event: Current event supplying the platform-verified sender identity.
+            req: Model request receiving factual identity and relationship rules.
+        """
+        # Remove only obsolete machine prefixes; preserve message bodies and audit history.
+        legacy_tag = re.compile(
+            r"^\[(?:主人的朋友\s*([^\[\]\n]*?)|主人)(\([^()\[\]\n]+\))\]\s*"
+        )
+        if isinstance(getattr(req, "prompt", None), str):
+            req.prompt = legacy_tag.sub(
+                lambda match: f"[{match[1] or '用户'}{match[2]}] ", req.prompt, count=1
+            )
+        contexts = []
+        for message in getattr(req, "contexts", []) or []:
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                old_reply = "主人的朋友。哥的朋友我记着，别的不清楚。"
+                content = message.get("content")
+                if content == old_reply or content == [
+                    {"type": "text", "text": old_reply}
+                ]:
+                    contexts.append(
+                        {
+                            **message,
+                            "content": "[这条旧回复依据自动标签误认了关系；实际关系未知，不作为事实。]",
+                        }
+                    )
+                    continue
+            if not isinstance(message, dict) or message.get("role") != "user":
+                contexts.append(message)
+                continue
+            message = message.copy()
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = legacy_tag.sub(
+                    lambda match: f"[{match[1] or '用户'}{match[2]}] ", content, count=1
+                )
+            elif isinstance(content, list):
+                message["content"] = [
+                    {
+                        **part,
+                        "text": legacy_tag.sub(
+                            lambda match: f"[{match[1] or '用户'}{match[2]}] ",
+                            part["text"],
+                            count=1,
+                        ),
+                    }
+                    if isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                    else part
+                    for part in content
+                ]
+            contexts.append(message)
+        req.contexts = contexts
+        identity = {
+            "sender_id": str(event.get_sender_id()),
+            "session": event.unified_msg_origin,
+            "nickname": event.get_sender_name() or "",
+            "chat_type": "group" if event.get_group_id() else "private",
+            "is_admin": str(event.get_sender_id()) in self.admins,
+        }
+        req.system_prompt = (req.system_prompt or "") + (
+            "\n身份与关系：下面的账号、昵称和管理员状态只说明当前发言者及权限，不证明任何私人关系。"
+            "不能因管理员身份、普通私聊、好友消息或同群，就推断是朋友、家人、熟人或同一个人的另一个账号。"
+            "旧的自动身份标签及沿用这些标签的回复也不是关系证据，不要沿用或复述；关系须有独立、明确且可核实的依据。"
+            "不知道关系就直说不知道，可按昵称称呼，不编造关系或亲密程度；特殊称呼仅按当前人格中已确认的账号绑定使用。"
+            "称呼沿用当前人格，不另设身份称谓，不把权限角色说成人际关系。当前发言者："
+            + json.dumps(identity, ensure_ascii=False)
+        )
 
     # 嘴硬橡皮擦：只擦「隐约听见/看到…」这种回声腔。
     # “看不清/没听清/模模糊糊”是诚实的不确定性说明，必须保留；
