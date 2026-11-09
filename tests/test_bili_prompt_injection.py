@@ -34,6 +34,9 @@ class HistoryInjectionTests(unittest.IsolatedAsyncioTestCase):
         module = types.ModuleType("bili_prompt_hook_test")
         module.AstrMessageEvent = object
         module.authorization_prompt = authorization_prompt
+        module.LIFE_TOOLS = {"df_goal", "df_recall", "df_interest", "df_life_status"}
+        module.WORKSHOP_TOOLS = {"df_workshop"}
+        module.METHOD_TOOLS = {"df_method"}
         module.trim_tool_image_history = lambda *args, **kwargs: 0
         module.SelfExpression = Mock(
             side_effect=AssertionError("disabled expression must not run")
