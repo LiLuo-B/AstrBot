@@ -7,6 +7,7 @@ from typing import Any
 from .atom_classifier import classify_atoms
 import json
 from ..models.memory_atom import MemoryAtom
+from ..prompts.evidence_rules import SUMMARY_EVIDENCE_RULES
 
 
 class MemoryProcessorBuildMixin:
@@ -124,14 +125,17 @@ class MemoryProcessorBuildMixin:
                     "summary": summary,
                     "key_facts": metadata.get("key_facts") or [],
                     "topics": metadata.get("topics") or [],
+                    "source_time_start": metadata.get("source_time_start"),
+                    "source_time_end": metadata.get("source_time_end"),
                 }
             )
 
         system_prompt = (
             "你是记忆整理助手。把多条关于同一主题或会话的零散记忆合并为一条精炼、"
-            "信息无损的记忆摘要。保留所有关键事实与具体细节，去重并消除相互矛盾，"
+            "信息无损的记忆摘要。保留有依据的信息与具体细节，去重但保留尚未解决的矛盾及来源归属，"
             "避免泛化和丢失专有名词。只输出 JSON，不要输出任何其他内容。"
         )
+        system_prompt += "\n\n" + SUMMARY_EVIDENCE_RULES
         prompt = (
             f"以下是一组需要合并的记忆（共 {len(items)} 条）：\n"
             f"{json.dumps(items, ensure_ascii=False, indent=2)}\n\n"

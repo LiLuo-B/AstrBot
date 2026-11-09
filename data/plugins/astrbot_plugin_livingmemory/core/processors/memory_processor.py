@@ -14,6 +14,7 @@ from astrbot.api import logger
 
 from ..astrbot_compat import get_using_provider
 from ..models.conversation_models import Message
+from ..prompts.evidence_rules import SUMMARY_EVIDENCE_RULES
 from .memory_processor_parse import MemoryProcessorParseMixin
 from .memory_processor_build import MemoryProcessorBuildMixin
 
@@ -481,6 +482,7 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
 
             # 构建 system_prompt，嵌入人格提示
             system_prompt = await self._build_system_prompt_with_persona(persona_id)
+            system_prompt = system_prompt.rstrip() + "\n\n" + SUMMARY_EVIDENCE_RULES
             logger.debug(f"[MemoryProcessor] System Prompt: {system_prompt[:200]}...")
 
             llm_response_text = await self._call_llm_with_retry(

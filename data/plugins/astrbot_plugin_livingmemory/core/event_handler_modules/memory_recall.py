@@ -19,6 +19,7 @@ from ..memory_scope import (
     is_suspicious_session_id,
     resolve_memory_scope,
 )
+from ..prompts.evidence_rules import RECALL_EVIDENCE_RULES
 from ..utils import (
     OperationContext,
     format_memories_for_injection,
@@ -435,6 +436,7 @@ class MemoryRecall:
                     "For original-message pages, keep include_source=true."
                 )
             policy_text = policy.replace("{available_tools}", "\n".join(available))
+            policy_text = policy_text.rstrip() + "\n\n" + RECALL_EVIDENCE_RULES
             wrapped = (
                 f"{AGENT_RECALL_POLICY_HEADER}\n"
                 f"{policy_text.strip()}\n"

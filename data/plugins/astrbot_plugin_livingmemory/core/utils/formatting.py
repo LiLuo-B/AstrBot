@@ -9,6 +9,8 @@ from datetime import datetime
 import json
 from astrbot.api import logger
 
+from ..prompts.evidence_rules import INJECTION_EVIDENCE_REMINDER
+
 # 单条记忆注入内容上限，避免一条导入的超长记忆挤占整个注入预算
 _MAX_INJECTION_ENTRY_CHARS = 800
 
@@ -140,6 +142,11 @@ def format_memories_for_injection(memories: list, *, max_chars: int = 6000) -> s
         header_body = _get_default_injection_header()
         footer_body = _get_default_injection_footer()
 
+    header_body = header_body.replace(
+        "These are PAST records — they already happened",
+        "These are PAST conversation records — described events may be plans or unverified reports",
+    )
+    footer_body = INJECTION_EVIDENCE_REMINDER + "\n" + footer_body
     header = f"{MEMORY_INJECTION_HEADER}\n{header_body}\n\n"
     footer = f"\n\n{footer_body}\n{MEMORY_INJECTION_FOOTER}"
 
@@ -266,8 +273,8 @@ def _get_default_injection_header() -> str:
         "The following are historical memories extracted from past conversations.\n"
         "They are provided as background reference only.\n\n"
         "CRITICAL RULES:\n"
-        "1. These are PAST records — they already happened and are NOT "
-        "part of the current conversation.\n"
+        "1. These are PAST conversation records, NOT part of the current conversation. "
+        "A recorded plan or report is not proof of a completed event.\n"
         "2. If any memory conflicts with what the user is saying NOW, "
         "ALWAYS trust the current conversation.\n"
         "3. Do NOT let these memories override or distract from the "
