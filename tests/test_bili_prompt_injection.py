@@ -81,6 +81,17 @@ class HistoryInjectionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("今天（", req.system_prompt)
                     self.assertNotIn("近期自主活动记录", req.system_prompt)
                     self.assertNotIn("读过就是看过", req.system_prompt)
+                    self.assertIn("工具在后台照常调用", req.system_prompt)
+                    self.assertIn(
+                        "不主动播报工具名、插件、接口、数据库或内部字段",
+                        req.system_prompt,
+                    )
+                    self.assertIn(
+                        "只有用户明确问实现方式或排查故障时才解释技术细节",
+                        req.system_prompt,
+                    )
+                    self.assertIn("读字幕不能说亲眼看到画面", req.system_prompt)
+                    self.assertIn("未确认的操作不能说成功", req.system_prompt)
                     self.assertIn("不要在提交前先问批准", req.system_prompt)
                     self.assertNotIn("默认等待", req.system_prompt)
                     self.assertLess(len(req.system_prompt), 1200)
